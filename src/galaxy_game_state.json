@@ -1,0 +1,187 @@
+{
+  "version": 1,
+  "state": {
+    "current_year": 3330.4297,
+    "next_colony_id": 2,
+    "base_colonization_range_world": 8000.0,
+    "player": {
+      "faction_id": "player-commonwealth",
+      "location": {
+        "sector": {
+          "x": -11,
+          "y": 3
+        },
+        "local_index": 9331
+      },
+      "home_system": {
+        "sector": {
+          "x": -11,
+          "y": 3
+        },
+        "local_index": 9331
+      },
+      "starting_colony_id": 1
+    },
+    "factions": {
+      "player-commonwealth": {
+        "id": "player-commonwealth",
+        "display_name": "Player Commonwealth",
+        "treasury": 1250000,
+        "colonization_tech_level": 0,
+        "colonization_tech_progress": 0.13880177
+      },
+      "helios-league": {
+        "id": "helios-league",
+        "display_name": "Helios League",
+        "treasury": 2800000,
+        "colonization_tech_level": 0,
+        "colonization_tech_progress": 0.060799014
+      },
+      "orion-syndicate": {
+        "id": "orion-syndicate",
+        "display_name": "Orion Syndicate",
+        "treasury": 2100000,
+        "colonization_tech_level": 0,
+        "colonization_tech_progress": 0.060799014
+      }
+    },
+    "survey_records": [
+      {
+        "system": {
+          "sector": {
+            "x": -11,
+            "y": 3
+          },
+          "local_index": 9331
+        },
+        "stage": "ColonyAssessment",
+        "surveyed_body_count": 6,
+        "habitable_body_count": 1,
+        "viable_body_index": 3,
+        "last_updated_year": 3304.4043
+      }
+    ],
+    "explored_systems": [
+      {
+        "sector": {
+          "x": -11,
+          "y": 3
+        },
+        "local_index": 9331
+      }
+    ],
+    "colonies": {
+      "1": {
+        "id": 1,
+        "name": "SYS--11-3-09331 Colony 1",
+        "owner_faction": "player-commonwealth",
+        "system": {
+          "sector": {
+            "x": -11,
+            "y": 3
+          },
+          "local_index": 9331
+        },
+        "body_index": 3,
+        "habitable_site": true,
+        "system_pos": [
+          29894.777,
+          56633.2,
+          30217.156
+        ],
+        "stage": "Outpost",
+        "population": 3860.5307966886166,
+        "stability": 0.8687076,
+        "food_balance": -0.35,
+        "industry_balance": -0.35,
+        "energy_balance": -0.35,
+        "defense_balance": 0.051198687
+      }
+    }
+  },
+  "events": [
+    {
+      "HomeSystemSelected": {
+        "at_year": 3303.7837,
+        "system": {
+          "sector": {
+            "x": -11,
+            "y": 3
+          },
+          "local_index": 9331
+        }
+      }
+    },
+    {
+      "SurveyedSystem": {
+        "at_year": 3303.9038,
+        "system": {
+          "sector": {
+            "x": -11,
+            "y": 3
+          },
+          "local_index": 9331
+        },
+        "by_faction": "Player Commonwealth",
+        "stage": "StellarSurvey",
+        "surveyed_body_count": 0,
+        "habitable_body_count": 0
+      }
+    },
+    {
+      "SurveyedSystem": {
+        "at_year": 3304.024,
+        "system": {
+          "sector": {
+            "x": -11,
+            "y": 3
+          },
+          "local_index": 9331
+        },
+        "by_faction": "Player Commonwealth",
+        "stage": "PlanetarySurvey",
+        "surveyed_body_count": 6,
+        "habitable_body_count": 1
+      }
+    },
+    {
+      "SurveyedSystem": {
+        "at_year": 3304.224,
+        "system": {
+          "sector": {
+            "x": -11,
+            "y": 3
+          },
+          "local_index": 9331
+        },
+        "by_faction": "Player Commonwealth",
+        "stage": "ColonyAssessment",
+        "surveyed_body_count": 6,
+        "habitable_body_count": 1,
+        "viable_body_index": 3
+      }
+    },
+    {
+      "FoundedColony": {
+        "at_year": 3304.4043,
+        "colony_id": 1,
+        "colony_name": "SYS--11-3-09331 Colony 1",
+        "founder_faction": "player-commonwealth",
+        "system": {
+          "sector": {
+            "x": -11,
+            "y": 3
+          },
+          "local_index": 9331
+        },
+        "body_index": 3,
+        "habitable_site": true,
+        "system_pos": [
+          29894.777,
+          56633.2,
+          30217.156
+        ]
+      }
+    }
+  ]
+}

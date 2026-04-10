@@ -1,0 +1,281 @@
+{
+  "version": 4,
+  "state": {
+    "current_year": 3313.333,
+    "next_colony_id": 2,
+    "base_colonization_range_world": 400.0,
+    "player": {
+      "faction_id": "player-commonwealth",
+      "location": {
+        "sector": {
+          "x": -17,
+          "y": 15
+        },
+        "local_index": 2057
+      },
+      "home_system": {
+        "sector": {
+          "x": -17,
+          "y": 15
+        },
+        "local_index": 2057
+      },
+      "starting_colony_id": 1
+    },
+    "factions": {
+      "player-commonwealth": {
+        "id": "player-commonwealth",
+        "display_name": "Player Commonwealth",
+        "treasury": 1190700,
+        "colonization_tech_level": 0,
+        "colonization_tech_progress": 0.50419575
+      },
+      "helios-league": {
+        "id": "helios-league",
+        "display_name": "Helios League",
+        "treasury": 2800000,
+        "colonization_tech_level": 0,
+        "colonization_tech_progress": 0.02664013
+      },
+      "orion-syndicate": {
+        "id": "orion-syndicate",
+        "display_name": "Orion Syndicate",
+        "treasury": 2100000,
+        "colonization_tech_level": 0,
+        "colonization_tech_progress": 0.02664013
+      }
+    },
+    "survey_records": [
+      {
+        "system": {
+          "sector": {
+            "x": -17,
+            "y": 15
+          },
+          "local_index": 2057
+        },
+        "stage": "ColonyAssessment",
+        "surveyed_body_count": 0,
+        "habitable_body_count": 0,
+        "viable_body_index": 0,
+        "last_updated_year": 3300.8
+      },
+      {
+        "system": {
+          "sector": {
+            "x": -17,
+            "y": 15
+          },
+          "local_index": 1987
+        },
+        "stage": "PlanetarySurvey",
+        "surveyed_body_count": 13,
+        "habitable_body_count": 0,
+        "last_updated_year": 3306.9253
+      }
+    ],
+    "pending_survey_scans": [],
+    "pending_colony_foundings": [],
+    "pending_colony_buildings": [],
+    "pending_population_transfers": [],
+    "explored_systems": [
+      {
+        "sector": {
+          "x": -17,
+          "y": 15
+        },
+        "local_index": 2057
+      },
+      {
+        "sector": {
+          "x": -17,
+          "y": 15
+        },
+        "local_index": 1987
+      }
+    ],
+    "colonies": {
+      "1": {
+        "id": 1,
+        "name": "SYS--17-15-02057 Colony 1",
+        "owner_faction": "player-commonwealth",
+        "system": {
+          "sector": {
+            "x": -17,
+            "y": 15
+          },
+          "local_index": 2057
+        },
+        "body_index": 0,
+        "habitable_site": false,
+        "earth_like_world": false,
+        "system_pos": [
+          16801.924,
+          81380.49,
+          31964.459
+        ],
+        "policy": "Balanced",
+        "taxation_policy": "Standard",
+        "stage": "Outpost",
+        "population": 10227.71133890166,
+        "stability": 0.7676471,
+        "food_balance": 0.06319052,
+        "industry_balance": 0.04145712,
+        "energy_balance": 0.052251816,
+        "defense_balance": 0.03251963,
+        "stockpile_capacity": 80.0,
+        "food_stockpile": 44.792377,
+        "industry_stockpile": 32.286716,
+        "energy_stockpile": 35.534885,
+        "element_stockpiles": {
+          "W": 20.013523,
+          "Mg": 4.057323,
+          "C": 95.0,
+          "Ni": 80.543076,
+          "V": 0.016709182,
+          "Mo": 20.0,
+          "N": 90.0,
+          "Pt": 0.010170782,
+          "O": 6.1489286,
+          "Cu": 75.00968,
+          "Ti": 70.0,
+          "P": 45.0,
+          "Cr": 0.12386563,
+          "Co": 0.15474127,
+          "Si": 120.52269,
+          "S": 45.084625,
+          "Al": 100.1911,
+          "Fe": 141.35452
+        },
+        "atmosphere_stockpiles": {},
+        "element_resource_profile": {
+          "V": 0.0046000006,
+          "Co": 0.042600006,
+          "Si": 0.14390002,
+          "O": 0.041,
+          "Ni": 0.14950001,
+          "Al": 0.052600008,
+          "Fe": 0.37290004,
+          "Pt": 0.0028000001,
+          "Mg": 0.12590002,
+          "W": 0.0037000002,
+          "Cr": 0.034100004,
+          "S": 0.023300001,
+          "Cu": 0.0031000003
+        },
+        "atmosphere_resource_profile": {},
+        "atmosphere_pressure_atm": 0.0,
+        "buildings": [
+          {
+            "kind": "SpaceStation",
+            "site": "Orbital",
+            "level": 1
+          }
+        ],
+        "last_tax_revenue_annual": 1255,
+        "last_upkeep_cost_annual": 3012,
+        "last_net_revenue_annual": -1757
+      }
+    }
+  },
+  "events": [
+    {
+      "HomeSystemSelected": {
+        "at_year": 3300.0,
+        "system": {
+          "sector": {
+            "x": -17,
+            "y": 15
+          },
+          "local_index": 2057
+        }
+      }
+    },
+    {
+      "FoundedColony": {
+        "at_year": 3300.8,
+        "colony_id": 1,
+        "colony_name": "SYS--17-15-02057 Colony 1",
+        "founder_faction": "player-commonwealth",
+        "system": {
+          "sector": {
+            "x": -17,
+            "y": 15
+          },
+          "local_index": 2057
+        },
+        "body_index": 0,
+        "habitable_site": false,
+        "earth_like_world": false,
+        "system_pos": [
+          16801.924,
+          81380.49,
+          31964.459
+        ],
+        "element_resource_profile": {
+          "W": 0.0037,
+          "O": 0.040999997,
+          "Si": 0.1439,
+          "Al": 0.052600004,
+          "Pt": 0.0028,
+          "Ni": 0.1495,
+          "Mg": 0.1259,
+          "Fe": 0.3729,
+          "Cr": 0.0341,
+          "S": 0.0233,
+          "Cu": 0.0031,
+          "V": 0.0046,
+          "Co": 0.042600002
+        },
+        "atmosphere_resource_profile": {},
+        "atmosphere_pressure_atm": 0.0,
+        "colonists_sent": 100
+      }
+    },
+    {
+      "DiscoveredSystem": {
+        "at_year": 3303.5444,
+        "system": {
+          "sector": {
+            "x": -17,
+            "y": 15
+          },
+          "local_index": 1987
+        },
+        "by_faction": "Player Commonwealth"
+      }
+    },
+    {
+      "SurveyedSystem": {
+        "at_year": 3304.8438,
+        "system": {
+          "sector": {
+            "x": -17,
+            "y": 15
+          },
+          "local_index": 1987
+        },
+        "by_faction": "Player Commonwealth",
+        "stage": "StellarSurvey",
+        "surveyed_body_count": 0,
+        "habitable_body_count": 0
+      }
+    },
+    {
+      "SurveyedSystem": {
+        "at_year": 3306.9253,
+        "system": {
+          "sector": {
+            "x": -17,
+            "y": 15
+          },
+          "local_index": 1987
+        },
+        "by_faction": "Player Commonwealth",
+        "stage": "PlanetarySurvey",
+        "surveyed_body_count": 13,
+        "habitable_body_count": 0
+      }
+    }
+  ]
+}
