@@ -10,10 +10,8 @@ use std::time::{Duration, Instant};
 
 use crate::events::GameEvent;
 use crate::game_state::{
-    ColonyBuildingCostPreview, ColonyBuildingKind, ColonyBuildingSite, ColonyBuildingSiteProfile,
-    ColonyPolicy, GameState,
-    PendingColonyFounding, SurveyStage,
-    TaxationPolicy,
+    GameState,
+    SurveyStage,
 };
 use crate::procedural_galaxy::{
     atmosphere_resource_catalog, composition_element_resource_catalog,
@@ -27,6 +25,7 @@ use crate::sim_tick::StrategicClock;
 mod events;
 mod game_state;
 mod gpu_stars;
+mod ai_factions;
 mod music;
 mod procedural_galaxy;
 mod save;
@@ -142,23 +141,6 @@ const CHUNK_INPUT_MIN_BUDGET: usize = 60_000;
 const CHUNK_INPUT_MAX_BUDGET: usize = 900_000;
 const CHUNK_REP_WEIGHT_GAMMA: f64 = 0.72;
 const CHUNK_GRID_ROTATION_RADIANS: f32 = 0.61;
-const CHARTING_RANGE_WORLD_MAX: f32 = 16_000.0;
-const CHARTING_DISTANCE_TIME_MULTIPLIER_MAX: f32 = 3.8;
-const CHARTING_RESOURCE_COST_BASE: i64 = 8_000;
-const CHARTING_RESOURCE_COST_MULTIPLIER_MAX: f32 = 3.0;
-const SURVEY_STAGE_STELLAR_COST_BASE: i64 = 6_000;
-const SURVEY_STAGE_PLANETARY_COST_BASE: i64 = 10_000;
-const SURVEY_STAGE_ASSESSMENT_COST_BASE: i64 = 16_000;
-const COLONY_ESTABLISH_RESOURCE_COST_BASE: i64 = 75_000;
-const COLONY_ESTABLISH_RESOURCE_COST_MULTIPLIER_MAX: f32 = 3.0;
-const COLONY_TRANSFER_POP_MIN: u32 = 100;
-const COLONY_TRANSFER_POP_MAX: u32 = 10_000;
-const COLONY_TRANSFER_TIME_YEARS_BASE: f32 = 0.8;
-const COLONY_TRANSFER_TIME_YEARS_MULTIPLIER_MAX: f32 = 5.0;
-const COLONY_BALANCE_NUDGE_COST: i64 = 2_000;
-const COLONY_BALANCE_NUDGE_FOCUS_DELTA: f32 = 0.012;
-const COLONY_BALANCE_NUDGE_SIDE_DELTA: f32 = -0.004;
-
 const PROCEDURAL_ARM_COUNT: usize = 4;
 const PROCEDURAL_ARM_PITCH_PER_WORLD_UNIT: f32 = 0.00012; // Lower = looser spiral arms, higher = tighter winding
 const PROCEDURAL_ARM_WIDTH_RADIANS: f32 = 0.18; // Higher = wider arms, more stars in-between arms, less empty space, but also less contrast and more uniform distribution overall
@@ -177,13 +159,6 @@ fn galaxy_center() -> [f32; 3] {
 
 fn playfield_radius() -> f32 {
     ((X_MAX - X_MIN).min(Y_MAX - Y_MIN)) * 0.5
-}
-
-fn world_distance(a: [f32; 3], b: [f32; 3]) -> f32 {
-    let dx = a[0] - b[0];
-    let dy = a[1] - b[1];
-    let dz = a[2] - b[2];
-    (dx * dx + dy * dy + dz * dz).sqrt()
 }
 
 type SolarSystem = SystemSummary;
@@ -399,15 +374,8 @@ pub struct GalaxyApp {
     lod_system_view_readiness_min: f32,
     lod_system_view_max_missing_sectors: usize,
     reset_progress_armed: bool,
-    starting_colony_selection: Option<u64>,
     colonies_window_open: bool,
     construction_window_open: bool,
-    colonies_window_player_only: bool,
-    colony_transfer_source: Option<u64>,
-    colony_transfer_target: Option<u64>,
-    colony_transfer_amount: u32,
-    colony_build_site_selection: HashMap<u64, ColonyBuildingSite>,
-    colony_build_panel_selection: Option<u64>,
     legend_panel_open: bool,
     debug_panel_open: bool,
     resources_panel_open: bool,
@@ -425,10 +393,9 @@ pub struct GalaxyApp {
     travel_selected_body: Option<TravelBodySelection>,
     travel_composition_info_open: bool,
     travel_atmosphere_info_open: bool,
-    colony_source_selection: Option<u64>,
-    colony_transfer_colonists: u32,
     music_player: music::MusicPlayer,
     music_window_open: bool,
+    ai_controller: ai_factions::AiFactionController,
 }
 
 impl Default for GalaxyApp {
@@ -492,7 +459,7 @@ impl Default for GalaxyApp {
             }
         }
         Self::trim_game_event_history(&mut game_events);
-        let loaded_starting_colony = game_state.player.starting_colony_id;
+        let ai_controller = ai_factions::AiFactionController::new(&procedural_generator);
         Self {
             sector_cache: SectorLruCache::new(sector_cache_capacity),
             procedural_generator,
@@ -537,7 +504,6 @@ impl Default for GalaxyApp {
             rebuilt_this_frame: false,
             selected_system: None,
             delta_store: DeltaStore::load_json(DELTA_SAVE_PATH).unwrap_or_default(),
-            starting_colony_selection: loaded_starting_colony,
             game_state,
             game_events,
             game_paused: true,
@@ -559,12 +525,6 @@ impl Default for GalaxyApp {
             reset_progress_armed: false,
             colonies_window_open: false,
             construction_window_open: false,
-            colonies_window_player_only: false,
-            colony_transfer_source: None,
-            colony_transfer_target: None,
-            colony_transfer_amount: 1000,
-            colony_build_site_selection: HashMap::new(),
-            colony_build_panel_selection: loaded_starting_colony,
             legend_panel_open: false,
             debug_panel_open: false,
             resources_panel_open: false,
@@ -582,10 +542,9 @@ impl Default for GalaxyApp {
             travel_selected_body: None,
             travel_composition_info_open: false,
             travel_atmosphere_info_open: false,
-            colony_source_selection: loaded_starting_colony,
-            colony_transfer_colonists: COLONY_TRANSFER_POP_MIN,
             music_player: music::MusicPlayer::new(),
             music_window_open: false,
+            ai_controller,
         }
     }
 }
@@ -755,6 +714,7 @@ impl GalaxyApp {
         self.travel_last_input_time = None;
         self.travel_selected_body = None;
         self.reset_travel_view();
+        self.ai_controller = ai_factions::AiFactionController::new(&self.procedural_generator);
     }
 
     fn restart_simulation_with_seed(&mut self, galaxy_seed: u64) {
@@ -1005,121 +965,131 @@ impl GalaxyApp {
             return;
         }
 
-        let player_faction_id = self.game_state.player.faction_id.clone();
-        let player_faction = self
-            .game_state
-            .factions
-            .get(&self.game_state.player.faction_id);
-        let player_treasury = player_faction.map(|f| f.treasury).unwrap_or(0);
-        let player_tech_level = player_faction
-            .map(|f| f.colonization_tech_level)
-            .unwrap_or(0);
-        let player_tech_progress = player_faction
-            .map(|f| f.colonization_tech_progress)
-            .unwrap_or(0.0);
-        let mut total_food_stockpile = 0.0_f32;
-        let mut total_industry_stockpile = 0.0_f32;
-        let mut total_energy_stockpile = 0.0_f32;
-        let mut total_stockpile_capacity = 0.0_f32;
+        // Gather per-faction summaries.
+        let mut faction_summaries: Vec<(String, String, i64, u32, f32, usize, f32, f32, f32, f32)> =
+            Vec::new();
         let element_catalog = composition_element_resource_catalog();
         let atmosphere_catalog = atmosphere_resource_catalog();
-        let mut element_amounts = vec![0.0f32; element_catalog.len()];
-        let mut atmosphere_amounts = vec![0.0f32; atmosphere_catalog.len()];
-        let player_colony_count = self
-            .game_state
-            .colonies
-            .values()
-            .filter_map(|colony| {
-                if colony.owner_faction == player_faction_id {
-                    total_food_stockpile += colony.food_stockpile;
-                    total_industry_stockpile += colony.industry_stockpile;
-                    total_energy_stockpile += colony.energy_stockpile;
-                    total_stockpile_capacity += colony.stockpile_capacity;
+        let mut total_element_amounts = vec![0.0f32; element_catalog.len()];
+        let mut total_atmosphere_amounts = vec![0.0f32; atmosphere_catalog.len()];
+
+        let mut faction_ids: Vec<String> = self.game_state.factions.keys().cloned().collect();
+        faction_ids.sort();
+
+        for fid in &faction_ids {
+            let faction = &self.game_state.factions[fid];
+            let display_name = faction.display_name.clone();
+            let treasury = faction.treasury;
+            let tech_level = faction.colonization_tech_level;
+            let tech_progress = faction.colonization_tech_progress;
+
+            let mut colony_count = 0usize;
+            let mut food_stock = 0.0_f32;
+            let mut industry_stock = 0.0_f32;
+            let mut energy_stock = 0.0_f32;
+            let mut stockpile_cap = 0.0_f32;
+
+            for colony in self.game_state.colonies.values() {
+                if colony.owner_faction == *fid {
+                    colony_count += 1;
+                    food_stock += colony.food_stockpile;
+                    industry_stock += colony.industry_stockpile;
+                    energy_stock += colony.energy_stockpile;
+                    stockpile_cap += colony.stockpile_capacity;
                     for (symbol, amount) in &colony.element_stockpiles {
                         if let Some(idx) = element_catalog.iter().position(|e| e.symbol == symbol) {
-                            element_amounts[idx] += amount.max(0.0);
+                            total_element_amounts[idx] += amount.max(0.0);
                         }
                     }
                     for (formula, amount) in &colony.atmosphere_stockpiles {
                         if let Some(idx) = atmosphere_catalog.iter().position(|e| e.formula == formula) {
-                            atmosphere_amounts[idx] += amount.max(0.0);
+                            total_atmosphere_amounts[idx] += amount.max(0.0);
                         }
                     }
-                    Some(())
-                } else {
-                    None
                 }
-            })
-            .count();
+            }
 
-        let pending_scan_count = self.game_state.pending_survey_scans.len();
-        let pending_colony_count = self.game_state.pending_colony_foundings.len();
+            faction_summaries.push((
+                fid.clone(),
+                display_name,
+                treasury,
+                tech_level,
+                tech_progress,
+                colony_count,
+                food_stock,
+                industry_stock,
+                energy_stock,
+                stockpile_cap,
+            ));
+        }
+
         let pending_building_count = self.game_state.pending_colony_buildings.len();
 
         let mut open = self.resources_panel_open;
-        egui::Window::new("Resources")
+        egui::Window::new("Galaxy Economy")
             .open(&mut open)
             .resizable(true)
-            .default_size([760.0, 560.0])
+            .default_size([780.0, 560.0])
             .show(ctx, |ui| {
-                ui.heading("Resource Overview");
-                egui::Grid::new("resources_overview_grid")
-                    .num_columns(3)
-                    .spacing([14.0, 4.0])
+                ui.heading("Faction Overview");
+                egui::ScrollArea::vertical()
+                    .max_height(180.0)
                     .show(ui, |ui| {
-                        ui.label(format!("Faction treasury: {}", player_treasury));
-                        ui.label(format!("Pending scans: {}", pending_scan_count));
-                        ui.label("");
-                        ui.end_row();
+                        egui::Grid::new("faction_overview_grid")
+                            .num_columns(8)
+                            .spacing([10.0, 4.0])
+                            .striped(true)
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new("Faction").underline());
+                                ui.label(egui::RichText::new("Treasury").underline());
+                                ui.label(egui::RichText::new("Tech").underline());
+                                ui.label(egui::RichText::new("Colonies").underline());
+                                ui.label(egui::RichText::new("Food").underline());
+                                ui.label(egui::RichText::new("Industry").underline());
+                                ui.label(egui::RichText::new("Energy").underline());
+                                ui.label(egui::RichText::new("Capacity").underline());
+                                ui.end_row();
 
-                        ui.label(format!("Colonies owned: {}", player_colony_count));
-                        ui.label(format!("Tech level: L{}", player_tech_level));
-                        ui.label(format!(
-                            "Tech progress: {:.0}%",
-                            player_tech_progress.clamp(0.0, 1.0) * 100.0
-                        ));
-                        ui.end_row();
-
-                        ui.label(format!("Pending colony expeditions: {}", pending_colony_count));
-                        ui.label(format!("Pending building projects: {}", pending_building_count));
-                        ui.label("");
-                        ui.end_row();
-
-                        ui.label(format!(
-                            "Food stockpile: {:.1}/{:.1}",
-                            total_food_stockpile, total_stockpile_capacity
-                        ));
-                        ui.label(format!(
-                            "Industry stockpile: {:.1}/{:.1}",
-                            total_industry_stockpile, total_stockpile_capacity
-                        ));
-                        ui.label(format!(
-                            "Energy stockpile: {:.1}/{:.1}",
-                            total_energy_stockpile, total_stockpile_capacity
-                        ));
-                        ui.end_row();
+                                for (
+                                    _fid,
+                                    display_name,
+                                    treasury,
+                                    tech_level,
+                                    _tech_progress,
+                                    colony_count,
+                                    food_stock,
+                                    industry_stock,
+                                    energy_stock,
+                                    stockpile_cap,
+                                ) in &faction_summaries
+                                {
+                                    ui.label(display_name.as_str());
+                                    ui.label(format!("{}", treasury));
+                                    ui.label(format!("L{}", tech_level));
+                                    ui.label(format!("{}", colony_count));
+                                    ui.label(format!("{:.1}", food_stock));
+                                    ui.label(format!("{:.1}", industry_stock));
+                                    ui.label(format!("{:.1}", energy_stock));
+                                    ui.label(format!("{:.1}", stockpile_cap));
+                                    ui.end_row();
+                                }
+                            });
                     });
 
                 ui.separator();
+                ui.small(format!(
+                    "Pending building projects galaxy-wide: {}",
+                    pending_building_count
+                ));
                 ui.small(
-                    "Catalog entries below include all elements and atmospheric gases that can appear in procedural planet/atmosphere compositions.",
-                );
-                ui.small(
-                    "Element amounts are summed from colony stockpiles (the spendable pool used by construction).",
-                );
-                ui.small(
-                    "Atmosphere amounts are harvested stockpiles gathered by Atmosphere Harvesters from local gas mixtures.",
+                    "Element and atmosphere amounts below are summed across ALL faction colony stockpiles.",
                 );
 
                 ui.columns(2, |columns| {
                     columns[0].push_id("resource_elements_column", |ui| {
-                        ui.label(egui::RichText::new("Elemental Stockpiles").strong());
-                        ui.small(format!(
-                            "{} catalog entries",
-                            composition_element_resource_catalog().len()
-                        ));
+                        ui.label(egui::RichText::new("Elemental Stockpiles (Galaxy)").strong());
                         egui::ScrollArea::vertical()
-                            .max_height(340.0)
+                            .max_height(300.0)
                             .show(ui, |ui| {
                                 egui::Grid::new("resource_elements_grid")
                                     .num_columns(4)
@@ -1132,8 +1102,8 @@ impl GalaxyApp {
                                         ui.label(egui::RichText::new("Amount").underline());
                                         ui.end_row();
 
-                        for (idx, entry) in element_catalog.iter().enumerate() {
-                                            let amount = element_amounts[idx];
+                                        for (idx, entry) in element_catalog.iter().enumerate() {
+                                            let amount = total_element_amounts[idx];
                                             if amount <= 0.0 { continue; }
                                             ui.label(entry.atomic_number.to_string());
                                             ui.label(entry.symbol);
@@ -1146,13 +1116,9 @@ impl GalaxyApp {
                     });
 
                     columns[1].push_id("resource_atmosphere_column", |ui| {
-                        ui.label(egui::RichText::new("Atmospheric Resources").strong());
-                        ui.small(format!(
-                            "{} catalog entries",
-                            atmosphere_resource_catalog().len()
-                        ));
+                        ui.label(egui::RichText::new("Atmospheric Resources (Galaxy)").strong());
                         egui::ScrollArea::vertical()
-                            .max_height(340.0)
+                            .max_height(300.0)
                             .show(ui, |ui| {
                                 egui::Grid::new("resource_atmosphere_grid")
                                     .num_columns(3)
@@ -1165,7 +1131,7 @@ impl GalaxyApp {
                                         ui.end_row();
 
                                         for (idx, entry) in atmosphere_catalog.iter().enumerate() {
-                                            let amount = atmosphere_amounts[idx];
+                                            let amount = total_atmosphere_amounts[idx];
                                             if amount <= 0.0 { continue; }
                                             ui.label(entry.formula);
                                             ui.label(entry.name);
@@ -1193,14 +1159,6 @@ impl GalaxyApp {
         }
     }
 
-    fn record_game_event(&mut self, event: GameEvent) {
-        self.game_state.apply_event(&event);
-        self.game_events.push(event);
-        self.trim_game_events();
-        self.game_autosave_accum_years = 0.0;
-        self.persist_game_state();
-    }
-
     fn reset_all_progress(&mut self) {
         self.delta_store = DeltaStore::default();
         self.game_state = GameState::default();
@@ -1210,9 +1168,6 @@ impl GalaxyApp {
         self.game_save_error = None;
         self.game_notice = Some("All saved progress has been reset.".to_owned());
         self.reset_progress_armed = false;
-        self.starting_colony_selection = None;
-        self.colony_source_selection = None;
-        self.colony_transfer_colonists = COLONY_TRANSFER_POP_MIN;
         self.colonies_window_open = false;
         self.construction_window_open = false;
         self.selected_system = None;
@@ -1367,190 +1322,6 @@ impl GalaxyApp {
         Some(detail)
     }
 
-    fn colony_build_site_profile(
-        detail: Option<&SystemDetail>,
-        site: ColonyBuildingSite,
-    ) -> ColonyBuildingSiteProfile {
-        let Some(detail) = detail else {
-            return ColonyBuildingSiteProfile::default();
-        };
-
-        match site {
-            ColonyBuildingSite::Planet(index) => {
-                if let Some(planet) = detail.planets.get(index as usize) {
-                    ColonyBuildingSiteProfile {
-                        planet_is_gas_giant: Some(planet.kind.is_gas_giant()),
-                        planet_habitable: Some(planet.habitable),
-                        planet_building_slot_capacity: Some(
-                            GameState::planet_building_slot_capacity_for_radius(
-                                planet.radius_earth,
-                            ),
-                        ),
-                        planet_has_atmosphere: Some(
-                            !planet.atmosphere.is_empty()
-                                && planet.atmosphere_pressure_atm > 0.0,
-                        ),
-                        star_is_scoopable: None,
-                    }
-                } else {
-                    ColonyBuildingSiteProfile::default()
-                }
-            }
-            ColonyBuildingSite::Star(index) => {
-                if let Some(star) = detail.stars.get(index as usize) {
-                    let is_scoopable = star.class.spectral.is_scoopable();
-                    ColonyBuildingSiteProfile {
-                        planet_is_gas_giant: None,
-                        planet_habitable: None,
-                        planet_building_slot_capacity: None,
-                        planet_has_atmosphere: None,
-                        star_is_scoopable: Some(is_scoopable),
-                    }
-                } else {
-                    ColonyBuildingSiteProfile::default()
-                }
-            }
-            ColonyBuildingSite::Orbital => {
-                ColonyBuildingSiteProfile::default()
-            }
-        }
-    }
-
-    fn colony_build_site_context_label(detail: Option<&SystemDetail>, site: ColonyBuildingSite) -> String {
-        let Some(detail) = detail else {
-            return "Unknown site context".to_owned();
-        };
-
-        match site {
-            ColonyBuildingSite::Orbital => "Station ring and orbital infrastructure".to_owned(),
-            ColonyBuildingSite::Star(index) => detail
-                .stars
-                .get(index as usize)
-                .map(|star| format!("Stellar site ({})", star.class.notation()))
-                .unwrap_or_else(|| "Unknown stellar site".to_owned()),
-            ColonyBuildingSite::Planet(index) => detail
-                .planets
-                .get(index as usize)
-                .map(|planet| {
-                    let habitability = if planet.habitable {
-                        "habitable"
-                    } else {
-                        "non-habitable"
-                    };
-                    let slots =
-                        GameState::planet_building_slot_capacity_for_radius(planet.radius_earth);
-                    format!(
-                        "{} world ({habitability}) | Radius {:.2} R⊕ | Slots {}",
-                        planet.kind.label(),
-                        planet.radius_earth,
-                        slots
-                    )
-                })
-                .unwrap_or_else(|| "Unknown planetary site".to_owned()),
-        }
-    }
-
-    fn colony_building_effect_summary(kind: ColonyBuildingKind) -> String {
-        let effects = kind.effect_preview_per_level();
-        let mut segments = Vec::new();
-
-        if effects.food_production_bonus.abs() > f32::EPSILON {
-            segments.push(format!(
-                "+Food production {:.4}/year",
-                effects.food_production_bonus
-            ));
-        }
-        if effects.industry_production_bonus.abs() > f32::EPSILON {
-            segments.push(format!(
-                "+Industry production {:.4}/year",
-                effects.industry_production_bonus
-            ));
-        }
-        if effects.energy_production_bonus.abs() > f32::EPSILON {
-            segments.push(format!(
-                "+Energy production {:.4}/year",
-                effects.energy_production_bonus
-            ));
-        }
-        if effects.food_demand_bonus.abs() > f32::EPSILON {
-            segments.push(format!(
-                "+Food demand {:.4}/year",
-                effects.food_demand_bonus
-            ));
-        }
-        if effects.industry_demand_bonus.abs() > f32::EPSILON {
-            segments.push(format!(
-                "+Industry demand {:.4}/year",
-                effects.industry_demand_bonus
-            ));
-        }
-        if effects.energy_demand_bonus.abs() > f32::EPSILON {
-            segments.push(format!(
-                "+Energy demand {:.4}/year",
-                effects.energy_demand_bonus
-            ));
-        }
-        if effects.element_extraction_bonus.abs() > f32::EPSILON {
-            segments.push(format!(
-                "+Element extraction {:.3} profile-rate/year",
-                effects.element_extraction_bonus
-            ));
-        }
-        if effects.atmosphere_harvest_bonus.abs() > f32::EPSILON {
-            segments.push(format!(
-                "+Atmosphere harvesting {:.3} profile-rate/year",
-                effects.atmosphere_harvest_bonus
-            ));
-        }
-        if effects.treasury_production_bonus.abs() > f32::EPSILON {
-            segments.push(format!(
-                "+Treasury {:.0}/year (pop-scaled)",
-                effects.treasury_production_bonus
-            ));
-        }
-        if effects.stability_bonus.abs() > f32::EPSILON {
-            segments.push(format!(
-                "+Stability {:.4}/year",
-                effects.stability_bonus
-            ));
-        }
-        if effects.growth_bonus.abs() > f32::EPSILON {
-            segments.push(format!(
-                "+Growth rate {:.5}/year",
-                effects.growth_bonus
-            ));
-        }
-        if effects.annual_upkeep != 0 {
-            segments.push(format!("Annual upkeep {}", effects.annual_upkeep));
-        }
-
-        if segments.is_empty() {
-            "No direct production or upkeep modifiers per level.".to_owned()
-        } else {
-            segments.join(" | ")
-        }
-    }
-
-    fn colony_building_cost_summary(cost: &ColonyBuildingCostPreview) -> String {
-        let mut text = format!(
-            "Treasury {} | Food {:.1} | Industry {:.1} | Energy {:.1} | Duration {:.2}y",
-            cost.treasury, cost.food, cost.industry, cost.energy, cost.duration_years,
-        );
-
-        if !cost.element_costs.is_empty() {
-            let element_text = cost
-                .element_costs
-                .iter()
-                .map(|(symbol, amount)| format!("{} {:.1}", symbol, amount))
-                .collect::<Vec<_>>()
-                .join(", ");
-            text.push_str(" | Elements: ");
-            text.push_str(&element_text);
-        }
-
-        text
-    }
-
     fn show_favorites_window(&mut self, ctx: &egui::Context, center3d: [f32; 3]) {
         if !self.favorites_window_open {
             return;
@@ -1646,34 +1417,23 @@ impl GalaxyApp {
         let mut open = self.colonies_window_open;
         let mut focus_colony: Option<u64> = None;
         let mut select_colony: Option<u64> = None;
-        let mut policy_updates: Vec<(u64, ColonyPolicy)> = Vec::new();
-        let mut taxation_updates: Vec<(u64, TaxationPolicy)> = Vec::new();
-        let mut nudge_updates: Vec<(u64, usize)> = Vec::new();
-        let mut transfer_request: Option<(u64, u64, u32)> = None;
 
         egui::Window::new("Colonized Systems")
             .open(&mut open)
             .resizable(true)
             .default_size([940.0, 500.0])
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.colonies_window_player_only, "Player colonies only");
-                    ui.label(format!("Total colonies: {}", self.game_state.colonies.len()));
-                });
+                ui.label(format!("Total colonies: {}", self.game_state.colonies.len()));
 
                 let mut colonies = self
                     .game_state
                     .colonies
                     .values()
-                    .filter(|colony| {
-                        !self.colonies_window_player_only
-                            || colony.owner_faction == self.game_state.player.faction_id
-                    })
                     .map(|colony| {
                         (
                             colony.id,
                             colony.name.clone(),
-                            colony.owner_faction == self.game_state.player.faction_id,
+                            colony.owner_faction.clone(),
                             colony.stage.label(),
                             colony.population,
                             colony.system,
@@ -1687,6 +1447,7 @@ impl GalaxyApp {
                             colony.defense_balance,
                             colony.last_tax_revenue_annual,
                             colony.last_net_revenue_annual,
+                            colony.buildings.clone(),
                         )
                     })
                     .collect::<Vec<_>>();
@@ -1696,7 +1457,7 @@ impl GalaxyApp {
                     .max_height(410.0)
                     .show(ui, |ui| {
                         egui::Grid::new("colonies_table")
-                            .num_columns(13)
+                            .num_columns(12)
                             .striped(true)
                             .spacing([10.0, 4.0])
                             .show(ui, |ui| {
@@ -1710,15 +1471,14 @@ impl GalaxyApp {
                                 ui.label(egui::RichText::new("Stability").underline());
                                 ui.label(egui::RichText::new("Balances").underline());
                                 ui.label(egui::RichText::new("Revenue (yr)").underline());
-                                ui.label(egui::RichText::new("Tune").underline());
-                                ui.label(egui::RichText::new("Focus").underline());
-                                ui.label(egui::RichText::new("Select").underline());
+                                ui.label(egui::RichText::new("Buildings").underline());
+                                ui.label(egui::RichText::new("").underline());
                                 ui.end_row();
 
                                 for (
                                     id,
                                     name,
-                                    is_player,
+                                    owner_faction,
                                     stage,
                                     population,
                                     system,
@@ -1732,10 +1492,11 @@ impl GalaxyApp {
                                     defense,
                                     tax_revenue,
                                     net_revenue,
+                                    buildings,
                                 ) in &colonies
                                 {
                                     ui.label(name);
-                                    ui.label(if *is_player { "Player" } else { "NPC" });
+                                    ui.label(owner_faction.as_str());
                                     ui.label(*stage);
                                     ui.label(format!("{:.0}", population));
                                     ui.label(format!(
@@ -1743,51 +1504,8 @@ impl GalaxyApp {
                                         system.sector.x, system.sector.y, system.local_index
                                     ));
 
-                                    if *is_player {
-                                        let mut selected_policy = *policy;
-                                        egui::ComboBox::from_id_source(format!(
-                                            "colony_policy_{}",
-                                            id
-                                        ))
-                                        .selected_text(selected_policy.label())
-                                        .show_ui(ui, |ui| {
-                                            for option in ColonyPolicy::all() {
-                                                ui.selectable_value(
-                                                    &mut selected_policy,
-                                                    option,
-                                                    option.label(),
-                                                ).on_hover_text(option.description());
-                                            }
-                                        });
-                                        if selected_policy != *policy {
-                                            policy_updates.push((*id, selected_policy));
-                                        }
-                                    } else {
-                                        ui.label("NPC");
-                                    }
-
-                                    if *is_player {
-                                        let mut selected_taxation = *taxation_policy;
-                                        egui::ComboBox::from_id_source(format!(
-                                            "colony_taxation_{}",
-                                            id
-                                        ))
-                                        .selected_text(selected_taxation.label())
-                                        .show_ui(ui, |ui| {
-                                            for option in TaxationPolicy::all() {
-                                                ui.selectable_value(
-                                                    &mut selected_taxation,
-                                                    option,
-                                                    option.label(),
-                                                ).on_hover_text(option.description());
-                                            }
-                                        });
-                                        if selected_taxation != *taxation_policy {
-                                            taxation_updates.push((*id, selected_taxation));
-                                        }
-                                    } else {
-                                        ui.label("NPC");
-                                    }
+                                    ui.label(policy.label());
+                                    ui.label(taxation_policy.label());
 
                                     {
                                         let pct = stability * 100.0;
@@ -1814,31 +1532,36 @@ impl GalaxyApp {
                                         tax_revenue, net_revenue
                                     ));
 
-                                    if *is_player {
-                                        ui.horizontal(|ui| {
-                                            if ui.small_button("F+").clicked() {
-                                                nudge_updates.push((*id, 0));
+                                    {
+                                        let bld_count = buildings.len();
+                                        let label_text = if bld_count == 0 {
+                                            "None".to_owned()
+                                        } else {
+                                            format!("{} built", bld_count)
+                                        };
+                                        let resp = ui.label(&label_text);
+                                        if bld_count > 0 {
+                                            let mut tooltip_lines = Vec::new();
+                                            for bld in buildings {
+                                                tooltip_lines.push(format!(
+                                                    "L{} {} @ {}",
+                                                    bld.level,
+                                                    bld.kind.label(),
+                                                    bld.site.label(),
+                                                ));
                                             }
-                                            if ui.small_button("I+").clicked() {
-                                                nudge_updates.push((*id, 1));
-                                            }
-                                            if ui.small_button("E+").clicked() {
-                                                nudge_updates.push((*id, 2));
-                                            }
-                                            if ui.small_button("D+").clicked() {
-                                                nudge_updates.push((*id, 3));
-                                            }
-                                        });
-                                    } else {
-                                        ui.label("-");
+                                            resp.on_hover_text(tooltip_lines.join("\n"));
+                                        }
                                     }
 
-                                    if ui.small_button("Focus").clicked() {
-                                        focus_colony = Some(*id);
-                                    }
-                                    if ui.small_button("Select").clicked() {
-                                        select_colony = Some(*id);
-                                    }
+                                    ui.horizontal(|ui| {
+                                        if ui.small_button("Focus").clicked() {
+                                            focus_colony = Some(*id);
+                                        }
+                                        if ui.small_button("Select").clicked() {
+                                            select_colony = Some(*id);
+                                        }
+                                    });
                                     ui.end_row();
                                 }
                             });
@@ -1848,177 +1571,10 @@ impl GalaxyApp {
                     "Policies: Balanced (steady), Growth (+pop, −stability), Industry (+output, −stability), Fortress (+defense/stability, −growth).",
                 );
                 ui.small("Taxation: Low (+stability/growth, −revenue), Standard, High (+revenue, −stability), Extractive (max revenue, heavy penalties).");
-                ui.small("Stability affects production efficiency and population growth. Keep it high for a thriving colony.");
-                ui.small(
-                    "Use the standalone Construction button in the main toolbar to queue buildings and inspect costs.",
-                );
-                ui.small("Tune buttons apply immediate small balance shifts to player colonies.");
-
-                // ── Population Transfer panel ──
-                ui.separator();
-                ui.label(egui::RichText::new("Population Transfer").strong());
-
-                let player_colonies: Vec<(u64, String, f64)> = self
-                    .game_state
-                    .colonies
-                    .values()
-                    .filter(|c| c.owner_faction == self.game_state.player.faction_id)
-                    .map(|c| (c.id, c.name.clone(), c.population))
-                    .collect();
-
-                if player_colonies.len() < 2 {
-                    ui.small("You need at least two colonies to transfer population.");
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.label("From:");
-                        let source_label = self.colony_transfer_source
-                            .and_then(|id| player_colonies.iter().find(|c| c.0 == id))
-                            .map(|c| c.1.clone())
-                            .unwrap_or_else(|| "Select…".to_owned());
-                        egui::ComboBox::from_id_source("transfer_source")
-                            .selected_text(&source_label)
-                            .show_ui(ui, |ui| {
-                                for (id, name, pop) in &player_colonies {
-                                    let label = format!("{} ({:.0} pop)", name, pop);
-                                    if ui.selectable_value(
-                                        &mut self.colony_transfer_source,
-                                        Some(*id),
-                                        &label,
-                                    ).clicked() {}
-                                }
-                            });
-
-                        ui.label("To:");
-                        let target_label = self.colony_transfer_target
-                            .and_then(|id| player_colonies.iter().find(|c| c.0 == id))
-                            .map(|c| c.1.clone())
-                            .unwrap_or_else(|| "Select…".to_owned());
-                        egui::ComboBox::from_id_source("transfer_target")
-                            .selected_text(&target_label)
-                            .show_ui(ui, |ui| {
-                                for (id, name, pop) in &player_colonies {
-                                    let label = format!("{} ({:.0} pop)", name, pop);
-                                    if ui.selectable_value(
-                                        &mut self.colony_transfer_target,
-                                        Some(*id),
-                                        &label,
-                                    ).clicked() {}
-                                }
-                            });
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label("Colonists:");
-                        ui.add(egui::Slider::new(&mut self.colony_transfer_amount, 100..=50_000).logarithmic(true));
-
-                        let cost = (self.colony_transfer_amount as f64 * 1.8).round() as i64;
-                        ui.label(format!("Cost: {} cr", cost));
-                    });
-
-                    // Show pending transfers.
-                    let pending_count = self.game_state.pending_population_transfers.len();
-                    if pending_count > 0 {
-                        ui.small(format!("{} transfer(s) in transit.", pending_count));
-                    }
-
-                    let can_transfer = self.colony_transfer_source.is_some()
-                        && self.colony_transfer_target.is_some()
-                        && self.colony_transfer_source != self.colony_transfer_target;
-
-                    if ui.add_enabled(can_transfer, egui::Button::new("Send Transfer"))
-                        .on_hover_text("Deducts population + stability from source immediately. Destination receives colonists after transit, with a stability penalty on arrival.")
-                        .clicked()
-                    {
-                        if let (Some(src), Some(tgt)) = (self.colony_transfer_source, self.colony_transfer_target) {
-                            transfer_request = Some((src, tgt, self.colony_transfer_amount));
-                        }
-                    }
-                }
+                ui.small("Stability affects production efficiency and population growth.");
             });
 
         self.colonies_window_open = open;
-
-        let mut colony_settings_changed = false;
-        for (id, policy) in policy_updates {
-            if let Some(colony) = self.game_state.colonies.get_mut(&id) {
-                if colony.owner_faction == self.game_state.player.faction_id && colony.policy != policy {
-                    colony.policy = policy;
-                    colony_settings_changed = true;
-                }
-            }
-        }
-
-        for (id, taxation_policy) in taxation_updates {
-            if let Some(colony) = self.game_state.colonies.get_mut(&id) {
-                if colony.owner_faction == self.game_state.player.faction_id
-                    && colony.taxation_policy != taxation_policy
-                {
-                    colony.taxation_policy = taxation_policy;
-                    colony_settings_changed = true;
-                }
-            }
-        }
-
-        let mut nudges_applied = 0usize;
-        let mut nudges_rejected = 0usize;
-        for (id, target_index) in nudge_updates {
-            let faction_treasury = self
-                .game_state
-                .factions
-                .get(&self.game_state.player.faction_id)
-                .map(|faction| faction.treasury)
-                .unwrap_or(0);
-            if faction_treasury < COLONY_BALANCE_NUDGE_COST {
-                nudges_rejected += 1;
-                continue;
-            }
-
-            let mut should_charge = false;
-            if let Some(colony) = self.game_state.colonies.get_mut(&id) {
-                if colony.owner_faction != self.game_state.player.faction_id {
-                    continue;
-                }
-
-                let mut deltas = [COLONY_BALANCE_NUDGE_SIDE_DELTA; 4];
-                if let Some(delta) = deltas.get_mut(target_index) {
-                    *delta = COLONY_BALANCE_NUDGE_FOCUS_DELTA;
-                }
-
-                colony.food_balance = (colony.food_balance + deltas[0]).clamp(-0.35, 0.35);
-                colony.industry_balance = (colony.industry_balance + deltas[1]).clamp(-0.35, 0.35);
-                colony.energy_balance = (colony.energy_balance + deltas[2]).clamp(-0.35, 0.35);
-                colony.defense_balance = (colony.defense_balance + deltas[3]).clamp(-0.20, 0.50);
-                colony_settings_changed = true;
-                should_charge = true;
-            }
-
-            if should_charge {
-                if let Some(faction) = self.game_state.factions.get_mut(&self.game_state.player.faction_id)
-                {
-                    faction.treasury = faction.treasury.saturating_sub(COLONY_BALANCE_NUDGE_COST);
-                }
-                nudges_applied += 1;
-            }
-        }
-
-        if colony_settings_changed {
-            self.game_autosave_accum_years = 0.0;
-            self.persist_game_state();
-            if nudges_applied > 0 {
-                self.game_notice = Some(format!(
-                    "Applied {} colony tuning action(s). Treasury spent: {}.",
-                    nudges_applied,
-                    COLONY_BALANCE_NUDGE_COST.saturating_mul(nudges_applied as i64)
-                ));
-            } else if self.game_notice.is_none() {
-                self.game_notice = Some("Colony management settings updated.".to_owned());
-            }
-        } else if nudges_rejected > 0 {
-            self.game_notice = Some(format!(
-                "Colony tuning denied: each action requires {} treasury.",
-                COLONY_BALANCE_NUDGE_COST
-            ));
-        }
 
         if let Some(colony_id) = focus_colony {
             if let Some((pos, name)) = self
@@ -2048,370 +1604,6 @@ impl GalaxyApp {
                     ));
                 }
             }
-        }
-
-        if let Some((src, tgt, amount)) = transfer_request {
-            let faction_id = self.game_state.player.faction_id.clone();
-            match self.game_state.queue_population_transfer(src, tgt, amount, &faction_id) {
-                Ok(duration) => {
-                    self.game_autosave_accum_years = 0.0;
-                    self.persist_game_state();
-                    self.game_notice = Some(format!(
-                        "Population transfer dispatched. ETA: {:.1} years.",
-                        duration
-                    ));
-                }
-                Err(msg) => {
-                    self.game_notice = Some(format!("Transfer failed: {msg}"));
-                }
-            }
-        }
-    }
-
-    fn show_construction_window(&mut self, ctx: &egui::Context) {
-        if !self.construction_window_open {
-            return;
-        }
-
-        let mut open = self.construction_window_open;
-        let mut building_queue_requests: Vec<(
-            u64,
-            ColonyBuildingKind,
-            ColonyBuildingSite,
-            ColonyBuildingSiteProfile,
-        )> = Vec::new();
-
-        egui::Window::new("Construction")
-            .open(&mut open)
-            .resizable(true)
-            .default_size([620.0, 420.0])
-            .show(ctx, |ui| {
-                let mut player_colonies = self
-                    .game_state
-                    .colonies
-                    .values()
-                    .filter(|colony| colony.owner_faction == self.game_state.player.faction_id)
-                    .map(|colony| {
-                        (
-                            colony.id,
-                            colony.name.clone(),
-                            colony.system,
-                            colony.body_index,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                player_colonies.sort_by(|a, b| a.1.cmp(&b.1));
-
-                if player_colonies.is_empty() {
-                    ui.small("No player-owned colonies are available for construction.");
-                    return;
-                }
-
-                let mut selected_colony_id = self
-                    .colony_build_panel_selection
-                    .filter(|selected| {
-                        player_colonies
-                            .iter()
-                            .any(|(colony_id, _, _, _)| colony_id == selected)
-                    })
-                    .unwrap_or(player_colonies[0].0);
-
-                ui.horizontal(|ui| {
-                    ui.label("Colony:");
-                    egui::ComboBox::from_id_source("construction_colony_select")
-                        .selected_text(
-                            player_colonies
-                                .iter()
-                                .find(|(id, _, _, _)| *id == selected_colony_id)
-                                .map(|(_, name, _, _)| name.clone())
-                                .unwrap_or_else(|| "Select colony".to_owned()),
-                        )
-                        .show_ui(ui, |ui| {
-                            for (colony_id, colony_name, _, _) in &player_colonies {
-                                ui.selectable_value(
-                                    &mut selected_colony_id,
-                                    *colony_id,
-                                    colony_name.clone(),
-                                );
-                            }
-                        });
-                });
-                self.colony_build_panel_selection = Some(selected_colony_id);
-
-                let Some(selected_colony) = self.game_state.colonies.get(&selected_colony_id).cloned() else {
-                    ui.small("Selected colony is no longer available.");
-                    return;
-                };
-
-                let detail = self.load_system_detail_by_id(selected_colony.system);
-
-                let mut site_options = vec![ColonyBuildingSite::Orbital];
-                if let Some(system_detail) = detail.as_ref() {
-                    for (star_index, _) in system_detail.stars.iter().enumerate() {
-                        site_options.push(ColonyBuildingSite::Star(star_index as u16));
-                    }
-                    for (planet_index, _) in system_detail.planets.iter().enumerate() {
-                        site_options.push(ColonyBuildingSite::Planet(planet_index as u16));
-                    }
-                }
-
-                let host_site = ColonyBuildingSite::host_for_body_index(selected_colony.body_index);
-                if !site_options.contains(&host_site) {
-                    site_options.push(host_site);
-                }
-                site_options.sort_by_key(|site| match *site {
-                    ColonyBuildingSite::Orbital => (0_u8, 0_u16),
-                    ColonyBuildingSite::Star(index) => (1_u8, index),
-                    ColonyBuildingSite::Planet(index) => (2_u8, index),
-                });
-                site_options.dedup();
-
-                let mut selected_site = self
-                    .colony_build_site_selection
-                    .get(&selected_colony_id)
-                    .copied()
-                    .unwrap_or(host_site);
-                if !site_options.contains(&selected_site) {
-                    selected_site = host_site;
-                }
-
-                ui.horizontal(|ui| {
-                    ui.label("Site:");
-                    let site_label = selected_site.label();
-                    egui::ComboBox::from_id_source("construction_site_select")
-                        .selected_text(&*site_label)
-                        .show_ui(ui, |ui| {
-                            for site in &site_options {
-                                let sl = site.label();
-                                ui.selectable_value(&mut selected_site, *site, &*sl);
-                            }
-                        });
-                });
-                self.colony_build_site_selection
-                    .insert(selected_colony_id, selected_site);
-
-                let site_profile = Self::colony_build_site_profile(detail.as_ref(), selected_site);
-                let slot_capacity = GameState::building_site_slot_capacity(selected_site, site_profile);
-                let occupied_slots = selected_colony.occupied_building_slots_at_site(selected_site);
-
-                ui.small(Self::colony_build_site_context_label(
-                    detail.as_ref(),
-                    selected_site,
-                ));
-                let faction_treasury = self
-                    .game_state
-                    .factions
-                    .get(&self.game_state.player.faction_id)
-                    .map(|faction| faction.treasury)
-                    .unwrap_or(0);
-                ui.small(format!(
-                    "Faction treasury {} | Stockpiles F {:.1} I {:.1} E {:.1}",
-                    faction_treasury,
-                    selected_colony.food_stockpile,
-                    selected_colony.industry_stockpile,
-                    selected_colony.energy_stockpile,
-                ));
-
-                let pending_project = self
-                    .game_state
-                    .pending_colony_building_for_colony(selected_colony_id)
-                    .cloned();
-                if let Some(pending) = pending_project.as_ref() {
-                    let eta = (pending.complete_year - self.game_state.current_year).max(0.0);
-                    ui.small(format!(
-                        "Active project: {} @ {} to L{} ({:.2}y remaining)",
-                        pending.kind.label(),
-                        pending.site.label(),
-                        pending.target_level,
-                        eta,
-                    ));
-                }
-
-                ui.separator();
-                egui::ScrollArea::vertical()
-                    .max_height(320.0)
-                    .show(ui, |ui| {
-                        egui::Grid::new("construction_building_grid")
-                            .num_columns(4)
-                            .striped(true)
-                            .spacing([10.0, 4.0])
-                            .show(ui, |ui| {
-                                ui.label(egui::RichText::new("Building").underline());
-                                ui.label(egui::RichText::new("Level").underline());
-                                ui.label(egui::RichText::new("Cost").underline());
-                                ui.label(egui::RichText::new("").underline());
-                                ui.end_row();
-
-                                let available_buildings: Vec<_> = ColonyBuildingKind::all()
-                                    .into_iter()
-                                    .filter(|kind| kind.is_player_queueable())
-                                    .filter(|kind| {
-                                        GameState::building_site_support_error(*kind, selected_site, site_profile).is_none()
-                                    })
-                                    .collect();
-
-                                if available_buildings.is_empty() {
-                                    ui.label("No buildings available at this site.");
-                                    ui.end_row();
-                                }
-
-                                for kind in available_buildings {
-                                    let current_level =
-                                        selected_colony.building_level_at_site(kind, selected_site);
-                                    let at_max_level = current_level >= kind.max_level();
-                                    let target_level = current_level.saturating_add(1);
-                                    let cost_preview = GameState::colony_building_cost_preview(
-                                        kind,
-                                        target_level,
-                                    );
-
-                                    let mut queue_issues = Vec::new();
-                                    if at_max_level {
-                                        queue_issues.push(
-                                            "This building has reached its maximum level."
-                                                .to_owned(),
-                                        );
-                                    }
-                                    if kind.consumes_site_slot() && current_level == 0 {
-                                        if let Some(capacity) = slot_capacity {
-                                            if occupied_slots >= capacity {
-                                                queue_issues.push(
-                                                    "No free building slots remain on this planet."
-                                                        .to_owned(),
-                                                );
-                                            }
-                                        }
-                                    }
-                                    if pending_project.is_some() {
-                                        queue_issues.push(
-                                            "Another building is already under construction for this colony."
-                                                .to_owned(),
-                                        );
-                                    }
-
-                                    if faction_treasury < cost_preview.treasury {
-                                        queue_issues.push(format!(
-                                            "Need {} more treasury.",
-                                            cost_preview.treasury - faction_treasury
-                                        ));
-                                    }
-                                    if selected_colony.food_stockpile + 0.0001 < cost_preview.food {
-                                        queue_issues.push(format!(
-                                            "Need {:.1} more food stockpile.",
-                                            cost_preview.food - selected_colony.food_stockpile
-                                        ));
-                                    }
-                                    if selected_colony.industry_stockpile + 0.0001
-                                        < cost_preview.industry
-                                    {
-                                        queue_issues.push(format!(
-                                            "Need {:.1} more industry stockpile.",
-                                            cost_preview.industry - selected_colony.industry_stockpile
-                                        ));
-                                    }
-                                    if selected_colony.energy_stockpile + 0.0001 < cost_preview.energy {
-                                        queue_issues.push(format!(
-                                            "Need {:.1} more energy stockpile.",
-                                            cost_preview.energy - selected_colony.energy_stockpile
-                                        ));
-                                    }
-                                    for (symbol, amount) in &cost_preview.element_costs {
-                                        let available = selected_colony
-                                            .element_stockpiles
-                                            .get(symbol)
-                                            .copied()
-                                            .unwrap_or(0.0);
-                                        if available + 0.0001 < *amount {
-                                            queue_issues.push(format!(
-                                                "Need {:.1} more {}.",
-                                                amount - available,
-                                                symbol
-                                            ));
-                                        }
-                                    }
-
-                                    let can_queue = queue_issues.is_empty();
-
-                                    let building_label = ui.label(kind.label());
-                                    building_label.on_hover_text(format!(
-                                        "{}\n\n{}",
-                                        kind.role_description(),
-                                        Self::colony_building_effect_summary(kind),
-                                    ));
-
-                                    if at_max_level {
-                                        ui.label(format!("L{} (max)", current_level));
-                                    } else {
-                                        ui.label(format!("L{} → L{}", current_level, cost_preview.target_level));
-                                    }
-
-                                    ui.small(Self::colony_building_cost_summary(&cost_preview));
-
-                                    ui.vertical(|ui| {
-                                        if !at_max_level {
-                                            if ui
-                                                .add_enabled(
-                                                    can_queue,
-                                                    egui::Button::new(kind.queue_button_label()),
-                                                )
-                                                .clicked()
-                                            {
-                                                building_queue_requests.push((
-                                                    selected_colony_id,
-                                                    kind,
-                                                    selected_site,
-                                                    site_profile,
-                                                ));
-                                            }
-                                        }
-                                        for issue in queue_issues.iter().take(2) {
-                                            ui.small(issue);
-                                        }
-                                        if queue_issues.len() > 2 {
-                                            ui.small(format!(
-                                                "{} additional requirement(s)",
-                                                queue_issues.len() - 2
-                                            ));
-                                        }
-                                    });
-                                    ui.end_row();
-                                }
-                            });
-                    });
-            });
-
-        self.construction_window_open = open;
-
-        let mut building_queue_count = 0usize;
-        let mut first_queue_error: Option<String> = None;
-        for (colony_id, kind, site, site_profile) in building_queue_requests {
-            match self.game_state.queue_colony_building_with_profile(
-                self.game_state.current_year,
-                colony_id,
-                kind,
-                site,
-                site_profile,
-            ) {
-                Ok((_duration_years, _construction_cost, _target_level)) => {
-                    building_queue_count += 1;
-                }
-                Err(message) => {
-                    if first_queue_error.is_none() {
-                        first_queue_error = Some(message.to_owned());
-                    }
-                }
-            }
-        }
-
-        if building_queue_count > 0 {
-            self.game_autosave_accum_years = 0.0;
-            self.persist_game_state();
-            self.game_notice = Some(format!(
-                "Queued {} colony building project(s).",
-                building_queue_count
-            ));
-        } else if let Some(error) = first_queue_error {
-            self.game_notice = Some(error);
         }
     }
 
@@ -4292,6 +3484,14 @@ impl eframe::App for GalaxyApp {
                     self.game_state.apply_event(&event);
                     self.game_events.push(event);
                 }
+                let ai_events = self.ai_controller.tick(
+                    &mut self.game_state,
+                    &self.procedural_generator,
+                );
+                for event in ai_events {
+                    self.game_state.apply_event(&event);
+                    self.game_events.push(event);
+                }
             }
             self.trim_game_events();
             self.game_autosave_accum_years +=
@@ -4344,9 +3544,6 @@ impl eframe::App for GalaxyApp {
                 if ui.button("Colonized Systems").clicked() {
                     self.colonies_window_open = true;
                 }
-                if ui.button("Construction").clicked() {
-                    self.construction_window_open = true;
-                }
                 if ui.button("Favorites").clicked() {
                     self.favorites_window_open = !self.favorites_window_open;
                 }
@@ -4368,9 +3565,9 @@ impl eframe::App for GalaxyApp {
                 }
                 if ui
                     .button(if self.resources_panel_open {
-                        "Hide resources"
+                        "Hide economy"
                     } else {
-                        "Resources window"
+                        "Galaxy Economy"
                     })
                     .clicked()
                 {
@@ -4412,103 +3609,7 @@ impl eframe::App for GalaxyApp {
                 self.game_state.factions.len(),
                 self.game_events.len(),
             ));
-            ui.horizontal(|ui| {
-                let mut base_range = self.game_state.base_colonization_range_world;
-                if ui
-                    .add(
-                        egui::Slider::new(&mut base_range, 100.0..=5_000.0)
-                            .text("Base colonization range")
-                            .logarithmic(true),
-                    )
-                    .changed()
-                {
-                    self.game_state.base_colonization_range_world = base_range;
-                    self.game_autosave_accum_years = 0.0;
-                    self.persist_game_state();
-                }
 
-                let player_tech_level = self
-                    .game_state
-                    .factions
-                    .get(&self.game_state.player.faction_id)
-                    .map(|faction| faction.colonization_tech_level)
-                    .unwrap_or(0);
-                let player_range = self
-                    .game_state
-                    .faction_colonization_range_world(&self.game_state.player.faction_id);
-                ui.label(format!(
-                    "Player colonization tech: L{} | Effective range: {:.0}",
-                    player_tech_level, player_range
-                ));
-            });
-            if self.game_state.player.home_system.is_some() {
-                ui.label("Home system selected");
-            } else {
-                ui.colored_label(
-                    egui::Color32::from_rgb(255, 210, 120),
-                    "Select a home system first to begin charting nearby systems.",
-                );
-            }
-            let mut player_colonies = self
-                .game_state
-                .colonies
-                .values()
-                .filter(|colony| colony.owner_faction == self.game_state.player.faction_id)
-                .map(|colony| (colony.id, colony.name.clone()))
-                .collect::<Vec<_>>();
-            player_colonies.sort_by_key(|(id, _)| *id);
-            if player_colonies.is_empty() {
-                self.starting_colony_selection = None;
-                ui.label("Starting colony: none (found your first colony to set one)");
-            } else {
-                let first_colony_id = player_colonies[0].0;
-                if self.starting_colony_selection.is_none() {
-                    self.starting_colony_selection =
-                        self.game_state.player.starting_colony_id.or(Some(first_colony_id));
-                }
-                if let Some(selected_id) = self.starting_colony_selection {
-                    if !player_colonies.iter().any(|(id, _)| *id == selected_id) {
-                        self.starting_colony_selection = Some(first_colony_id);
-                    }
-                }
-
-                let selected_text = self
-                    .starting_colony_selection
-                    .and_then(|id| {
-                        player_colonies
-                            .iter()
-                            .find(|(candidate_id, _)| *candidate_id == id)
-                            .map(|(_, name)| name.clone())
-                    })
-                    .unwrap_or_else(|| "Select colony".to_owned());
-
-                ui.horizontal(|ui| {
-                    ui.label("Starting colony:");
-                    egui::ComboBox::from_id_source("starting_colony_selector")
-                        .selected_text(selected_text)
-                        .show_ui(ui, |ui| {
-                            for (id, name) in &player_colonies {
-                                ui.selectable_value(
-                                    &mut self.starting_colony_selection,
-                                    Some(*id),
-                                    name,
-                                );
-                            }
-                        });
-
-                    if ui.button("Set starting colony").clicked() {
-                        if let Some(colony_id) = self.starting_colony_selection {
-                            self.record_game_event(GameEvent::StartingColonySelected {
-                                at_year: self.game_state.current_year,
-                                colony_id,
-                            });
-                            self.starting_colony_selection =
-                                self.game_state.player.starting_colony_id;
-                            self.game_notice = Some("Starting colony updated.".to_owned());
-                        }
-                    }
-                });
-            }
             if let Some(err) = &self.game_save_error {
                 ui.colored_label(egui::Color32::YELLOW, err);
             }
@@ -4927,17 +4028,8 @@ impl eframe::App for GalaxyApp {
                         (rotated[0] - center3d[0] + self.pan.x) * self.zoom,
                         (rotated[1] - center3d[1] + self.pan.y) * self.zoom,
                     );
-                let is_player_colony = colony.owner_faction == self.game_state.player.faction_id;
-                let marker_color = if is_player_colony {
-                    egui::Color32::from_rgb(70, 210, 170)
-                } else {
-                    egui::Color32::from_rgb(226, 160, 82)
-                };
-                let marker_radius = if self.game_state.player.starting_colony_id == Some(colony.id) {
-                    6.0
-                } else {
-                    4.2
-                };
+                let marker_color = egui::Color32::from_rgb(226, 160, 82);
+                let marker_radius = 4.2;
                 painter.circle_stroke(
                     colony_screen,
                     marker_radius,
@@ -4974,41 +4066,6 @@ impl eframe::App for GalaxyApp {
                         (rotated[0] - center3d[0] + self.pan.x) * self.zoom,
                         (rotated[1] - center3d[1] + self.pan.y) * self.zoom,
                     );
-                if let Some(nearest) = self.game_state.nearest_colony_for_faction(
-                    &self.game_state.player.faction_id,
-                    detail.pos,
-                ) {
-                    let nearest_rotated = rotate_point(
-                        nearest.system_pos,
-                        self.yaw,
-                        self.pitch,
-                        center3d,
-                    );
-                    let nearest_screen = center2d
-                        + egui::Vec2::new(
-                            (nearest_rotated[0] - center3d[0] + self.pan.x) * self.zoom,
-                            (nearest_rotated[1] - center3d[1] + self.pan.y) * self.zoom,
-                        );
-                    let range_world = self
-                        .game_state
-                        .faction_colonization_range_world(&self.game_state.player.faction_id);
-                    let in_range = nearest.distance <= range_world;
-                    let range_color = if in_range {
-                        egui::Color32::from_rgba_unmultiplied(80, 220, 110, 80)
-                    } else {
-                        egui::Color32::from_rgba_unmultiplied(230, 120, 100, 80)
-                    };
-                    let range_radius_px = (range_world * self.zoom).max(4.0);
-                    painter.circle_stroke(
-                        nearest_screen,
-                        range_radius_px,
-                        egui::Stroke::new(1.3, range_color),
-                    );
-                    painter.line_segment(
-                        [nearest_screen, sel_screen],
-                        egui::Stroke::new(1.0, range_color),
-                    );
-                }
                 let sel_ring_radius = (star_draw_radius * 4.0).max(6.0);
                 painter.circle_stroke(
                     sel_screen,
@@ -5039,27 +4096,12 @@ impl eframe::App for GalaxyApp {
             let mut window_close = false;
             let mut window_save = false;
             let mut window_travel = false;
-            let mut window_set_home_system = false;
-            let mut window_advance_survey = false;
-            let mut window_found_colony = false;
             if let Some(detail) = self.selected_system.as_mut() {
                 let (survey_stage, survey_record, pending_scan, pending_progress, pending_colony_founding, current_year) = selected_survey_snapshot
                     .clone()
                     .unwrap_or((SurveyStage::Unknown, None, None, None, None, self.game_state.current_year));
-                let home_system = self.game_state.player.home_system;
-                // Before the first colony is founded, all system details are
-                // visible globally so the player can scout for a good home
-                // system.  Once a colony exists the fog of war returns.
-                let pre_colony_mode = self.game_state.player.starting_colony_id.is_none();
-                let display_survey_stage = if pre_colony_mode {
-                    SurveyStage::ColonyAssessment
-                } else {
-                    survey_stage
-                };
-                let can_advance_survey = !pre_colony_mode
-                    && survey_stage.next().is_some()
-                    && (home_system.is_some() || survey_stage != SurveyStage::Unknown)
-                    && pending_scan.is_none();
+                // Spectator always sees full system data.
+                let display_survey_stage = SurveyStage::ColonyAssessment;
                 egui::Window::new("System Details")
                     .resizable(true)
                     .default_width(360.0)
@@ -5082,16 +4124,13 @@ impl eframe::App for GalaxyApp {
                                 ui.end_row();
                             });
 
-                        if !pre_colony_mode {
+                        {
                             ui.separator();
                             ui.label(egui::RichText::new("Survey Status").strong());
                             egui::Grid::new("survey_status")
                                 .num_columns(2)
                                 .spacing([8.0, 4.0])
                                 .show(ui, |ui| {
-                                    ui.label("Home system:");
-                                    ui.label(if home_system.is_some() { "Selected" } else { "Not set" });
-                                    ui.end_row();
 
                                     ui.label("Stage:");
                                     ui.label(survey_stage.label());
@@ -5230,76 +4269,8 @@ impl eframe::App for GalaxyApp {
                                     eta
                                 ));
                             }
-                        } else {
-                            let mut player_colonies = self
-                                .game_state
-                                .colonies
-                                .values()
-                                .filter(|colony| colony.owner_faction == self.game_state.player.faction_id)
-                                .map(|colony| {
-                                    (
-                                        colony.id,
-                                        colony.name.clone(),
-                                        colony.population.max(0.0) as u64,
-                                    )
-                                })
-                                .collect::<Vec<_>>();
-                            player_colonies.sort_by_key(|(id, _, _)| *id);
-
-                            if !player_colonies.is_empty() {
-                                if self.colony_source_selection.is_none() {
-                                    self.colony_source_selection = Some(player_colonies[0].0);
-                                }
-                                if let Some(selected_id) = self.colony_source_selection {
-                                    if !player_colonies.iter().any(|(id, _, _)| *id == selected_id) {
-                                        self.colony_source_selection = Some(player_colonies[0].0);
-                                    }
-                                }
-
-                                let source_label = self
-                                    .colony_source_selection
-                                    .and_then(|id| {
-                                        player_colonies
-                                            .iter()
-                                            .find(|(candidate_id, _, _)| *candidate_id == id)
-                                            .map(|(_, name, pop)| format!("{} (pop {})", name, pop))
-                                    })
-                                    .unwrap_or_else(|| "Select source colony".to_owned());
-
-                                ui.horizontal(|ui| {
-                                    ui.label("Source colony:");
-                                    egui::ComboBox::from_id_source("colony_source_selector")
-                                        .selected_text(source_label)
-                                        .show_ui(ui, |ui| {
-                                            for (id, name, pop) in &player_colonies {
-                                                ui.selectable_value(
-                                                    &mut self.colony_source_selection,
-                                                    Some(*id),
-                                                    format!("{} (pop {})", name, pop),
-                                                );
-                                            }
-                                        });
-                                });
-
-                                self.colony_transfer_colonists = self
-                                    .colony_transfer_colonists
-                                    .clamp(COLONY_TRANSFER_POP_MIN, COLONY_TRANSFER_POP_MAX);
-                                ui.add(
-                                    egui::Slider::new(
-                                        &mut self.colony_transfer_colonists,
-                                        COLONY_TRANSFER_POP_MIN..=COLONY_TRANSFER_POP_MAX,
-                                    )
-                                    .text("Colonists to send"),
-                                );
-                                ui.small("Minimum transfer is 100 colonists.");
-                            } else {
-                                ui.label("No source colony available yet for colonization expeditions.");
-                            }
                         }
-                        ui.add_enabled(
-                            !pre_colony_mode,
-                            egui::Checkbox::new(&mut detail.favorite, "Favorite"),
-                        );
+                        ui.checkbox(&mut detail.favorite, "Favorite");
 
                         ui.separator();
                         ui.label("Notes:");
@@ -5325,36 +4296,7 @@ impl eframe::App for GalaxyApp {
                             if ui.button("Save").clicked() {
                                 window_save = true;
                             }
-                            if ui
-                                .add_enabled(
-                                    home_system.is_none(),
-                                    egui::Button::new("Set Home System"),
-                                )
-                                .clicked()
-                            {
-                                window_set_home_system = true;
-                            }
-                            if !pre_colony_mode {
-                                if ui
-                                    .add_enabled(
-                                        can_advance_survey,
-                                        egui::Button::new(survey_stage.action_label()),
-                                    )
-                                    .clicked()
-                                {
-                                    window_advance_survey = true;
-                                }
-                            }
-                            if ui.button("Found Colony").clicked() {
-                                window_found_colony = true;
-                            }
-                            if ui
-                                .add_enabled(
-                                    display_survey_stage >= SurveyStage::ColonyAssessment,
-                                    egui::Button::new("Travel"),
-                                )
-                                .clicked()
-                            {
+                            if ui.button("Travel").clicked() {
                                 window_travel = true;
                             }
                             if ui.button("Close").clicked() {
@@ -5383,8 +4325,7 @@ impl eframe::App for GalaxyApp {
             }
             if window_travel {
                 if let Some(detail) = &self.selected_system {
-                    let pre_colony = self.game_state.player.starting_colony_id.is_none();
-                    if !pre_colony && self.game_state.survey_stage(detail.id) < SurveyStage::ColonyAssessment {
+                    if self.game_state.survey_stage(detail.id) < SurveyStage::ColonyAssessment {
                         self.game_notice = Some(
                             "Travel unavailable: complete all scans for this system first.".to_owned(),
                         );
@@ -5400,452 +4341,6 @@ impl eframe::App for GalaxyApp {
                     self.travel_selected_body = None;
                 }
             }
-            if window_set_home_system {
-                if let Some(detail) = self.selected_system.as_ref() {
-                    let system_id = detail.id;
-                    if self.game_state.player.home_system.is_none() {
-                        self.record_game_event(GameEvent::HomeSystemSelected {
-                            at_year: self.game_state.current_year,
-                            system: system_id,
-                        });
-                        self.game_notice = Some(
-                            "Home system selected. Chart nearby systems within range.".to_owned(),
-                        );
-                    } else {
-                        self.game_notice = Some("Home system is already set.".to_owned());
-                    }
-                }
-            }
-            if window_advance_survey {
-                if let Some(detail) = self.selected_system.clone() {
-                    let current_stage = self.game_state.survey_stage(detail.id);
-                    if let Some(next_stage) = current_stage.next() {
-                        let mut charting_duration_scale = 1.0;
-                        let mut survey_resource_cost = match next_stage {
-                            SurveyStage::StellarSurvey => SURVEY_STAGE_STELLAR_COST_BASE,
-                            SurveyStage::PlanetarySurvey => SURVEY_STAGE_PLANETARY_COST_BASE,
-                            SurveyStage::ColonyAssessment => SURVEY_STAGE_ASSESSMENT_COST_BASE,
-                            _ => 0,
-                        };
-                        if next_stage == SurveyStage::Located {
-                            let mut nearest_anchor: Option<(&'static str, f32)> = None;
-
-                            if let Some(home_system) = self.game_state.player.home_system {
-                                let Some(home_detail) = self.load_system_detail_by_id(home_system) else {
-                                    self.game_notice = Some(
-                                        "Unable to load home system data for range check.".to_owned(),
-                                    );
-                                    return;
-                                };
-                                nearest_anchor = Some(("home", world_distance(detail.pos, home_detail.pos)));
-                            }
-
-                            if let Some(nearest_colony) = self
-                                .game_state
-                                .nearest_colony_for_faction(&self.game_state.player.faction_id, detail.pos)
-                            {
-                                nearest_anchor = match nearest_anchor {
-                                    Some((kind, current_distance)) => {
-                                        if nearest_colony.distance < current_distance {
-                                            Some(("colony", nearest_colony.distance))
-                                        } else {
-                                            Some((kind, current_distance))
-                                        }
-                                    }
-                                    None => Some(("colony", nearest_colony.distance)),
-                                };
-                            }
-
-                            let Some((anchor_kind, anchor_distance)) = nearest_anchor else {
-                                self.game_notice = Some(
-                                    "Charting denied: establish a home system or colony first.".to_owned(),
-                                );
-                                return;
-                            };
-
-                            let player_range = self
-                                .game_state
-                                .faction_colonization_range_world(&self.game_state.player.faction_id);
-                            let charting_limit = player_range.min(CHARTING_RANGE_WORLD_MAX);
-                            if anchor_distance > charting_limit {
-                                self.game_notice = Some(format!(
-                                    "Charting denied: nearest {} anchor is {:.0} units away (charting limit {:.0}).",
-                                    anchor_kind, anchor_distance, charting_limit
-                                ));
-                                return;
-                            }
-
-                            let normalized_distance = if charting_limit > 0.0 {
-                                (anchor_distance / charting_limit).clamp(0.0, 1.0)
-                            } else {
-                                1.0
-                            };
-                            charting_duration_scale =
-                                1.0 + normalized_distance * (CHARTING_DISTANCE_TIME_MULTIPLIER_MAX - 1.0);
-                            survey_resource_cost = ((CHARTING_RESOURCE_COST_BASE as f32)
-                                * (1.0
-                                    + normalized_distance
-                                        * (CHARTING_RESOURCE_COST_MULTIPLIER_MAX - 1.0)))
-                                .round() as i64;
-                        }
-
-                        let faction_treasury_available = self
-                            .game_state
-                            .factions
-                            .get(&self.game_state.player.faction_id)
-                            .map(|faction| faction.treasury)
-                            .unwrap_or(0);
-                        if faction_treasury_available < survey_resource_cost {
-                            let action_text = if next_stage == SurveyStage::Located {
-                                "Charting"
-                            } else {
-                                "Survey"
-                            };
-                            self.game_notice = Some(format!(
-                                "{} denied: requires {} treasury resources (available {}).",
-                                action_text,
-                                survey_resource_cost,
-                                faction_treasury_available
-                            ));
-                            return;
-                        }
-
-                        let surveyed_body_count = if next_stage >= SurveyStage::PlanetarySurvey {
-                            detail.planets.len().min(u16::MAX as usize) as u16
-                        } else {
-                            0
-                        };
-                        let viable_body_index = if next_stage >= SurveyStage::ColonyAssessment {
-                            detail
-                                .planets
-                                .iter()
-                                .position(|planet| planet.kind == PlanetKind::EarthLikeWorld)
-                                .or_else(|| detail.planets.iter().position(|planet| planet.habitable))
-                                .or_else(|| {
-                                    if detail.planets.is_empty() {
-                                        None
-                                    } else {
-                                        Some(0)
-                                    }
-                                })
-                                .map(|index| index as u16)
-                                .or_else(|| {
-                                    if detail.planets.is_empty() {
-                                        Some(u16::MAX)
-                                    } else {
-                                        None
-                                    }
-                                })
-                        } else {
-                            None
-                        };
-                        let habitable_body_count = if next_stage >= SurveyStage::PlanetarySurvey {
-                            detail
-                                .planets
-                                .iter()
-                                .filter(|planet| planet.habitable)
-                                .count()
-                                .min(u16::MAX as usize) as u16
-                        } else {
-                            0
-                        };
-
-                        match self.game_state.queue_survey_scan(
-                            detail.id,
-                            self.game_state.player_faction_name().to_owned(),
-                            self.game_state.current_year,
-                            next_stage,
-                            surveyed_body_count,
-                            habitable_body_count,
-                            viable_body_index,
-                            charting_duration_scale,
-                        ) {
-                            Ok(duration_years) => {
-                                if survey_resource_cost > 0 {
-                                    if let Some(faction) = self
-                                        .game_state
-                                        .factions
-                                        .get_mut(&self.game_state.player.faction_id)
-                                    {
-                                        faction.treasury = faction
-                                            .treasury
-                                            .saturating_sub(survey_resource_cost);
-                                    }
-                                    self.game_autosave_accum_years = 0.0;
-                                    self.persist_game_state();
-                                }
-                                self.game_notice = Some(format!(
-                                    "{} queued. Completion in {:.2} strategic years. Treasury cost: {}.",
-                                    current_stage.action_label(),
-                                    duration_years,
-                                    survey_resource_cost.max(0)
-                                ));
-                            }
-                            Err(message) => {
-                                self.game_notice = Some(message.to_owned());
-                            }
-                        }
-
-                        if let Some(selected) = self.selected_system.as_mut() {
-                            selected.explored = self.game_state.is_system_explored(selected.id);
-                        }
-                    } else {
-                        self.game_notice = Some("This system has already been fully assessed.".to_owned());
-                    }
-                }
-            }
-            if window_found_colony {
-                if let Some(detail) = self.selected_system.clone() {
-                    let pre_colony = self.game_state.player.starting_colony_id.is_none();
-                    let survey_stage = self.game_state.survey_stage(detail.id);
-                    if !pre_colony && survey_stage < SurveyStage::ColonyAssessment {
-                        self.game_notice = Some(
-                            "Colonization denied: complete a colony assessment first.".to_owned(),
-                        );
-                        return;
-                    }
-
-                    let candidate_body = self
-                        .game_state
-                        .colony_candidate_body(detail.id)
-                        .or_else(|| {
-                            if detail.planets.is_empty() {
-                                Some(u16::MAX)
-                            } else {
-                                Some(0)
-                            }
-                        });
-
-                    if let Some(body_index) = candidate_body {
-                        if self.game_state.has_colony_at(detail.id, body_index)
-                            || self
-                                .game_state
-                                .pending_colony_founding_for_target(detail.id, body_index)
-                                .is_some()
-                        {
-                            self.game_notice = Some(
-                                "A colony already exists or is already being established at this colony site."
-                                    .to_owned(),
-                            );
-                        } else {
-                            let is_home_system_colony = self
-                                .game_state
-                                .player
-                                .home_system
-                                .map(|home_system| home_system == detail.id)
-                                .unwrap_or(false);
-
-                            let mut source_colony_id_opt: Option<u64> = None;
-                            let mut colonists_to_send = self
-                                .colony_transfer_colonists
-                                .clamp(COLONY_TRANSFER_POP_MIN, COLONY_TRANSFER_POP_MAX);
-                            let source_distance = if is_home_system_colony {
-                                colonists_to_send = COLONY_TRANSFER_POP_MIN;
-                                0.0
-                            } else {
-                                let Some(source_colony_id) = self.colony_source_selection else {
-                                    self.game_notice = Some(
-                                        "Select a source colony for this expedition first.".to_owned(),
-                                    );
-                                    return;
-                                };
-
-                                let Some(source_colony) = self.game_state.colonies.get(&source_colony_id) else {
-                                    self.game_notice = Some(
-                                        "Selected source colony could not be found.".to_owned(),
-                                    );
-                                    return;
-                                };
-                                if source_colony.owner_faction != self.game_state.player.faction_id {
-                                    self.game_notice = Some(
-                                        "Selected source colony is not owned by your faction.".to_owned(),
-                                    );
-                                    return;
-                                }
-
-                                let source_population = source_colony.population.max(0.0) as u64;
-                                if source_population
-                                    < (colonists_to_send as u64 + COLONY_TRANSFER_POP_MIN as u64)
-                                {
-                                    self.game_notice = Some(format!(
-                                        "Colonization denied: source colony needs at least {} population plus {} reserve.",
-                                        colonists_to_send,
-                                        COLONY_TRANSFER_POP_MIN,
-                                    ));
-                                    return;
-                                }
-
-                                source_colony_id_opt = Some(source_colony_id);
-                                world_distance(source_colony.system_pos, detail.pos)
-                            };
-
-                            let allowed_range = self
-                                .game_state
-                                .faction_colonization_range_world(&self.game_state.player.faction_id);
-                            if source_distance > allowed_range {
-                                self.game_notice = Some(format!(
-                                    "Colonization denied: source colony is {:.0} units from target (limit {:.0}).",
-                                    source_distance,
-                                    allowed_range,
-                                ));
-                                return;
-                            }
-
-                            let colony_id = self.game_state.reserve_colony_id();
-                            let colony_name = format!("{} Colony {}", detail.display_name, colony_id);
-                            let habitable_site = if body_index == u16::MAX {
-                                false
-                            } else {
-                                detail
-                                    .planets
-                                    .get(body_index as usize)
-                                    .map(|planet| planet.habitable)
-                                    .unwrap_or(false)
-                            };
-                            let earth_like_world = if body_index == u16::MAX {
-                                false
-                            } else {
-                                detail
-                                    .planets
-                                    .get(body_index as usize)
-                                    .map(|planet| planet.kind == PlanetKind::EarthLikeWorld)
-                                    .unwrap_or(false)
-                            };
-                            let element_resource_profile = if body_index == u16::MAX {
-                                HashMap::new()
-                            } else {
-                                detail
-                                    .planets
-                                    .get(body_index as usize)
-                                    .map(|planet| {
-                                        planet
-                                            .composition
-                                            .iter()
-                                            .map(|component| {
-                                                (component.symbol.clone(), component.percent.max(0.0))
-                                            })
-                                            .collect::<HashMap<_, _>>()
-                                    })
-                                    .unwrap_or_default()
-                            };
-                            let atmosphere_resource_profile = if body_index == u16::MAX {
-                                HashMap::new()
-                            } else {
-                                detail
-                                    .planets
-                                    .get(body_index as usize)
-                                    .map(|planet| {
-                                        planet
-                                            .atmosphere
-                                            .iter()
-                                            .map(|gas| (gas.formula.clone(), gas.percent.max(0.0)))
-                                            .collect::<HashMap<_, _>>()
-                                    })
-                                    .unwrap_or_default()
-                            };
-                            let atmosphere_pressure_atm = if body_index == u16::MAX {
-                                0.0
-                            } else {
-                                detail
-                                    .planets
-                                    .get(body_index as usize)
-                                    .map(|planet| planet.atmosphere_pressure_atm.max(0.0))
-                                    .unwrap_or(0.0)
-                            };
-
-                            let normalized_distance = if allowed_range > 0.0 {
-                                (source_distance / allowed_range).clamp(0.0, 1.0)
-                            } else {
-                                1.0
-                            };
-                            let treasury_cost = if is_home_system_colony {
-                                0
-                            } else {
-                                ((COLONY_ESTABLISH_RESOURCE_COST_BASE as f32)
-                                    * (1.0
-                                        + normalized_distance
-                                            * (COLONY_ESTABLISH_RESOURCE_COST_MULTIPLIER_MAX - 1.0)))
-                                    .round() as i64
-                            };
-                            let faction_treasury_available = self
-                                .game_state
-                                .factions
-                                .get(&self.game_state.player.faction_id)
-                                .map(|faction| faction.treasury)
-                                .unwrap_or(0);
-
-                            if faction_treasury_available < treasury_cost {
-                                self.game_notice = Some(format!(
-                                    "Colonization denied: requires {} treasury resources (available {}).",
-                                    treasury_cost,
-                                    faction_treasury_available,
-                                ));
-                                return;
-                            }
-
-                            let transfer_duration = COLONY_TRANSFER_TIME_YEARS_BASE
-                                * (1.0
-                                    + normalized_distance
-                                        * (COLONY_TRANSFER_TIME_YEARS_MULTIPLIER_MAX - 1.0));
-
-                            let pending = PendingColonyFounding {
-                                colony_id,
-                                colony_name,
-                                founder_faction: self.game_state.player.faction_id.clone(),
-                                system: detail.id,
-                                body_index,
-                                habitable_site,
-                                earth_like_world,
-                                system_pos: detail.pos,
-                                element_resource_profile,
-                                atmosphere_resource_profile,
-                                atmosphere_pressure_atm,
-                                source_colony_id: source_colony_id_opt,
-                                colonists_sent: colonists_to_send,
-                                start_year: self.game_state.current_year,
-                                complete_year: self.game_state.current_year + transfer_duration,
-                            };
-
-                            match self.game_state.queue_colony_founding(self.game_state.current_year, pending) {
-                                Ok(duration_years) => {
-                                    if let Some(faction) = self
-                                        .game_state
-                                        .factions
-                                        .get_mut(&self.game_state.player.faction_id)
-                                    {
-                                        faction.treasury = faction.treasury.saturating_sub(treasury_cost);
-                                    }
-                                    self.game_autosave_accum_years = 0.0;
-                                    self.persist_game_state();
-
-                                    self.game_notice = Some(format!(
-                                        "Colony expedition launched{} with {} colonists. ETA {:.2}y. Treasury cost: {}{}.",
-                                        source_colony_id_opt
-                                            .map(|id| format!(" from #{}", id))
-                                            .unwrap_or_else(|| " (home-system bypass)".to_owned()),
-                                        colonists_to_send,
-                                        duration_years,
-                                        treasury_cost,
-                                        if is_home_system_colony {
-                                            " (home system colony is free)"
-                                        } else {
-                                            ""
-                                        }
-                                    ));
-                                }
-                                Err(message) => {
-                                    self.game_notice = Some(message.to_owned());
-                                }
-                            }
-                        }
-                    } else {
-                        self.game_notice = Some(
-                            "Colonization denied: no colony site could be determined for this system."
-                                .to_owned(),
-                        );
-                    }
-                }
-            }
             if window_close {
                 self.selected_system = None;
             }
@@ -5855,7 +4350,6 @@ impl eframe::App for GalaxyApp {
         self.show_resources_window(ctx);
         self.show_colonies_window(ctx, center3d);
         self.show_favorites_window(ctx, center3d);
-        self.show_construction_window(ctx);
         self.show_settings_window(ctx);
         self.show_music_window(ctx);
 

@@ -30,7 +30,7 @@ mod survey_records_serde {
     }
 }
 
-pub const PLAYER_FACTION_ID: &str = "player-commonwealth";
+pub const PLAYER_FACTION_ID: &str = "raccoon-flood";
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum SurveyStage {
@@ -63,6 +63,7 @@ impl SurveyStage {
         }
     }
 
+    #[allow(dead_code)]
     pub fn action_label(self) -> &'static str {
         match self {
             SurveyStage::Unknown => "Chart System",
@@ -152,6 +153,7 @@ pub enum ColonyBuildingKind {
 }
 
 impl ColonyBuildingKind {
+    #[allow(dead_code)]
     pub const ALL: [Self; 8] = [
         ColonyBuildingKind::SpaceStation,
         ColonyBuildingKind::IndustrialHub,
@@ -163,6 +165,7 @@ impl ColonyBuildingKind {
         ColonyBuildingKind::EntertainmentPlaza,
     ];
 
+    #[allow(dead_code)]
     pub fn all() -> [Self; 8] {
         Self::ALL
     }
@@ -183,9 +186,11 @@ impl ColonyBuildingKind {
 
     pub fn label(self) -> &'static str { self.definition().label }
     pub fn max_level(self) -> u16 { self.definition().max_level }
+    #[allow(dead_code)]
     pub fn queue_button_label(self) -> &'static str { self.definition().queue_button_label }
     pub fn is_player_queueable(self) -> bool { self.definition().is_player_queueable }
     pub fn consumes_site_slot(self) -> bool { self.is_player_queueable() }
+    #[allow(dead_code)]
     pub fn role_description(self) -> &'static str { self.definition().role_description }
     pub fn requires_solid_planet_surface(self) -> bool { self.definition().requires_solid_surface }
     pub fn requires_atmosphere(self) -> bool { self.definition().requires_atmosphere }
@@ -199,6 +204,7 @@ impl ColonyBuildingKind {
         }
     }
 
+    #[allow(dead_code)]
     pub fn effect_preview_per_level(self) -> ColonyBuildingEffectPreview {
         let modifiers = self.definition().economy_profile.per_level_modifiers;
         ColonyBuildingEffectPreview {
@@ -235,6 +241,7 @@ impl ColonyBuildingSite {
         }
     }
 
+    #[allow(dead_code)]
     pub fn host_for_body_index(body_index: u16) -> Self {
         if body_index == u16::MAX {
             Self::Orbital
@@ -302,9 +309,13 @@ pub struct FactionState {
     pub colonization_tech_level: u32,
     #[serde(default)]
     pub colonization_tech_progress: f32,
+    /// The first colony founded by this faction, which receives reduced upkeep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starting_colony_id: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 pub struct NearestColonyInfo {
     pub system_pos: [f32; 3],
     pub distance: f32,
@@ -340,6 +351,7 @@ pub enum ColonyPolicy {
 
 pub struct ColonyPolicyDefinition {
     pub label: &'static str,
+    #[allow(dead_code)]
     pub description: &'static str,
     /// Baseline per-tick production rates: (food, industry, energy, defense).
     pub production_rates: (f32, f32, f32, f32),
@@ -404,10 +416,12 @@ impl ColonyPolicy {
         self.definition().label
     }
 
+    #[allow(dead_code)]
     pub fn description(self) -> &'static str {
         self.definition().description
     }
 
+    #[allow(dead_code)]
     pub fn all() -> [Self; 4] {
         [
             ColonyPolicy::Balanced,
@@ -429,6 +443,7 @@ pub enum TaxationPolicy {
 
 pub struct TaxationPolicyDefinition {
     pub label: &'static str,
+    #[allow(dead_code)]
     pub description: &'static str,
     /// Revenue multiplier relative to standard taxation.
     pub revenue_multiplier: f64,
@@ -481,10 +496,12 @@ impl TaxationPolicy {
         self.definition().label
     }
 
+    #[allow(dead_code)]
     pub fn description(self) -> &'static str {
         self.definition().description
     }
 
+    #[allow(dead_code)]
     pub fn all() -> [Self; 4] {
         [
             TaxationPolicy::Low,
@@ -611,6 +628,7 @@ pub struct GameState {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct ColonyBuildingCostPreview {
     pub target_level: u16,
     pub duration_years: f32,
@@ -622,6 +640,7 @@ pub struct ColonyBuildingCostPreview {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+#[allow(dead_code)]
 pub struct ColonyBuildingEffectPreview {
     pub food_production_bonus: f32,
     pub industry_production_bonus: f32,
@@ -646,9 +665,132 @@ struct ColonyBuildingResourceCost {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct ElementCost {
-    symbol: &'static str,
-    amount: f32,
+pub(crate) struct ElementCost {
+    pub(crate) symbol: &'static str,
+    pub(crate) amount: f32,
+}
+
+/// Groups of elements that can substitute for one another during construction.
+/// Using a substitute costs `ELEMENT_SUBSTITUTION_PENALTY` times more material.
+pub const ELEMENT_SUBSTITUTION_PENALTY: f32 = 1.5;
+
+/// Returns the substitution group for a given element symbol, if any.
+/// Elements in the same group can substitute for each other.
+#[allow(dead_code)]
+pub fn element_substitution_group(symbol: &str) -> Option<&'static str> {
+    match symbol {
+        // Transition metals (structural)
+        "Fe" | "Ni" | "Co" | "Mn" | "Cr" | "V" => Some("transition_structural"),
+        // Refractory / heavy metals
+        "Ti" | "W" | "Mo" | "Ir" | "Pt" => Some("refractory"),
+        // Light metals
+        "Al" | "Mg" | "Ca" | "Na" | "K" | "Li" => Some("light_metal"),
+        // Conductive metals
+        "Cu" | "Zn" => Some("conductive"),
+        // Metalloids / semiconductor
+        "Si" | "B" => Some("metalloid"),
+        // Non-metals (life-essential)
+        "C" | "S" | "P" => Some("nonmetal_organic"),
+        // Atmospheric non-metals
+        "N" | "O" | "H" | "He" => Some("atmospheric"),
+        // Halogens / noble gases
+        "F" | "Cl" | "Ne" | "Ar" => Some("halogen_noble"),
+        _ => None,
+    }
+}
+
+/// Returns the list of possible substitutes for `symbol` (excluding itself).
+pub fn element_substitutes(symbol: &str) -> &'static [&'static str] {
+    match symbol {
+        "Fe" => &["Ni", "Co", "Mn", "Cr", "V"],
+        "Ni" => &["Fe", "Co", "Mn", "Cr", "V"],
+        "Co" => &["Fe", "Ni", "Mn", "Cr", "V"],
+        "Mn" => &["Fe", "Ni", "Co", "Cr", "V"],
+        "Cr" => &["Fe", "Ni", "Co", "Mn", "V"],
+        "V"  => &["Fe", "Ni", "Co", "Mn", "Cr"],
+        "Ti" => &["W", "Mo", "Ir", "Pt"],
+        "W"  => &["Ti", "Mo", "Ir", "Pt"],
+        "Mo" => &["Ti", "W", "Ir", "Pt"],
+        "Ir" => &["Ti", "W", "Mo", "Pt"],
+        "Pt" => &["Ti", "W", "Mo", "Ir"],
+        "Al" => &["Mg", "Ca", "Na", "K", "Li"],
+        "Mg" => &["Al", "Ca", "Na", "K", "Li"],
+        "Ca" => &["Al", "Mg", "Na", "K", "Li"],
+        "Na" => &["Al", "Mg", "Ca", "K", "Li"],
+        "K"  => &["Al", "Mg", "Ca", "Na", "Li"],
+        "Li" => &["Al", "Mg", "Ca", "Na", "K"],
+        "Cu" => &["Zn"],
+        "Zn" => &["Cu"],
+        "Si" => &["B"],
+        "B"  => &["Si"],
+        "C"  => &["S", "P"],
+        "S"  => &["C", "P"],
+        "P"  => &["C", "S"],
+        "N"  => &["O", "H"],
+        "O"  => &["N", "H"],
+        "H"  => &["N", "O"],
+        _ => &[],
+    }
+}
+
+/// Resolves element costs against a colony's stockpiles, using substitutes
+/// where the primary element is insufficient. Returns the resolved costs as
+/// (symbol, amount) pairs drawing from actual available stockpiles.
+/// Returns `None` if costs cannot be met even with substitution.
+pub fn resolve_element_costs_with_substitution(
+    stockpiles: &HashMap<String, f32>,
+    element_costs: &[ElementCost],
+) -> Option<Vec<(String, f32)>> {
+    // Track remaining availability after each allocation.
+    let mut remaining: HashMap<&str, f32> = HashMap::new();
+    for (sym, &amt) in stockpiles.iter() {
+        remaining.insert(sym.as_str(), amt);
+    }
+
+    let mut resolved: Vec<(String, f32)> = Vec::new();
+
+    for cost in element_costs {
+        let available = remaining.get(cost.symbol).copied().unwrap_or(0.0);
+        if available + 0.0001 >= cost.amount {
+            // Can afford directly.
+            *remaining.entry(cost.symbol).or_insert(0.0) -= cost.amount;
+            resolved.push((cost.symbol.to_owned(), cost.amount));
+            continue;
+        }
+
+        // Use what we have of the primary element, then fill remainder with substitutes.
+        let mut still_needed = cost.amount - available.max(0.0);
+        let primary_used = available.max(0.0);
+        if primary_used > 0.0 {
+            *remaining.entry(cost.symbol).or_insert(0.0) = 0.0;
+            resolved.push((cost.symbol.to_owned(), primary_used));
+        }
+
+        let substitutes = element_substitutes(cost.symbol);
+        for &sub in substitutes {
+            if still_needed <= 0.0001 {
+                break;
+            }
+            let sub_available = remaining.get(sub).copied().unwrap_or(0.0);
+            if sub_available < 0.01 {
+                continue;
+            }
+            // Substitutes cost more (penalty multiplier).
+            let sub_needed = still_needed * ELEMENT_SUBSTITUTION_PENALTY;
+            let sub_used = sub_available.min(sub_needed);
+            *remaining.entry(sub).or_insert(0.0) -= sub_used;
+            // How much of the original requirement does this cover?
+            let original_covered = sub_used / ELEMENT_SUBSTITUTION_PENALTY;
+            still_needed -= original_covered;
+            resolved.push((sub.to_owned(), sub_used));
+        }
+
+        if still_needed > 0.0001 {
+            return None; // Cannot meet this cost even with substitution.
+        }
+    }
+
+    Some(resolved)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -704,6 +846,7 @@ pub enum ColonyBuildingSiteType {
 /// [`ColonyBuildingKind::definition`].  Everything else (UI, costs, tick
 /// effects) is derived automatically from the data here.
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 pub struct ColonyBuildingDefinition {
     pub label: &'static str,
     pub queue_button_label: &'static str,
@@ -757,7 +900,7 @@ const BUILDING_DEF_SPACE_STATION: ColonyBuildingDefinition = ColonyBuildingDefin
             treasury_production_bonus: 0.0,
             stability_bonus: 0.0,
             growth_bonus: 0.0,
-            annual_upkeep: 1_400,
+            annual_upkeep: 400,
         },
     },
     element_cost_scales: &[],
@@ -796,7 +939,7 @@ const BUILDING_DEF_INDUSTRIAL_HUB: ColonyBuildingDefinition = ColonyBuildingDefi
             treasury_production_bonus: 0.0,
             stability_bonus: 0.0,
             growth_bonus: 0.0,
-            annual_upkeep: 5_800,
+            annual_upkeep: 800,
         },
     },
     element_cost_scales: &[
@@ -843,7 +986,7 @@ const BUILDING_DEF_AGRI_DOME: ColonyBuildingDefinition = ColonyBuildingDefinitio
             treasury_production_bonus: 0.0,
             stability_bonus: 0.0,
             growth_bonus: 0.0,
-            annual_upkeep: 4_300,
+            annual_upkeep: 750,
         },
     },
     element_cost_scales: &[
@@ -891,7 +1034,7 @@ const BUILDING_DEF_DEEP_MANTLE_MINING: ColonyBuildingDefinition = ColonyBuilding
             treasury_production_bonus: 0.0,
             stability_bonus: 0.0,
             growth_bonus: 0.0,
-            annual_upkeep: 7_000,
+            annual_upkeep: 900,
         },
     },
     element_cost_scales: &[
@@ -939,7 +1082,7 @@ const BUILDING_DEF_ATMOSPHERE_HARVESTER: ColonyBuildingDefinition = ColonyBuildi
             treasury_production_bonus: 0.0,
             stability_bonus: 0.0,
             growth_bonus: 0.0,
-            annual_upkeep: 5_200,
+            annual_upkeep: 700,
         },
     },
     element_cost_scales: &[
@@ -988,7 +1131,7 @@ const BUILDING_DEF_FUEL_SCOOP_DRONE_SWARM: ColonyBuildingDefinition = ColonyBuil
             treasury_production_bonus: 0.0,
             stability_bonus: 0.0,
             growth_bonus: 0.0,
-            annual_upkeep: 5_400,
+            annual_upkeep: 650,
         },
     },
     element_cost_scales: &[
@@ -1037,7 +1180,7 @@ const BUILDING_DEF_TRADING_HUB: ColonyBuildingDefinition = ColonyBuildingDefinit
             treasury_production_bonus: 2_200.0,
             stability_bonus: 0.0,
             growth_bonus: 0.0,
-            annual_upkeep: 4_800,
+            annual_upkeep: 1_500,
         },
     },
     element_cost_scales: &[
@@ -1084,7 +1227,7 @@ const BUILDING_DEF_ENTERTAINMENT_PLAZA: ColonyBuildingDefinition = ColonyBuildin
             treasury_production_bonus: 0.0,
             stability_bonus: 0.0035,
             growth_bonus: 0.00025,
-            annual_upkeep: 3_600,
+            annual_upkeep: 1_000,
         },
     },
     element_cost_scales: &[
@@ -1113,10 +1256,11 @@ impl Default for GameState {
             PLAYER_FACTION_ID.to_owned(),
             FactionState {
                 id: PLAYER_FACTION_ID.to_owned(),
-                display_name: "Player Commonwealth".to_owned(),
+                display_name: "Flood of Raccoons".to_owned(),
                 treasury: 1_250_000,
                 colonization_tech_level: 0,
                 colonization_tech_progress: 0.0,
+                starting_colony_id: None,
             },
         );
         factions.insert(
@@ -1127,6 +1271,7 @@ impl Default for GameState {
                 treasury: 2_800_000,
                 colonization_tech_level: 0,
                 colonization_tech_progress: 0.0,
+                starting_colony_id: None,
             },
         );
         factions.insert(
@@ -1137,6 +1282,7 @@ impl Default for GameState {
                 treasury: 2_100_000,
                 colonization_tech_level: 0,
                 colonization_tech_progress: 0.0,
+                starting_colony_id: None,
             },
         );
 
@@ -1168,10 +1314,9 @@ impl GameState {
     const MIN_ANNUAL_GROWTH_HABITABLE: f64 = -0.010;
     const MIN_ANNUAL_GROWTH_HOSTILE: f64 = -0.014;
     const TAXABLE_POPULATION_SATURATION: f64 = 9_000_000.0;
-    const POPULATION_UPKEEP_LINEAR_PER_PERSON: f64 = 0.034;
-    const POPULATION_UPKEEP_QUADRATIC_PER_PERSON_SQUARED: f64 = 0.000000010;
+    const POPULATION_UPKEEP_LINEAR_PER_PERSON: f64 = 0.018;
+    const POPULATION_UPKEEP_QUADRATIC_PER_PERSON_SQUARED: f64 = 0.000000005;
     const STARTING_COLONY_MIN_POPULATION: u32 = 10_000;
-    const STARTING_COLONY_UPKEEP_FACTOR: f64 = 0.35;
 
     fn element_distribution_weights() -> &'static [(&'static str, f32)] {
         const WEIGHTS: [(&str, f32); 12] = [
@@ -1210,7 +1355,7 @@ impl GameState {
         stockpiles
     }
 
-    fn player_starting_colony_element_stockpile_targets() -> &'static [(&'static str, f32)] {
+    fn starting_colony_element_stockpile_targets() -> &'static [(&'static str, f32)] {
         const TARGETS: [(&str, f32); 12] = [
             ("Fe", 140.0),
             ("Si", 120.0),
@@ -1228,8 +1373,8 @@ impl GameState {
         &TARGETS
     }
 
-    fn seed_player_starting_colony_element_stockpiles(colony: &mut ColonyState) {
-        for (symbol, min_amount) in Self::player_starting_colony_element_stockpile_targets() {
+    fn seed_starting_colony_element_stockpiles(colony: &mut ColonyState) {
+        for (symbol, min_amount) in Self::starting_colony_element_stockpile_targets() {
             let entry = colony
                 .element_stockpiles
                 .entry((*symbol).to_owned())
@@ -1354,17 +1499,11 @@ impl GameState {
         cost: ColonyBuildingResourceCost,
         element_costs: &[ElementCost],
     ) -> bool {
-        element_costs.iter().all(|entry| {
-            colony
-                .element_stockpiles
-                .get(entry.symbol)
-                .copied()
-                .unwrap_or(0.0)
-                + 0.0001
-                >= entry.amount
-        }) && colony.food_stockpile + 0.0001 >= cost.food
+        colony.food_stockpile + 0.0001 >= cost.food
             && colony.industry_stockpile + 0.0001 >= cost.industry
             && colony.energy_stockpile + 0.0001 >= cost.energy
+            && resolve_element_costs_with_substitution(&colony.element_stockpiles, element_costs)
+                .is_some()
     }
 
     fn spend_colony_resource_cost(
@@ -1372,12 +1511,24 @@ impl GameState {
         cost: ColonyBuildingResourceCost,
         element_costs: &[ElementCost],
     ) {
-        for entry in element_costs {
-            let value = colony
-                .element_stockpiles
-                .entry(entry.symbol.to_owned())
-                .or_insert(0.0);
-            *value = (*value - entry.amount).max(0.0);
+        // Resolve with substitution, then spend accordingly.
+        if let Some(resolved) = resolve_element_costs_with_substitution(&colony.element_stockpiles, element_costs) {
+            for (symbol, amount) in resolved {
+                let value = colony
+                    .element_stockpiles
+                    .entry(symbol)
+                    .or_insert(0.0);
+                *value = (*value - amount).max(0.0);
+            }
+        } else {
+            // Fallback: direct deduction (should not happen if can_afford was checked).
+            for entry in element_costs {
+                let value = colony
+                    .element_stockpiles
+                    .entry(entry.symbol.to_owned())
+                    .or_insert(0.0);
+                *value = (*value - entry.amount).max(0.0);
+            }
         }
         colony.food_stockpile = (colony.food_stockpile - cost.food).max(0.0);
         colony.industry_stockpile = (colony.industry_stockpile - cost.industry).max(0.0);
@@ -1396,6 +1547,7 @@ impl GameState {
         400.0
     }
 
+    #[allow(dead_code)]
     pub fn planet_building_slot_capacity_for_radius(radius_earth: f32) -> u16 {
         let radius = radius_earth.max(0.02);
         if radius < 0.45 {
@@ -1505,6 +1657,7 @@ impl GameState {
         None
     }
 
+    #[allow(dead_code)]
     pub fn player_faction_name(&self) -> &str {
         self.factions
             .get(&self.player.faction_id)
@@ -1595,7 +1748,7 @@ impl GameState {
     }
 
     fn colony_tax_revenue_annual(colony: &ColonyState) -> i64 {
-        let base_per_person = 0.16_f64;
+        let base_per_person = 0.64_f64;
         let stability_factor = colony.stability.clamp(0.2, 1.0) as f64;
         let policy_factor = colony.taxation_policy.multiplier();
         let taxable_population = Self::taxable_population(colony.population);
@@ -1606,10 +1759,10 @@ impl GameState {
 
     fn colony_upkeep_cost_annual(colony: &ColonyState) -> i64 {
         let stage_base = match colony.stage {
-            ColonyStage::Outpost => 6_500,
-            ColonyStage::Settlement => 28_000,
-            ColonyStage::City => 180_000,
-            ColonyStage::CoreWorld => 950_000,
+            ColonyStage::Outpost => 3_500,
+            ColonyStage::Settlement => 15_000,
+            ColonyStage::City => 95_000,
+            ColonyStage::CoreWorld => 500_000,
         };
         let policy_factor = colony.policy.definition().upkeep_multiplier;
         let defense_factor = 1.0 + colony.defense_balance.max(0.0) as f64 * 1.6;
@@ -1828,16 +1981,22 @@ impl GameState {
     }
 
     /// Minimum colonists that must remain in a colony after a transfer.
+    #[allow(dead_code)]
     const TRANSFER_MIN_REMAINING_POP: u64 = 500;
     /// Stability cost applied to the source colony when a transfer departs.
+    #[allow(dead_code)]
     const TRANSFER_SOURCE_STABILITY_COST: f32 = 0.12;
     /// Stability cost applied to the destination colony when a transfer arrives.
+    #[allow(dead_code)]
     const TRANSFER_DEST_STABILITY_COST: f32 = 0.15;
     /// Base transit duration in years (scaled by distance).
+    #[allow(dead_code)]
     const TRANSFER_BASE_DURATION_YEARS: f32 = 0.4;
     /// Treasury cost per colonist transferred.
+    #[allow(dead_code)]
     const TRANSFER_COST_PER_COLONIST: f64 = 1.8;
 
+    #[allow(dead_code)]
     pub fn queue_population_transfer(
         &mut self,
         source_colony_id: u64,
@@ -1959,6 +2118,7 @@ impl GameState {
         Some((elapsed / total).clamp(0.0, 1.0))
     }
 
+    #[allow(dead_code)]
     pub fn colony_candidate_body(&self, system: SystemId) -> Option<u16> {
         let record = self.survey_record(system)?;
         if record.stage >= SurveyStage::ColonyAssessment {
@@ -2014,6 +2174,7 @@ impl GameState {
         id
     }
 
+    #[allow(dead_code)]
     pub fn nearest_colony_for_faction(
         &self,
         faction_id: &str,
@@ -2245,10 +2406,23 @@ impl GameState {
                     },
                 );
 
-                if is_player_starting_colony {
-                    if let Some(colony) = self.colonies.get_mut(colony_id) {
-                        Self::seed_player_starting_colony_element_stockpiles(colony);
+                // Mark this as the faction's starting colony if it doesn't have one yet.
+                let is_faction_starting_colony = self
+                    .factions
+                    .get(founder_faction)
+                    .is_some_and(|f| f.starting_colony_id.is_none());
+                if let Some(faction) = self.factions.get_mut(founder_faction) {
+                    if faction.starting_colony_id.is_none() {
+                        faction.starting_colony_id = Some(*colony_id);
                     }
+                }
+                // Seed element stockpiles for any faction's starting colony.
+                if is_faction_starting_colony {
+                    if let Some(colony) = self.colonies.get_mut(colony_id) {
+                        Self::seed_starting_colony_element_stockpiles(colony);
+                    }
+                }
+                if is_player_starting_colony {
                     let _ = self.set_player_starting_colony(*colony_id);
                 }
             }
@@ -2303,8 +2477,6 @@ impl GameState {
             }
         }
 
-        let player_starting_colony_id = self.player.starting_colony_id;
-        let player_faction_id = self.player.faction_id.clone();
         let mut treasury_delta_by_faction = HashMap::<String, i64>::new();
         for colony in self.colonies.values_mut() {
             let habitability_bonus = if colony.earth_like_world {
@@ -2537,17 +2709,8 @@ impl GameState {
             } else {
                 0
             };
-            let is_player_starting_colony = player_starting_colony_id == Some(colony.id)
-                && colony.owner_faction == player_faction_id;
-            let full_upkeep_cost_annual =
+            let upkeep_cost_annual =
                 Self::colony_upkeep_cost_annual(colony).saturating_add(building_upkeep_bonus_annual);
-            let upkeep_cost_annual = if is_player_starting_colony {
-                ((full_upkeep_cost_annual as f64) * Self::STARTING_COLONY_UPKEEP_FACTOR)
-                    .round()
-                    .max(0.0) as i64
-            } else {
-                full_upkeep_cost_annual
-            };
             let net_annual = tax_revenue_annual + trading_hub_revenue_annual - upkeep_cost_annual;
 
             colony.last_tax_revenue_annual = tax_revenue_annual;
@@ -2785,19 +2948,23 @@ mod tests {
     }
 
     #[test]
-    fn player_starting_colony_gets_discounted_upkeep() {
+    fn starting_colony_pays_full_upkeep() {
         let mut state = GameState::default();
         let mut colony = test_colony(3, 2_000_000.0);
         colony.owner_faction = state.player.faction_id.clone();
         colony.stage = ColonyStage::City;
         state.player.starting_colony_id = Some(colony.id);
+        if let Some(faction) = state.factions.get_mut(&state.player.faction_id) {
+            faction.starting_colony_id = Some(colony.id);
+        }
         state.colonies.insert(colony.id, colony);
 
         state.advance_strategic_tick(0.25);
         let updated = state.colonies.get(&3).unwrap();
 
         assert!(updated.last_upkeep_cost_annual > 0);
-        assert!(updated.last_upkeep_cost_annual < GameState::colony_upkeep_cost_annual(updated));
+        // No discount: upkeep should match the full calculated upkeep (plus building upkeep).
+        assert!(updated.last_upkeep_cost_annual >= GameState::colony_upkeep_cost_annual(updated));
     }
 
     #[test]
@@ -3039,7 +3206,7 @@ mod tests {
 
         let colony = state.colonies.get(&88).expect("colony should exist");
         assert_eq!(state.player.starting_colony_id, Some(88));
-        for (symbol, min_amount) in GameState::player_starting_colony_element_stockpile_targets() {
+        for (symbol, min_amount) in GameState::starting_colony_element_stockpile_targets() {
             let amount = colony.element_stockpiles.get(*symbol).copied().unwrap_or(0.0);
             assert!(
                 amount + 0.0001 >= *min_amount,
