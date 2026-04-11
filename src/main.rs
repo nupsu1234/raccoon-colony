@@ -27,6 +27,7 @@ use crate::sim_tick::StrategicClock;
 mod events;
 mod game_state;
 mod gpu_stars;
+mod music;
 mod procedural_galaxy;
 mod save;
 mod sim_tick;
@@ -426,6 +427,8 @@ pub struct GalaxyApp {
     travel_atmosphere_info_open: bool,
     colony_source_selection: Option<u64>,
     colony_transfer_colonists: u32,
+    music_player: music::MusicPlayer,
+    music_window_open: bool,
 }
 
 impl Default for GalaxyApp {
@@ -456,13 +459,7 @@ impl Default for GalaxyApp {
                     Some(format!("Failed to load game save: {err}")),
                 ),
             };
-        // Reconcile colony positions with the procedural galaxy so that
-        // colony markers always sit on top of their actual star after a
-        // reload (the stored system_pos may drift when the generator
-        // parameters change between compilations).
-        // When the index-based lookup fails (sector shrank due to parameter
-        // changes), fall back to a spatial search and rebind the colony to
-        // the nearest system.
+            
         let mut rebound_system_ids: Vec<(SystemId, SystemId)> = Vec::new();
         for colony in game_state.colonies.values_mut() {
             if let Some(summary) = procedural_generator.find_system_summary(colony.system) {
@@ -478,8 +475,7 @@ impl Default for GalaxyApp {
                 rebound_system_ids.push((old_id, nearest.id));
             }
         }
-        // Patch explored_systems and survey_records so the rebound system
-        // IDs stay consistent with the new colony references.
+
         for (old_id, new_id) in &rebound_system_ids {
             if game_state.explored_systems.remove(old_id) {
                 game_state.explored_systems.insert(*new_id);
@@ -588,6 +584,8 @@ impl Default for GalaxyApp {
             travel_atmosphere_info_open: false,
             colony_source_selection: loaded_starting_colony,
             colony_transfer_colonists: COLONY_TRANSFER_POP_MIN,
+            music_player: music::MusicPlayer::new(),
+            music_window_open: false,
         }
     }
 }
@@ -778,6 +776,120 @@ impl GalaxyApp {
         self.game_notice = Some(format!(
             "Simulation restarted with seed {galaxy_seed}. Saved progress reset.",
         ));
+    }
+
+    fn show_music_window(&mut self, ctx: &egui::Context) {
+        self.music_player.tick();
+
+        if !self.music_window_open {
+            return;
+        }
+
+        let mut open = self.music_window_open;
+        egui::Window::new("Music Player")
+            .open(&mut open)
+            .resizable(true)
+            .default_size([360.0, 400.0])
+            .show(ctx, |ui| {
+                // Now-playing header
+                if let Some(name) = self.music_player.current_track_name() {
+                    ui.label(
+                        egui::RichText::new(format!("Now playing: {name}"))
+                            .strong()
+                            .color(egui::Color32::from_rgb(180, 220, 255)),
+                    );
+                } else {
+                    ui.label(egui::RichText::new("No track playing").weak());
+                }
+
+                ui.separator();
+
+                // Transport controls
+                ui.horizontal(|ui| {
+                    if ui.button("⏮").on_hover_text("Previous").clicked() {
+                        self.music_player.previous_track();
+                    }
+                    if self.music_player.is_playing() {
+                        if ui.button("⏸").on_hover_text("Pause").clicked() {
+                            self.music_player.pause();
+                        }
+                    } else if self.music_player.is_paused() {
+                        if ui.button("▶").on_hover_text("Resume").clicked() {
+                            self.music_player.resume();
+                        }
+                    } else if ui.button("▶").on_hover_text("Play").clicked() {
+                        self.music_player.next_track();
+                    }
+                    if ui.button("⏹").on_hover_text("Stop").clicked() {
+                        self.music_player.stop();
+                    }
+                    if ui.button("⏭").on_hover_text("Next").clicked() {
+                        self.music_player.next_track();
+                    }
+                });
+
+                ui.add_space(4.0);
+
+                // Volume slider
+                ui.horizontal(|ui| {
+                    ui.label("Volume:");
+                    let mut vol = self.music_player.volume();
+                    if ui
+                        .add(egui::Slider::new(&mut vol, 0.0..=1.0).show_value(true))
+                        .changed()
+                    {
+                        self.music_player.set_volume(vol);
+                    }
+                });
+
+                // Shuffle toggle
+                ui.horizontal(|ui| {
+                    let mut shuffle = self.music_player.shuffle();
+                    if ui.checkbox(&mut shuffle, "Shuffle").changed() {
+                        self.music_player.set_shuffle(shuffle);
+                    }
+                });
+
+                ui.separator();
+
+                // Track list
+                let track_count = self.music_player.tracks().len();
+                if track_count == 0 {
+                    ui.label("No music files found in the 'music/' folder.");
+                    ui.small("Supported formats: mp3, ogg, wav, flac");
+                } else {
+                    ui.small(format!("{track_count} tracks"));
+                    let current = self.music_player.current_index();
+                    let mut play_index = None;
+
+                    egui::ScrollArea::vertical()
+                        .max_height(260.0)
+                        .show(ui, |ui| {
+                            for (idx, track) in self.music_player.tracks().iter().enumerate() {
+                                let is_current = current == Some(idx);
+                                let label = if is_current {
+                                    egui::RichText::new(&track.name)
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(120, 200, 255))
+                                } else {
+                                    egui::RichText::new(&track.name)
+                                };
+                                if ui
+                                    .add(egui::Label::new(label).sense(egui::Sense::click()))
+                                    .clicked()
+                                {
+                                    play_index = Some(idx);
+                                }
+                            }
+                        });
+
+                    if let Some(idx) = play_index {
+                        self.music_player.play_track(idx);
+                    }
+                }
+            });
+
+        self.music_window_open = open;
     }
 
     fn show_settings_window(&mut self, ctx: &egui::Context) {
@@ -4245,6 +4357,16 @@ impl eframe::App for GalaxyApp {
                     self.settings_lod_preset = self.lod_preset;
                 }
                 if ui
+                    .button(if self.music_window_open {
+                        "Hide music"
+                    } else {
+                        "Music"
+                    })
+                    .clicked()
+                {
+                    self.music_window_open = !self.music_window_open;
+                }
+                if ui
                     .button(if self.resources_panel_open {
                         "Hide resources"
                     } else {
@@ -5735,6 +5857,7 @@ impl eframe::App for GalaxyApp {
         self.show_favorites_window(ctx, center3d);
         self.show_construction_window(ctx);
         self.show_settings_window(ctx);
+        self.show_music_window(ctx);
 
         // Keep simulation and rendering advancing even when there is no input.
         // eframe/egui is otherwise event-driven and may sleep between interactions.
