@@ -1,9 +1,34 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::events::GameEvent;
 use crate::procedural_galaxy::SystemId;
+
+mod survey_records_serde {
+    use super::*;
+    use serde::{Deserializer, Serializer, ser::SerializeSeq};
+
+    pub fn serialize<S>(map: &HashMap<SystemId, SystemSurveyRecord>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(map.len()))?;
+        for record in map.values() {
+            seq.serialize_element(record)?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<HashMap<SystemId, SystemSurveyRecord>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let vec: Vec<SystemSurveyRecord> = Vec::deserialize(deserializer)?;
+        Ok(vec.into_iter().map(|record| (record.system, record)).collect())
+    }
+}
 
 pub const PLAYER_FACTION_ID: &str = "player-commonwealth";
 
@@ -202,11 +227,11 @@ pub enum ColonyBuildingSite {
 }
 
 impl ColonyBuildingSite {
-    pub fn label(self) -> String {
+    pub fn label(self) -> Cow<'static, str> {
         match self {
-            ColonyBuildingSite::Orbital => "Orbital".to_owned(),
-            ColonyBuildingSite::Star(index) => format!("Star {}", index as usize + 1),
-            ColonyBuildingSite::Planet(index) => format!("Planet {}", index as usize + 1),
+            ColonyBuildingSite::Orbital => Cow::Borrowed("Orbital"),
+            ColonyBuildingSite::Star(index) => Cow::Owned(format!("Star {}", index as usize + 1)),
+            ColonyBuildingSite::Planet(index) => Cow::Owned(format!("Planet {}", index as usize + 1)),
         }
     }
 
@@ -291,6 +316,17 @@ pub enum ColonyStage {
     Settlement,
     City,
     CoreWorld,
+}
+
+impl ColonyStage {
+    pub fn label(self) -> &'static str {
+        match self {
+            ColonyStage::Outpost => "Outpost",
+            ColonyStage::Settlement => "Settlement",
+            ColonyStage::City => "City",
+            ColonyStage::CoreWorld => "CoreWorld",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -560,8 +596,8 @@ pub struct GameState {
     pub base_colonization_range_world: f32,
     pub player: PlayerState,
     pub factions: HashMap<String, FactionState>,
-    #[serde(default)]
-    pub survey_records: Vec<SystemSurveyRecord>,
+    #[serde(default, with = "survey_records_serde")]
+    pub survey_records: HashMap<SystemId, SystemSurveyRecord>,
     #[serde(default)]
     pub pending_survey_scans: Vec<PendingSurveyScan>,
     #[serde(default)]
@@ -1110,7 +1146,7 @@ impl Default for GameState {
             base_colonization_range_world: Self::default_base_colonization_range_world(),
             player: PlayerState::default(),
             factions,
-            survey_records: Vec::new(),
+            survey_records: HashMap::new(),
             pending_survey_scans: Vec::new(),
             pending_colony_foundings: Vec::new(),
             pending_colony_buildings: Vec::new(),
@@ -1606,12 +1642,12 @@ impl GameState {
     }
 
     pub fn survey_record(&self, system: SystemId) -> Option<&SystemSurveyRecord> {
-        self.survey_records.iter().find(|record| record.system == system)
+        self.survey_records.get(&system)
     }
 
     pub fn fully_surveyed_system_count(&self) -> usize {
         self.survey_records
-            .iter()
+            .values()
             .filter(|record| record.stage >= SurveyStage::ColonyAssessment)
             .count()
     }
@@ -1941,11 +1977,7 @@ impl GameState {
         viable_body_index: Option<u16>,
         at_year: f32,
     ) {
-        if let Some(record) = self
-            .survey_records
-            .iter_mut()
-            .find(|record| record.system == system)
-        {
+        if let Some(record) = self.survey_records.get_mut(&system) {
             record.stage = record.stage.max(stage);
             if surveyed_body_count > 0 || record.surveyed_body_count == 0 {
                 record.surveyed_body_count = record.surveyed_body_count.max(surveyed_body_count);
@@ -1960,7 +1992,7 @@ impl GameState {
             return;
         }
 
-        self.survey_records.push(SystemSurveyRecord {
+        self.survey_records.insert(system, SystemSurveyRecord {
             system,
             stage,
             surveyed_body_count,

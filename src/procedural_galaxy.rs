@@ -4,7 +4,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::f32::consts::PI;
 use std::fs;
 use std::io;
@@ -950,6 +950,8 @@ impl Default for GeneratorConfig {
 pub struct GalaxyGenerator {
     cfg: GeneratorConfig,
     density_scale: f32,
+    arm_phases: Vec<f32>,
+    inv_arm_width_sq: f32,
 }
 
 impl GalaxyGenerator {
@@ -969,7 +971,13 @@ impl GalaxyGenerator {
         let baseline = Self::estimate_total_systems_for_scale(&cfg, 1.0).max(1);
         let density_scale = cfg.target_system_count.max(1) as f32 / baseline as f32;
 
-        Self { cfg, density_scale }
+        let arm_phases: Vec<f32> = (0..cfg.arm_count)
+            .map(|arm| 2.0 * PI * arm as f32 / cfg.arm_count as f32)
+            .collect();
+        let width = cfg.arm_width_radians.max(0.01);
+        let inv_arm_width_sq = 1.0 / (width * width);
+
+        Self { cfg, density_scale, arm_phases, inv_arm_width_sq }
     }
 
     pub fn config(&self) -> &GeneratorConfig {
@@ -1038,12 +1046,10 @@ impl GalaxyGenerator {
 
     fn arm_signal(&self, theta: f32, radial: f32) -> f32 {
         let mut strongest: f32 = 0.0;
-        for arm in 0..self.cfg.arm_count {
-            let arm_phase = 2.0 * PI * arm as f32 / self.cfg.arm_count as f32;
+        for &arm_phase in &self.arm_phases {
             let expected_theta = arm_phase + radial * self.cfg.arm_pitch_per_world_unit;
             let delta = wrap_angle_radians(theta - expected_theta);
-            let width = self.cfg.arm_width_radians.max(0.01);
-            let gaussian = (-0.5 * (delta / width).powi(2)).exp();
+            let gaussian = (-0.5 * delta * delta * self.inv_arm_width_sq).exp();
             strongest = strongest.max(gaussian);
         }
         strongest.clamp(0.0, 1.0)
@@ -1187,6 +1193,13 @@ impl GalaxyGenerator {
         let generator = Self {
             cfg: cfg.clone(),
             density_scale: 1.0,
+            arm_phases: (0..cfg.arm_count)
+                .map(|arm| 2.0 * PI * arm as f32 / cfg.arm_count as f32)
+                .collect(),
+            inv_arm_width_sq: {
+                let w = cfg.arm_width_radians.max(0.01);
+                1.0 / (w * w)
+            },
         };
         let sector_radius = (cfg.playfield_radius / cfg.sector_size).ceil() as i32 + 1;
         let mut total = 0u64;
@@ -1757,12 +1770,16 @@ impl GalaxyGenerator {
 
         let mut rng = StdRng::seed_from_u64(seed);
         let (major_components, trace_pool) = Self::composition_profile(kind);
-        let mut weights = HashMap::<&'static str, f32>::new();
+        let mut weights: Vec<(&'static str, f32)> = Vec::with_capacity(major_components.len() + 4);
 
         for (symbol, base_weight) in major_components {
             let adjusted =
                 Self::adjusted_composition_weight(kind, symbol, *base_weight, temperature_k, &mut rng);
-            *weights.entry(*symbol).or_insert(0.0) += adjusted;
+            if let Some(entry) = weights.iter_mut().find(|(s, _)| *s == *symbol) {
+                entry.1 += adjusted;
+            } else {
+                weights.push((*symbol, adjusted));
+            }
         }
 
         let mut trace_candidates = trace_pool.to_vec();
@@ -1776,10 +1793,14 @@ impl GalaxyGenerator {
             let idx = rng.gen_range(0..trace_candidates.len());
             let trace_symbol = trace_candidates.swap_remove(idx);
             let trace_weight = rng.gen_range(0.08..0.75);
-            *weights.entry(trace_symbol).or_insert(0.0) += trace_weight;
+            if let Some(entry) = weights.iter_mut().find(|(s, _)| *s == trace_symbol) {
+                entry.1 += trace_weight;
+            } else {
+                weights.push((trace_symbol, trace_weight));
+            }
         }
 
-        let total_weight = weights.values().copied().sum::<f32>().max(0.001);
+        let total_weight = weights.iter().map(|(_, w)| *w).sum::<f32>().max(0.001);
         let mut composition = weights
             .into_iter()
             .map(|(symbol, weight)| {
@@ -2188,7 +2209,7 @@ impl GalaxyGenerator {
         }
 
         let (major_gases, trace_pool) = Self::atmosphere_profile(kind);
-        let mut weights = HashMap::<&'static str, f32>::new();
+        let mut weights: Vec<(&'static str, f32)> = Vec::with_capacity(major_gases.len() + 5);
         for (formula, base_weight) in major_gases {
             let adjusted = Self::adjusted_atmosphere_weight(
                 kind,
@@ -2197,7 +2218,11 @@ impl GalaxyGenerator {
                 temperature_k,
                 &mut rng,
             );
-            *weights.entry(*formula).or_insert(0.0) += adjusted;
+            if let Some(entry) = weights.iter_mut().find(|(s, _)| *s == *formula) {
+                entry.1 += adjusted;
+            } else {
+                weights.push((*formula, adjusted));
+            }
         }
 
         let mut trace_candidates = trace_pool.to_vec();
@@ -2209,10 +2234,14 @@ impl GalaxyGenerator {
             let idx = rng.gen_range(0..trace_candidates.len());
             let trace_formula = trace_candidates.swap_remove(idx);
             let trace_weight = rng.gen_range(0.03..0.55);
-            *weights.entry(trace_formula).or_insert(0.0) += trace_weight;
+            if let Some(entry) = weights.iter_mut().find(|(s, _)| *s == trace_formula) {
+                entry.1 += trace_weight;
+            } else {
+                weights.push((trace_formula, trace_weight));
+            }
         }
 
-        let total_weight = weights.values().copied().sum::<f32>().max(0.001);
+        let total_weight = weights.iter().map(|(_, w)| *w).sum::<f32>().max(0.001);
         let mut gases = weights
             .into_iter()
             .map(|(formula, weight)| PlanetAtmosphereComponent {
@@ -3153,7 +3182,8 @@ impl GalaxyGenerator {
 pub struct SectorLruCache {
     capacity: usize,
     entries: HashMap<SectorCoord, Arc<Vec<SystemSummary>>>,
-    order: VecDeque<SectorCoord>,
+    access_gen: HashMap<SectorCoord, u64>,
+    generation: u64,
     hits: u64,
     misses: u64,
 }
@@ -3163,23 +3193,23 @@ impl SectorLruCache {
         Self {
             capacity: capacity.max(1),
             entries: HashMap::new(),
-            order: VecDeque::new(),
+            access_gen: HashMap::new(),
+            generation: 0,
             hits: 0,
             misses: 0,
         }
     }
 
     fn touch(&mut self, coord: SectorCoord) {
-        if let Some(existing_index) = self.order.iter().position(|current| *current == coord) {
-            self.order.remove(existing_index);
-        }
-        self.order.push_back(coord);
+        self.generation += 1;
+        self.access_gen.insert(coord, self.generation);
     }
 
     fn evict_if_needed(&mut self) {
         while self.entries.len() > self.capacity {
-            if let Some(oldest) = self.order.pop_front() {
-                self.entries.remove(&oldest);
+            if let Some((&oldest_coord, _)) = self.access_gen.iter().min_by_key(|&(_, &g)| g) {
+                self.entries.remove(&oldest_coord);
+                self.access_gen.remove(&oldest_coord);
             } else {
                 break;
             }

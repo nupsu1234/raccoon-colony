@@ -484,10 +484,9 @@ impl Default for GalaxyApp {
             if game_state.explored_systems.remove(old_id) {
                 game_state.explored_systems.insert(*new_id);
             }
-            for record in &mut game_state.survey_records {
-                if record.system == *old_id {
-                    record.system = *new_id;
-                }
+            if let Some(mut record) = game_state.survey_records.remove(old_id) {
+                record.system = *new_id;
+                game_state.survey_records.insert(*new_id, record);
             }
             if game_state.player.location == Some(*old_id) {
                 game_state.player.location = Some(*new_id);
@@ -910,8 +909,10 @@ impl GalaxyApp {
         let mut total_industry_stockpile = 0.0_f32;
         let mut total_energy_stockpile = 0.0_f32;
         let mut total_stockpile_capacity = 0.0_f32;
-        let mut element_resource_amounts: HashMap<String, f32> = HashMap::new();
-        let mut atmosphere_resource_amounts: HashMap<String, f32> = HashMap::new();
+        let element_catalog = composition_element_resource_catalog();
+        let atmosphere_catalog = atmosphere_resource_catalog();
+        let mut element_amounts = vec![0.0f32; element_catalog.len()];
+        let mut atmosphere_amounts = vec![0.0f32; atmosphere_catalog.len()];
         let player_colony_count = self
             .game_state
             .colonies
@@ -923,14 +924,14 @@ impl GalaxyApp {
                     total_energy_stockpile += colony.energy_stockpile;
                     total_stockpile_capacity += colony.stockpile_capacity;
                     for (symbol, amount) in &colony.element_stockpiles {
-                        *element_resource_amounts
-                            .entry(symbol.clone())
-                            .or_insert(0.0) += amount.max(0.0);
+                        if let Some(idx) = element_catalog.iter().position(|e| e.symbol == symbol) {
+                            element_amounts[idx] += amount.max(0.0);
+                        }
                     }
                     for (formula, amount) in &colony.atmosphere_stockpiles {
-                        *atmosphere_resource_amounts
-                            .entry(formula.clone())
-                            .or_insert(0.0) += amount.max(0.0);
+                        if let Some(idx) = atmosphere_catalog.iter().position(|e| e.formula == formula) {
+                            atmosphere_amounts[idx] += amount.max(0.0);
+                        }
                     }
                     Some(())
                 } else {
@@ -1019,14 +1020,12 @@ impl GalaxyApp {
                                         ui.label(egui::RichText::new("Amount").underline());
                                         ui.end_row();
 
-                                        for entry in composition_element_resource_catalog() {
+                        for (idx, entry) in element_catalog.iter().enumerate() {
+                                            let amount = element_amounts[idx];
+                                            if amount <= 0.0 { continue; }
                                             ui.label(entry.atomic_number.to_string());
                                             ui.label(entry.symbol);
                                             ui.label(entry.name);
-                                            let amount = element_resource_amounts
-                                                .get(entry.symbol)
-                                                .copied()
-                                                .unwrap_or(0.0);
                                             ui.label(format!("{amount:.2}"));
                                             ui.end_row();
                                         }
@@ -1053,13 +1052,11 @@ impl GalaxyApp {
                                         ui.label(egui::RichText::new("Amount").underline());
                                         ui.end_row();
 
-                                        for entry in atmosphere_resource_catalog() {
+                                        for (idx, entry) in atmosphere_catalog.iter().enumerate() {
+                                            let amount = atmosphere_amounts[idx];
+                                            if amount <= 0.0 { continue; }
                                             ui.label(entry.formula);
                                             ui.label(entry.name);
-                                            let amount = atmosphere_resource_amounts
-                                                .get(entry.formula)
-                                                .copied()
-                                                .unwrap_or(0.0);
                                             ui.label(format!("{amount:.2}"));
                                             ui.end_row();
                                         }
@@ -1564,8 +1561,8 @@ impl GalaxyApp {
                         (
                             colony.id,
                             colony.name.clone(),
-                            colony.owner_faction.clone(),
-                            format!("{:?}", colony.stage),
+                            colony.owner_faction == self.game_state.player.faction_id,
+                            colony.stage.label(),
                             colony.population,
                             colony.system,
                             colony.body_index,
@@ -1609,7 +1606,7 @@ impl GalaxyApp {
                                 for (
                                     id,
                                     name,
-                                    owner,
+                                    is_player,
                                     stage,
                                     population,
                                     system,
@@ -1626,15 +1623,15 @@ impl GalaxyApp {
                                 ) in &colonies
                                 {
                                     ui.label(name);
-                                    ui.label(owner);
-                                    ui.label(stage);
+                                    ui.label(if *is_player { "Player" } else { "NPC" });
+                                    ui.label(*stage);
                                     ui.label(format!("{:.0}", population));
                                     ui.label(format!(
                                         "({}, {}) / #{}",
                                         system.sector.x, system.sector.y, system.local_index
                                     ));
 
-                                    if owner == &self.game_state.player.faction_id {
+                                    if *is_player {
                                         let mut selected_policy = *policy;
                                         egui::ComboBox::from_id_source(format!(
                                             "colony_policy_{}",
@@ -1657,7 +1654,7 @@ impl GalaxyApp {
                                         ui.label("NPC");
                                     }
 
-                                    if owner == &self.game_state.player.faction_id {
+                                    if *is_player {
                                         let mut selected_taxation = *taxation_policy;
                                         egui::ComboBox::from_id_source(format!(
                                             "colony_taxation_{}",
@@ -1705,7 +1702,7 @@ impl GalaxyApp {
                                         tax_revenue, net_revenue
                                     ));
 
-                                    if owner == &self.game_state.player.faction_id {
+                                    if *is_player {
                                         ui.horizontal(|ui| {
                                             if ui.small_button("F+").clicked() {
                                                 nudge_updates.push((*id, 0));
@@ -2068,11 +2065,13 @@ impl GalaxyApp {
 
                 ui.horizontal(|ui| {
                     ui.label("Site:");
+                    let site_label = selected_site.label();
                     egui::ComboBox::from_id_source("construction_site_select")
-                        .selected_text(selected_site.label())
+                        .selected_text(&*site_label)
                         .show_ui(ui, |ui| {
                             for site in &site_options {
-                                ui.selectable_value(&mut selected_site, *site, site.label());
+                                let sl = site.label();
+                                ui.selectable_value(&mut selected_site, *site, &*sl);
                             }
                         });
                 });
@@ -3350,7 +3349,9 @@ impl GalaxyApp {
         let inv_chunk_z = 1.0 / chunk_size_z;
         let lod_bucket = (chunk_size_xy * 10.0).round() as i32;
 
-        let mut chunk_map = HashMap::<u64, Vec<gpu_stars::StarPoint>>::new();
+        let mut chunk_map = HashMap::<u64, Vec<gpu_stars::StarPoint>>::with_capacity(
+            (render_points.len() / 16).max(16),
+        );
         for point in render_points {
             let ix = ((point.pos[0] - center[0]) * inv_chunk_xy).floor() as i32;
             let iy = ((point.pos[1] - center[1]) * inv_chunk_xy).floor() as i32;
@@ -5737,7 +5738,15 @@ impl eframe::App for GalaxyApp {
 
         // Keep simulation and rendering advancing even when there is no input.
         // eframe/egui is otherwise event-driven and may sleep between interactions.
-        ctx.request_repaint_after(Duration::from_millis(16));
+        let needs_frequent_repaint = !self.game_paused
+            || self.visible_build_inflight
+            || self.camera_focus_tween.is_some()
+            || self.pan_velocity.length_sq() > 0.01;
+        if needs_frequent_repaint {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
     }
 }
 
