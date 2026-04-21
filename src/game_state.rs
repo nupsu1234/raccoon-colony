@@ -1304,7 +1304,7 @@ impl Default for GameState {
 }
 
 impl GameState {
-    const COLONIZATION_RANGE_PER_TECH_LEVEL_WORLD: f32 = 120.0;
+    const COLONIZATION_RANGE_PER_TECH_LEVEL_WORLD: f32 = 10.0;
     const ELEMENT_STOCKPILE_CAPACITY_MULTIPLIER: f32 = 12.0;
     const BASE_BIRTH_RATE_ANNUAL: f64 = 0.0045;
     const STARTUP_BIRTH_BOOST_ANNUAL: f64 = 0.0090;
@@ -1544,7 +1544,7 @@ impl GameState {
     }
 
     fn default_base_colonization_range_world() -> f32 {
-        400.0
+        100.0
     }
 
     #[allow(dead_code)]
@@ -3049,14 +3049,14 @@ mod tests {
         let faction_id = state.player.faction_id.clone();
 
         let base_range = state.faction_colonization_range_world(&faction_id);
-        assert_eq!(base_range, 400.0);
+        assert_eq!(base_range, 100.0);
 
         if let Some(faction) = state.factions.get_mut(&faction_id) {
             faction.colonization_tech_level = 3;
         }
 
         let upgraded_range = state.faction_colonization_range_world(&faction_id);
-        assert_eq!(upgraded_range, 760.0);
+        assert_eq!(upgraded_range, 130.0);
         assert!(upgraded_range > base_range);
     }
 

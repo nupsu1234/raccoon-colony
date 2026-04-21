@@ -163,6 +163,12 @@ fn playfield_radius() -> f32 {
 
 type SolarSystem = SystemSummary;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppPhase {
+    MainMenu,
+    InGame,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ChunkCoord {
     x: i32,
@@ -312,6 +318,9 @@ struct LodProfile {
 }
 
 pub struct GalaxyApp {
+    phase: AppPhase,
+    menu_seed_input: String,
+    has_save_file: bool,
     sector_cache: SectorLruCache,
     procedural_generator: Arc<GalaxyGenerator>,
     galaxy_seed: u64,
@@ -376,7 +385,6 @@ pub struct GalaxyApp {
     reset_progress_armed: bool,
     colonies_window_open: bool,
     construction_window_open: bool,
-    legend_panel_open: bool,
     debug_panel_open: bool,
     resources_panel_open: bool,
     favorites_window_open: bool,
@@ -459,8 +467,12 @@ impl Default for GalaxyApp {
             }
         }
         Self::trim_game_event_history(&mut game_events);
+        let has_save_file = std::path::Path::new(GAME_SAVE_PATH).exists();
         let ai_controller = ai_factions::AiFactionController::new(&procedural_generator);
         Self {
+            phase: AppPhase::MainMenu,
+            menu_seed_input: String::new(),
+            has_save_file,
             sector_cache: SectorLruCache::new(sector_cache_capacity),
             procedural_generator,
             galaxy_seed,
@@ -525,7 +537,6 @@ impl Default for GalaxyApp {
             reset_progress_armed: false,
             colonies_window_open: false,
             construction_window_open: false,
-            legend_panel_open: false,
             debug_panel_open: false,
             resources_panel_open: false,
             favorites_window_open: false,
@@ -3474,6 +3485,90 @@ fn unrotate_point(point: [f32; 3], yaw: f32, pitch: f32, center: [f32; 3]) -> [f
 
 impl eframe::App for GalaxyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        match self.phase {
+            AppPhase::MainMenu => self.show_main_menu(ctx),
+            AppPhase::InGame => self.update_game(ctx),
+        }
+    }
+}
+
+impl GalaxyApp {
+    fn show_main_menu(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let available = ui.available_size();
+            ui.allocate_space(egui::Vec2::new(0.0, (available.y * 0.25).max(40.0)));
+
+            ui.vertical_centered(|ui| {
+                ui.heading(
+                    egui::RichText::new("Milky Way Simulator")
+                        .size(36.0)
+                        .strong(),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("400 billion star galaxy")
+                        .size(14.0)
+                        .color(egui::Color32::from_rgb(160, 180, 200)),
+                );
+
+                ui.add_space(32.0);
+
+                let button_width = 220.0;
+
+                // --- Continue ---
+                ui.add_enabled_ui(self.has_save_file, |ui| {
+                    let btn = ui.add_sized(
+                        [button_width, 36.0],
+                        egui::Button::new(egui::RichText::new("Continue").size(16.0)),
+                    );
+                    if btn.clicked() {
+                        self.phase = AppPhase::InGame;
+                    }
+                    if !self.has_save_file {
+                        btn.on_disabled_hover_text("No saved game found.");
+                    }
+                });
+
+                ui.add_space(12.0);
+
+                // --- New Game ---
+                ui.label("Galaxy seed (leave blank for random):");
+                ui.add_sized(
+                    [button_width, 24.0],
+                    egui::TextEdit::singleline(&mut self.menu_seed_input)
+                        .hint_text("e.g. 42 or 0xDEADBEEF"),
+                );
+                ui.add_space(4.0);
+                let new_game_btn = ui.add_sized(
+                    [button_width, 36.0],
+                    egui::Button::new(egui::RichText::new("New Game").size(16.0)),
+                );
+                if new_game_btn.clicked() {
+                    let seed = Self::parse_seed_input(&self.menu_seed_input).unwrap_or_else(|| {
+                        rand::thread_rng().r#gen::<u64>()
+                    });
+                    self.restart_simulation_with_seed(seed);
+                    self.game_notice = None;
+                    self.phase = AppPhase::InGame;
+                }
+
+                ui.add_space(12.0);
+
+                // --- Quit ---
+                if ui
+                    .add_sized(
+                        [button_width, 36.0],
+                        egui::Button::new(egui::RichText::new("Quit").size(16.0)),
+                    )
+                    .clicked()
+                {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+        });
+    }
+
+    fn update_game(&mut self, ctx: &egui::Context) {
         let sim_advance = self
             .strategic_clock
             .advance(ctx.input(|i| i.time), self.game_paused);
@@ -3615,45 +3710,6 @@ impl eframe::App for GalaxyApp {
             }
             if let Some(notice) = &self.game_notice {
                 ui.colored_label(egui::Color32::from_rgb(130, 205, 255), notice);
-            }
-            if ui
-                .small_button(if self.legend_panel_open {
-                    "Hide legend"
-                } else {
-                    "Show legend"
-                })
-                .clicked()
-            {
-                self.legend_panel_open = !self.legend_panel_open;
-            }
-            if self.legend_panel_open {
-                ui.group(|ui| {
-                    ui.label("Legend");
-                    ui.horizontal_wrapped(|ui| {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(70, 210, 170),
-                            "+ marker = player colony",
-                        );
-                        ui.colored_label(
-                            egui::Color32::from_rgb(226, 160, 82),
-                            "+ marker = non-player colony",
-                        );
-                        ui.colored_label(
-                            egui::Color32::from_rgb(92, 220, 255),
-                            "blue ring = selected system",
-                        );
-                        ui.colored_label(
-                            egui::Color32::from_rgb(80, 220, 110),
-                            "green range ring/line = colonization possible",
-                        );
-                        ui.colored_label(
-                            egui::Color32::from_rgb(230, 120, 100),
-                            "red range ring/line = out of range",
-                        );
-                    });
-                });
-            } else {
-                ui.small("Open 'Legend' for colony markers and range colors.");
             }
             if self.debug_panel_open {
                 ui.group(|ui| {
