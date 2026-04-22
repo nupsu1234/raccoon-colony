@@ -1,4 +1,5 @@
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
+use std::collections::HashSet;
 use std::fs;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -63,27 +64,68 @@ impl MusicPlayer {
         }
     }
 
-    fn scan_tracks() -> Vec<TrackInfo> {
-        let music_path = Path::new(MUSIC_DIR);
-        let mut tracks = Vec::new();
+    fn music_search_dirs() -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
 
-        if let Ok(entries) = fs::read_dir(music_path) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
+        // 1) Working directory (legacy behavior).
+        dirs.push(PathBuf::from(MUSIC_DIR));
+
+        // 2) Executable sibling folder (common for packaged runs).
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                dirs.push(exe_dir.join(MUSIC_DIR));
+            }
+        }
+
+        // 3) Project root at build time (works well in dev).
+        dirs.push(Path::new(env!("CARGO_MANIFEST_DIR")).join(MUSIC_DIR));
+
+        // Deduplicate while preserving order.
+        let mut dedup = Vec::new();
+        let mut seen = HashSet::new();
+        for dir in dirs {
+            let key = dir.to_string_lossy().to_string();
+            if seen.insert(key) {
+                dedup.push(dir);
+            }
+        }
+        dedup
+    }
+
+    fn scan_tracks() -> Vec<TrackInfo> {
+        let mut tracks = Vec::new();
+        let mut seen_paths = HashSet::new();
+
+        for music_path in Self::music_search_dirs() {
+            if let Ok(entries) = fs::read_dir(&music_path) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
+                    }
                     let ext = path
                         .extension()
                         .and_then(|e| e.to_str())
                         .unwrap_or("")
                         .to_lowercase();
-                    if matches!(ext.as_str(), "mp3" | "ogg" | "wav" | "flac") {
-                        let name = path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("Unknown")
-                            .to_owned();
-                        tracks.push(TrackInfo { path, name });
+                    if !matches!(ext.as_str(), "mp3" | "ogg" | "wav" | "flac") {
+                        continue;
                     }
+
+                    let canonical_key = fs::canonicalize(&path)
+                        .unwrap_or_else(|_| path.clone())
+                        .to_string_lossy()
+                        .to_string();
+                    if !seen_paths.insert(canonical_key) {
+                        continue;
+                    }
+
+                    let name = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("Unknown")
+                        .to_owned();
+                    tracks.push(TrackInfo { path, name });
                 }
             }
         }

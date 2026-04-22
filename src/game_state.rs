@@ -30,6 +30,119 @@ mod survey_records_serde {
     }
 }
 
+mod system_sim_serde {
+    use super::*;
+    use serde::{Deserializer, Serializer, ser::SerializeSeq};
+
+    pub fn serialize<S>(
+        map: &HashMap<SystemId, SystemSimState>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(map.len()))?;
+        for state in map.values() {
+            seq.serialize_element(state)?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<HashMap<SystemId, SystemSimState>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let vec: Vec<SystemSimState> = Vec::deserialize(deserializer)?;
+        Ok(vec.into_iter().map(|state| (state.system, state)).collect())
+    }
+}
+
+mod faction_relations_serde {
+    use super::*;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct RelationEntry {
+        a: String,
+        b: String,
+        value: i16,
+    }
+
+    pub fn serialize<S>(
+        map: &HashMap<(String, String), i16>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let entries: Vec<RelationEntry> = map
+            .iter()
+            .map(|((a, b), value)| RelationEntry {
+                a: a.clone(),
+                b: b.clone(),
+                value: *value,
+            })
+            .collect();
+        entries.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<HashMap<(String, String), i16>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let entries = Vec::<RelationEntry>::deserialize(deserializer)?;
+        let mut map = HashMap::new();
+        for entry in entries {
+            map.insert((entry.a, entry.b), entry.value);
+        }
+        Ok(map)
+    }
+}
+
+mod diplomacy_treaties_serde {
+    use super::*;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct TreatyEntry {
+        a: String,
+        b: String,
+        value: DiplomacyTreatyState,
+    }
+
+    pub fn serialize<S>(
+        map: &HashMap<(String, String), DiplomacyTreatyState>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let entries: Vec<TreatyEntry> = map
+            .iter()
+            .map(|((a, b), value)| TreatyEntry {
+                a: a.clone(),
+                b: b.clone(),
+                value: value.clone(),
+            })
+            .collect();
+        entries.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<HashMap<(String, String), DiplomacyTreatyState>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let entries = Vec::<TreatyEntry>::deserialize(deserializer)?;
+        let mut map = HashMap::new();
+        for entry in entries {
+            map.insert((entry.a, entry.b), entry.value);
+        }
+        Ok(map)
+    }
+}
+
 pub const PLAYER_FACTION_ID: &str = "raccoon-flood";
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -150,11 +263,16 @@ pub enum ColonyBuildingKind {
     FuelScoopDroneSwarm,
     TradingHub,
     EntertainmentPlaza,
+    LogisticsExchange,
+    HabitatArcology,
+    DefenseGrid,
+    SystemsAdministration,
+    CatalyticRefinery,
 }
 
 impl ColonyBuildingKind {
     #[allow(dead_code)]
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 13] = [
         ColonyBuildingKind::SpaceStation,
         ColonyBuildingKind::IndustrialHub,
         ColonyBuildingKind::AgriDome,
@@ -163,10 +281,15 @@ impl ColonyBuildingKind {
         ColonyBuildingKind::FuelScoopDroneSwarm,
         ColonyBuildingKind::TradingHub,
         ColonyBuildingKind::EntertainmentPlaza,
+        ColonyBuildingKind::LogisticsExchange,
+        ColonyBuildingKind::HabitatArcology,
+        ColonyBuildingKind::DefenseGrid,
+        ColonyBuildingKind::SystemsAdministration,
+        ColonyBuildingKind::CatalyticRefinery,
     ];
 
     #[allow(dead_code)]
-    pub fn all() -> [Self; 8] {
+    pub fn all() -> [Self; 13] {
         Self::ALL
     }
 
@@ -181,6 +304,11 @@ impl ColonyBuildingKind {
             Self::FuelScoopDroneSwarm => &BUILDING_DEF_FUEL_SCOOP_DRONE_SWARM,
             Self::TradingHub => &BUILDING_DEF_TRADING_HUB,
             Self::EntertainmentPlaza => &BUILDING_DEF_ENTERTAINMENT_PLAZA,
+            Self::LogisticsExchange => &BUILDING_DEF_LOGISTICS_EXCHANGE,
+            Self::HabitatArcology => &BUILDING_DEF_HABITAT_ARCOLOGY,
+            Self::DefenseGrid => &BUILDING_DEF_DEFENSE_GRID,
+            Self::SystemsAdministration => &BUILDING_DEF_SYSTEMS_ADMINISTRATION,
+            Self::CatalyticRefinery => &BUILDING_DEF_CATALYTIC_REFINERY,
         }
     }
 
@@ -277,6 +405,10 @@ pub struct PendingColonyBuilding {
     pub target_level: u16,
     pub start_year: f32,
     pub complete_year: f32,
+    #[serde(default)]
+    pub deferred_treasury_due: i64,
+    #[serde(default)]
+    pub annual_construction_upkeep: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -312,6 +444,128 @@ pub struct FactionState {
     /// The first colony founded by this faction, which receives reduced upkeep.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub starting_colony_id: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ConflictState {
+    Calm,
+    Tense,
+    ProxyWar,
+    Embargo,
+    PatrolSurge,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum DiplomaticTreatyKind {
+    Alliance,
+    NonAggressionPact,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DiplomacyTreatyState {
+    pub kind: DiplomaticTreatyKind,
+    pub started_year: f32,
+    pub expires_year: f32,
+    #[serde(default)]
+    pub cohesion: f32,
+    #[serde(default)]
+    pub strain: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum PowerplayOperationKind {
+    UndermineInfluence,
+    SupportAlly,
+    EconomicPressure,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PowerplayOperationRecord {
+    pub at_year: f32,
+    pub actor_faction: String,
+    pub target_faction: String,
+    pub system: SystemId,
+    pub operation: PowerplayOperationKind,
+    pub success: bool,
+}
+
+impl Default for ConflictState {
+    fn default() -> Self {
+        Self::Calm
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SystemSimState {
+    pub system: SystemId,
+    #[serde(default)]
+    pub influence_by_faction: HashMap<String, f32>,
+    #[serde(default = "SystemSimState::default_security")]
+    pub security: f32,
+    #[serde(default = "SystemSimState::default_stability")]
+    pub stability: f32,
+    #[serde(default)]
+    pub econ_pressure: f32,
+    #[serde(default)]
+    pub trade_flow: f32,
+    #[serde(default)]
+    pub scarcity: f32,
+    #[serde(default)]
+    pub conflict: ConflictState,
+}
+
+impl SystemSimState {
+    fn default_security() -> f32 {
+        0.55
+    }
+
+    fn default_stability() -> f32 {
+        0.60
+    }
+}
+
+impl Default for SystemSimState {
+    fn default() -> Self {
+        Self {
+            system: SystemId {
+                sector: crate::procedural_galaxy::SectorCoord { x: 0, y: 0 },
+                local_index: 0,
+            },
+            influence_by_faction: HashMap::new(),
+            security: Self::default_security(),
+            stability: Self::default_stability(),
+            econ_pressure: 0.0,
+            trade_flow: 0.0,
+            scarcity: 0.0,
+            conflict: ConflictState::Calm,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum MissionKind {
+    SupplyRelief,
+    ReconSweep,
+    InfluenceOp,
+    AllianceSupport,
+    SanctionRunning,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MissionState {
+    pub id: u64,
+    pub issuer_faction: String,
+    pub target_system: SystemId,
+    pub kind: MissionKind,
+    pub title: String,
+    pub description: String,
+    pub reward_credits: i64,
+    pub reward_tech: f32,
+    pub reward_reputation: i16,
+    #[serde(default)]
+    pub risk: f32,
+    #[serde(default)]
+    pub expires_year: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -623,6 +877,22 @@ pub struct GameState {
     pub pending_colony_buildings: Vec<PendingColonyBuilding>,
     #[serde(default)]
     pub pending_population_transfers: Vec<PendingPopulationTransfer>,
+    #[serde(default, with = "system_sim_serde")]
+    pub system_sim: HashMap<SystemId, SystemSimState>,
+    #[serde(default, with = "faction_relations_serde")]
+    pub faction_relations: HashMap<(String, String), i16>,
+    #[serde(default, with = "diplomacy_treaties_serde")]
+    pub diplomacy_treaties: HashMap<(String, String), DiplomacyTreatyState>,
+    #[serde(default)]
+    pub active_sanctions: HashMap<(String, String), f32>,
+    #[serde(default)]
+    pub recent_powerplay_ops: Vec<PowerplayOperationRecord>,
+    #[serde(default)]
+    pub player_reputation: HashMap<String, i16>,
+    #[serde(default)]
+    pub missions: Vec<MissionState>,
+    #[serde(default = "GameState::default_next_mission_id")]
+    pub next_mission_id: u64,
     pub explored_systems: HashSet<SystemId>,
     pub colonies: HashMap<u64, ColonyState>,
 }
@@ -673,6 +943,20 @@ pub(crate) struct ElementCost {
 /// Groups of elements that can substitute for one another during construction.
 /// Using a substitute costs `ELEMENT_SUBSTITUTION_PENALTY` times more material.
 pub const ELEMENT_SUBSTITUTION_PENALTY: f32 = 1.5;
+
+pub fn element_substitution_penalty(symbol: &str) -> f32 {
+    match element_substitution_group(symbol) {
+        Some("transition_structural") => 1.30,
+        Some("refractory") => 1.95,
+        Some("conductive") => 1.75,
+        Some("metalloid") => 1.65,
+        Some("nonmetal_organic") => 1.25,
+        Some("atmospheric") => 1.10,
+        Some("light_metal") => 1.45,
+        Some("halogen_noble") => 1.55,
+        _ => ELEMENT_SUBSTITUTION_PENALTY,
+    }
+}
 
 /// Returns the substitution group for a given element symbol, if any.
 /// Elements in the same group can substitute for each other.
@@ -776,11 +1060,12 @@ pub fn resolve_element_costs_with_substitution(
                 continue;
             }
             // Substitutes cost more (penalty multiplier).
-            let sub_needed = still_needed * ELEMENT_SUBSTITUTION_PENALTY;
+            let penalty = element_substitution_penalty(cost.symbol);
+            let sub_needed = still_needed * penalty;
             let sub_used = sub_available.min(sub_needed);
             *remaining.entry(sub).or_insert(0.0) -= sub_used;
             // How much of the original requirement does this cover?
-            let original_covered = sub_used / ELEMENT_SUBSTITUTION_PENALTY;
+            let original_covered = sub_used / penalty;
             still_needed -= original_covered;
             resolved.push((sub.to_owned(), sub_used));
         }
@@ -1239,6 +1524,228 @@ const BUILDING_DEF_ENTERTAINMENT_PLAZA: ColonyBuildingDefinition = ColonyBuildin
     ],
 };
 
+const BUILDING_DEF_LOGISTICS_EXCHANGE: ColonyBuildingDefinition = ColonyBuildingDefinition {
+    label: "Logistics Exchange",
+    queue_button_label: "Logi+",
+    max_level: 4,
+    role_description: "Cargo routing and warehousing network that expands practical stockpile usage.",
+    site_type: ColonyBuildingSiteType::Planet,
+    requires_solid_surface: true,
+    requires_atmosphere: false,
+    requires_scoopable_star: false,
+    is_player_queueable: true,
+    economy_profile: ColonyBuildingEconomyProfile {
+        treasury_base_cost: 30_000,
+        treasury_level_step: 20_000,
+        food_base_cost: 3.0,
+        food_level_step: 1.5,
+        industry_base_cost: 11.0,
+        industry_level_step: 5.0,
+        energy_base_cost: 6.0,
+        energy_level_step: 3.0,
+        duration_base_years: 0.62,
+        duration_level_step_years: 0.25,
+        per_level_modifiers: ColonyBuildingPerLevelModifiers {
+            food_production_bonus: 0.00045,
+            industry_production_bonus: 0.00045,
+            energy_production_bonus: 0.00045,
+            food_demand_bonus: -0.00008,
+            industry_demand_bonus: -0.00008,
+            energy_demand_bonus: -0.00006,
+            element_extraction_bonus: 0.0,
+            atmosphere_harvest_bonus: 0.0,
+            treasury_production_bonus: 350.0,
+            stability_bonus: 0.0006,
+            growth_bonus: 0.0,
+            annual_upkeep: 1_200,
+        },
+    },
+    element_cost_scales: &[
+        ElementCostScale { symbol: "Fe", base: 5.0, step_per_level: 3.0 },
+        ElementCostScale { symbol: "Al", base: 4.0, step_per_level: 2.0 },
+        ElementCostScale { symbol: "Si", base: 3.0, step_per_level: 2.0 },
+        ElementCostScale { symbol: "Cu", base: 3.0, step_per_level: 2.0 },
+    ],
+};
+
+const BUILDING_DEF_HABITAT_ARCOLOGY: ColonyBuildingDefinition = ColonyBuildingDefinition {
+    label: "Habitat Arcology",
+    queue_button_label: "Arcology+",
+    max_level: 4,
+    role_description: "Dense megahabitat blocks that improve growth and social resilience at high upkeep.",
+    site_type: ColonyBuildingSiteType::Planet,
+    requires_solid_surface: true,
+    requires_atmosphere: false,
+    requires_scoopable_star: false,
+    is_player_queueable: true,
+    economy_profile: ColonyBuildingEconomyProfile {
+        treasury_base_cost: 55_000,
+        treasury_level_step: 38_000,
+        food_base_cost: 6.0,
+        food_level_step: 2.5,
+        industry_base_cost: 15.0,
+        industry_level_step: 7.0,
+        energy_base_cost: 11.0,
+        energy_level_step: 5.0,
+        duration_base_years: 0.90,
+        duration_level_step_years: 0.35,
+        per_level_modifiers: ColonyBuildingPerLevelModifiers {
+            food_production_bonus: 0.0,
+            industry_production_bonus: 0.0,
+            energy_production_bonus: 0.0,
+            food_demand_bonus: 0.00012,
+            industry_demand_bonus: 0.00005,
+            energy_demand_bonus: 0.00020,
+            element_extraction_bonus: 0.0,
+            atmosphere_harvest_bonus: 0.0,
+            treasury_production_bonus: 0.0,
+            stability_bonus: 0.0025,
+            growth_bonus: 0.00055,
+            annual_upkeep: 2_200,
+        },
+    },
+    element_cost_scales: &[
+        ElementCostScale { symbol: "Fe", base: 7.0, step_per_level: 4.0 },
+        ElementCostScale { symbol: "Al", base: 6.0, step_per_level: 3.0 },
+        ElementCostScale { symbol: "Si", base: 5.0, step_per_level: 3.0 },
+        ElementCostScale { symbol: "C", base: 4.0, step_per_level: 2.0 },
+        ElementCostScale { symbol: "N", base: 3.0, step_per_level: 2.0 },
+    ],
+};
+
+const BUILDING_DEF_DEFENSE_GRID: ColonyBuildingDefinition = ColonyBuildingDefinition {
+    label: "Defense Grid",
+    queue_button_label: "Defense+",
+    max_level: 4,
+    role_description: "Orbital and planetary defense mesh that hardens colonies under instability.",
+    site_type: ColonyBuildingSiteType::Orbital,
+    requires_solid_surface: false,
+    requires_atmosphere: false,
+    requires_scoopable_star: false,
+    is_player_queueable: true,
+    economy_profile: ColonyBuildingEconomyProfile {
+        treasury_base_cost: 48_000,
+        treasury_level_step: 30_000,
+        food_base_cost: 3.0,
+        food_level_step: 1.0,
+        industry_base_cost: 14.0,
+        industry_level_step: 6.0,
+        energy_base_cost: 9.0,
+        energy_level_step: 4.0,
+        duration_base_years: 0.72,
+        duration_level_step_years: 0.30,
+        per_level_modifiers: ColonyBuildingPerLevelModifiers {
+            food_production_bonus: 0.0,
+            industry_production_bonus: 0.0,
+            energy_production_bonus: 0.0,
+            food_demand_bonus: 0.0,
+            industry_demand_bonus: 0.0,
+            energy_demand_bonus: 0.00012,
+            element_extraction_bonus: 0.0,
+            atmosphere_harvest_bonus: 0.0,
+            treasury_production_bonus: 0.0,
+            stability_bonus: 0.0012,
+            growth_bonus: 0.0,
+            annual_upkeep: 1_900,
+        },
+    },
+    element_cost_scales: &[
+        ElementCostScale { symbol: "Fe", base: 7.0, step_per_level: 4.0 },
+        ElementCostScale { symbol: "Ni", base: 5.0, step_per_level: 3.0 },
+        ElementCostScale { symbol: "Ti", base: 4.0, step_per_level: 2.0 },
+        ElementCostScale { symbol: "Cu", base: 3.0, step_per_level: 2.0 },
+    ],
+};
+
+const BUILDING_DEF_SYSTEMS_ADMINISTRATION: ColonyBuildingDefinition = ColonyBuildingDefinition {
+    label: "Systems Administration Nexus",
+    queue_button_label: "Admin+",
+    max_level: 4,
+    role_description: "Civic administration complex that improves stability and faction income reliability.",
+    site_type: ColonyBuildingSiteType::Planet,
+    requires_solid_surface: true,
+    requires_atmosphere: false,
+    requires_scoopable_star: false,
+    is_player_queueable: true,
+    economy_profile: ColonyBuildingEconomyProfile {
+        treasury_base_cost: 36_000,
+        treasury_level_step: 24_000,
+        food_base_cost: 3.0,
+        food_level_step: 1.0,
+        industry_base_cost: 9.0,
+        industry_level_step: 4.0,
+        energy_base_cost: 6.0,
+        energy_level_step: 2.5,
+        duration_base_years: 0.64,
+        duration_level_step_years: 0.27,
+        per_level_modifiers: ColonyBuildingPerLevelModifiers {
+            food_production_bonus: 0.0,
+            industry_production_bonus: 0.0002,
+            energy_production_bonus: 0.0,
+            food_demand_bonus: 0.0,
+            industry_demand_bonus: 0.0,
+            energy_demand_bonus: 0.00010,
+            element_extraction_bonus: 0.0,
+            atmosphere_harvest_bonus: 0.0,
+            treasury_production_bonus: 1_250.0,
+            stability_bonus: 0.0018,
+            growth_bonus: 0.00015,
+            annual_upkeep: 1_550,
+        },
+    },
+    element_cost_scales: &[
+        ElementCostScale { symbol: "Fe", base: 4.0, step_per_level: 3.0 },
+        ElementCostScale { symbol: "Si", base: 4.0, step_per_level: 2.0 },
+        ElementCostScale { symbol: "Cu", base: 4.0, step_per_level: 2.0 },
+        ElementCostScale { symbol: "Al", base: 3.0, step_per_level: 2.0 },
+    ],
+};
+
+const BUILDING_DEF_CATALYTIC_REFINERY: ColonyBuildingDefinition = ColonyBuildingDefinition {
+    label: "Catalytic Refinery",
+    queue_button_label: "Refine+",
+    max_level: 4,
+    role_description: "Advanced refining chain that boosts extractive throughput at high power demand.",
+    site_type: ColonyBuildingSiteType::Planet,
+    requires_solid_surface: true,
+    requires_atmosphere: false,
+    requires_scoopable_star: false,
+    is_player_queueable: true,
+    economy_profile: ColonyBuildingEconomyProfile {
+        treasury_base_cost: 52_000,
+        treasury_level_step: 34_000,
+        food_base_cost: 3.0,
+        food_level_step: 1.5,
+        industry_base_cost: 16.0,
+        industry_level_step: 8.0,
+        energy_base_cost: 12.0,
+        energy_level_step: 5.0,
+        duration_base_years: 0.78,
+        duration_level_step_years: 0.32,
+        per_level_modifiers: ColonyBuildingPerLevelModifiers {
+            food_production_bonus: 0.0,
+            industry_production_bonus: 0.0009,
+            energy_production_bonus: 0.0,
+            food_demand_bonus: 0.0,
+            industry_demand_bonus: 0.00010,
+            energy_demand_bonus: 0.00025,
+            element_extraction_bonus: 0.045,
+            atmosphere_harvest_bonus: 0.015,
+            treasury_production_bonus: 300.0,
+            stability_bonus: 0.0,
+            growth_bonus: 0.0,
+            annual_upkeep: 2_100,
+        },
+    },
+    element_cost_scales: &[
+        ElementCostScale { symbol: "Fe", base: 6.0, step_per_level: 4.0 },
+        ElementCostScale { symbol: "Ni", base: 5.0, step_per_level: 3.0 },
+        ElementCostScale { symbol: "Ti", base: 4.0, step_per_level: 3.0 },
+        ElementCostScale { symbol: "Mo", base: 2.0, step_per_level: 1.0 },
+        ElementCostScale { symbol: "W", base: 1.0, step_per_level: 1.0 },
+    ],
+};
+
 impl ColonyBuildingKind {
     fn economy_profile(self) -> ColonyBuildingEconomyProfile {
         self.definition().economy_profile
@@ -1264,10 +1771,10 @@ impl Default for GameState {
             },
         );
         factions.insert(
-            "helios-league".to_owned(),
+            "brewer-corporation".to_owned(),
             FactionState {
-                id: "helios-league".to_owned(),
-                display_name: "Helios League".to_owned(),
+                id: "brewer-corporation".to_owned(),
+                display_name: "Brewer Corporation".to_owned(),
                 treasury: 2_800_000,
                 colonization_tech_level: 0,
                 colonization_tech_progress: 0.0,
@@ -1275,11 +1782,66 @@ impl Default for GameState {
             },
         );
         factions.insert(
-            "orion-syndicate".to_owned(),
+            "wanderers-library".to_owned(),
             FactionState {
-                id: "orion-syndicate".to_owned(),
-                display_name: "Orion Syndicate".to_owned(),
+                id: "wanderers-library".to_owned(),
+                display_name: "Wanderer's Library".to_owned(),
                 treasury: 2_100_000,
+                colonization_tech_level: 0,
+                colonization_tech_progress: 0.0,
+                starting_colony_id: None,
+            },
+        );
+        factions.insert(
+            "drifters".to_owned(),
+            FactionState {
+                id: "drifters".to_owned(),
+                display_name: "Drifters".to_owned(),
+                treasury: 2_000_000,
+                colonization_tech_level: 0,
+                colonization_tech_progress: 0.0,
+                starting_colony_id: None,
+            },
+        );
+        factions.insert(
+            "new-providence".to_owned(),
+            FactionState {
+                id: "new-providence".to_owned(),
+                display_name: "New Providence".to_owned(),
+                treasury: 2_250_000,
+                colonization_tech_level: 0,
+                colonization_tech_progress: 0.0,
+                starting_colony_id: None,
+            },
+        );
+        factions.insert(
+            "hypercapitalist-foundation".to_owned(),
+            FactionState {
+                id: "hypercapitalist-foundation".to_owned(),
+                display_name: "Hypercapitalist Foundation".to_owned(),
+                treasury: 3_000_000,
+                colonization_tech_level: 0,
+                colonization_tech_progress: 0.0,
+                starting_colony_id: None,
+            },
+        );
+        factions.insert(
+            "greater-armenia".to_owned(),
+            FactionState {
+                id: "greater-armenia".to_owned(),
+                display_name: "Greater Armenia".to_owned(),
+                treasury: 2_150_000,
+                colonization_tech_level: 0,
+                colonization_tech_progress: 0.0,
+                starting_colony_id: None,
+            },
+        );
+        factions.insert(
+            "battle-pilgrims".to_owned(),
+            FactionState {
+                id: "battle-pilgrims".to_owned(),
+                display_name: "Battle Pilgrims".to_owned(),
+                treasury: 2_350_000,
                 colonization_tech_level: 0,
                 colonization_tech_progress: 0.0,
                 starting_colony_id: None,
@@ -1297,6 +1859,14 @@ impl Default for GameState {
             pending_colony_foundings: Vec::new(),
             pending_colony_buildings: Vec::new(),
             pending_population_transfers: Vec::new(),
+            system_sim: HashMap::new(),
+            faction_relations: HashMap::new(),
+            diplomacy_treaties: HashMap::new(),
+            active_sanctions: HashMap::new(),
+            recent_powerplay_ops: Vec::new(),
+            player_reputation: HashMap::new(),
+            missions: Vec::new(),
+            next_mission_id: Self::default_next_mission_id(),
             explored_systems: HashSet::new(),
             colonies: HashMap::new(),
         }
@@ -1307,16 +1877,59 @@ impl GameState {
     const COLONIZATION_RANGE_PER_TECH_LEVEL_WORLD: f32 = 10.0;
     const ELEMENT_STOCKPILE_CAPACITY_MULTIPLIER: f32 = 12.0;
     const BASE_BIRTH_RATE_ANNUAL: f64 = 0.0045;
-    const STARTUP_BIRTH_BOOST_ANNUAL: f64 = 0.0090;
+    const STARTUP_BIRTH_BOOST_ANNUAL: f64 = 0.0080;
     const STARTUP_GROWTH_CURVE: f64 = 0.70;
     const BASE_DEATH_RATE_ANNUAL: f64 = 0.0048;
     const STABILITY_DEATH_PENALTY_ANNUAL: f64 = 0.0042;
-    const MIN_ANNUAL_GROWTH_HABITABLE: f64 = -0.010;
-    const MIN_ANNUAL_GROWTH_HOSTILE: f64 = -0.014;
+    const MIN_ANNUAL_GROWTH_HABITABLE: f64 = -0.008;
+    const MIN_ANNUAL_GROWTH_HOSTILE: f64 = -0.011;
     const TAXABLE_POPULATION_SATURATION: f64 = 9_000_000.0;
-    const POPULATION_UPKEEP_LINEAR_PER_PERSON: f64 = 0.018;
-    const POPULATION_UPKEEP_QUADRATIC_PER_PERSON_SQUARED: f64 = 0.000000005;
+    const POPULATION_UPKEEP_LINEAR_PER_PERSON: f64 = 0.016;
+    const POPULATION_UPKEEP_QUADRATIC_PER_PERSON_SQUARED: f64 = 0.000000004;
     const STARTING_COLONY_MIN_POPULATION: u32 = 10_000;
+    const MISSION_REFRESH_INTERVAL_YEARS: f32 = 0.65;
+    const CONSTRUCTION_UPFRONT_PAYMENT_RATIO: f32 = 0.60;
+    const CONSTRUCTION_ANNUAL_UPKEEP_RATIO: f32 = 0.16;
+
+    fn default_next_mission_id() -> u64 {
+        1
+    }
+
+    fn colony_stage_for_population(population: f64) -> ColonyStage {
+        if population >= 46_000_000.0 {
+            ColonyStage::CoreWorld
+        } else if population >= 2_100_000.0 {
+            ColonyStage::City
+        } else if population >= 120_000.0 {
+            ColonyStage::Settlement
+        } else {
+            ColonyStage::Outpost
+        }
+    }
+
+    fn stage_output_multiplier(population: f64, earth_like_world: bool) -> f32 {
+        let pop = population.max(0.0);
+        let outpost = 0.92f32;
+        let settlement = 1.00f32;
+        let city = 1.13f32;
+        let core = 1.26f32;
+        let base = if pop < 120_000.0 {
+            outpost
+        } else if pop < 2_100_000.0 {
+            let t = ((pop - 120_000.0) / (2_100_000.0 - 120_000.0)) as f32;
+            outpost + (settlement - outpost) * t
+        } else if pop < 46_000_000.0 {
+            let t = ((pop - 2_100_000.0) / (46_000_000.0 - 2_100_000.0)) as f32;
+            settlement + (city - settlement) * t
+        } else {
+            core
+        };
+        if earth_like_world {
+            base * 1.06
+        } else {
+            base
+        }
+    }
 
     fn element_distribution_weights() -> &'static [(&'static str, f32)] {
         const WEIGHTS: [(&str, f32); 12] = [
@@ -1680,8 +2293,8 @@ impl GameState {
     }
 
     fn award_exploration_rewards(&mut self, faction_token: &str, stage: SurveyStage) {
-        let (faction_treasury, tech_progress) = Self::survey_stage_rewards(stage);
-        if faction_treasury == 0 && tech_progress <= 0.0 {
+        let (faction_treasury, tech_progress, reputation_gain) = Self::survey_stage_rewards(stage);
+        if faction_treasury == 0 && tech_progress <= 0.0 && reputation_gain == 0 {
             return;
         }
 
@@ -1697,15 +2310,208 @@ impl GameState {
                 faction.colonization_tech_level = faction.colonization_tech_level.saturating_add(1);
             }
         }
+        let rep_entry = self.player_reputation.entry(faction_id).or_insert(0);
+        *rep_entry = (*rep_entry + reputation_gain).clamp(-100, 100);
     }
 
-    pub fn survey_stage_rewards(stage: SurveyStage) -> (i64, f32) {
+    pub fn survey_stage_rewards(stage: SurveyStage) -> (i64, f32, i16) {
         match stage {
-            SurveyStage::Unknown => (0, 0.0),
-            SurveyStage::Located => (0, 0.10),
-            SurveyStage::StellarSurvey => (0, 0.14),
-            SurveyStage::PlanetarySurvey => (0, 0.20),
-            SurveyStage::ColonyAssessment => (0, 0.28),
+            SurveyStage::Unknown => (0, 0.0, 0),
+            SurveyStage::Located => (350, 0.10, 1),
+            SurveyStage::StellarSurvey => (600, 0.14, 2),
+            SurveyStage::PlanetarySurvey => (950, 0.20, 3),
+            SurveyStage::ColonyAssessment => (1_600, 0.28, 5),
+        }
+    }
+
+    fn relation_key(a: &str, b: &str) -> (String, String) {
+        if a <= b {
+            (a.to_owned(), b.to_owned())
+        } else {
+            (b.to_owned(), a.to_owned())
+        }
+    }
+
+    fn get_relation(&self, a: &str, b: &str) -> i16 {
+        if a == b {
+            return 100;
+        }
+        self.faction_relations
+            .get(&Self::relation_key(a, b))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn set_relation(&mut self, a: &str, b: &str, value: i16) {
+        if a == b {
+            return;
+        }
+        self.faction_relations
+            .insert(Self::relation_key(a, b), value.clamp(-100, 100));
+    }
+
+    pub fn relation_between(&self, a: &str, b: &str) -> i16 {
+        self.get_relation(a, b)
+    }
+
+    pub fn treaty_between(&self, a: &str, b: &str) -> Option<&DiplomacyTreatyState> {
+        self.diplomacy_treaties.get(&Self::relation_key(a, b))
+    }
+
+    pub fn hostility_score_between(&self, a: &str, b: &str) -> f32 {
+        let mut hostility = -(self.get_relation(a, b) as f32) / 100.0;
+        if let Some(treaty) = self.treaty_between(a, b) {
+            hostility -= match treaty.kind {
+                DiplomaticTreatyKind::Alliance => 0.55,
+                DiplomaticTreatyKind::NonAggressionPact => 0.30,
+            };
+        }
+        if self.has_sanction(a, b) || self.has_sanction(b, a) {
+            hostility += 0.35;
+        }
+        hostility.clamp(-1.0, 1.0)
+    }
+
+    pub fn has_sanction(&self, by_faction: &str, target_faction: &str) -> bool {
+        self.active_sanctions
+            .get(&(by_faction.to_owned(), target_faction.to_owned()))
+            .is_some_and(|expires| *expires > self.current_year)
+    }
+
+    pub fn diplomacy_summary_counts(&self) -> (usize, usize, usize) {
+        let alliance_count = self
+            .diplomacy_treaties
+            .values()
+            .filter(|t| t.kind == DiplomaticTreatyKind::Alliance && t.expires_year > self.current_year)
+            .count();
+        let pact_count = self
+            .diplomacy_treaties
+            .values()
+            .filter(|t| {
+                t.kind == DiplomaticTreatyKind::NonAggressionPact && t.expires_year > self.current_year
+            })
+            .count();
+        let sanction_count = self
+            .active_sanctions
+            .values()
+            .filter(|expires| **expires > self.current_year)
+            .count();
+        (alliance_count, pact_count, sanction_count)
+    }
+
+    fn ensure_system_sim_state(&mut self, system: SystemId) -> &mut SystemSimState {
+        self.system_sim.entry(system).or_insert_with(|| SystemSimState {
+            system,
+            ..SystemSimState::default()
+        })
+    }
+
+    fn regenerate_missions(&mut self) {
+        self.missions.retain(|mission| mission.expires_year > self.current_year);
+        if self.missions.len() >= 8 {
+            return;
+        }
+        let mut candidate_systems: Vec<SystemSimState> = self
+            .system_sim
+            .values()
+            .filter(|sim| sim.econ_pressure > 0.25 || sim.conflict != ConflictState::Calm)
+            .cloned()
+            .collect();
+        candidate_systems.sort_by(|a, b| b.econ_pressure.total_cmp(&a.econ_pressure));
+        candidate_systems.truncate(6);
+
+        for sim in candidate_systems {
+            if self.missions.iter().any(|m| m.target_system == sim.system) {
+                continue;
+            }
+            let mut dominant = self.player.faction_id.clone();
+            let mut dominant_influence = -1.0_f32;
+            let mut second = self.player.faction_id.clone();
+            let mut second_influence = -1.0_f32;
+            for (faction_id, influence) in &sim.influence_by_faction {
+                if *influence > dominant_influence {
+                    second = dominant.clone();
+                    second_influence = dominant_influence;
+                    dominant = faction_id.clone();
+                    dominant_influence = *influence;
+                } else if *influence > second_influence {
+                    second = faction_id.clone();
+                    second_influence = *influence;
+                }
+            }
+            let treaty_kind = self.treaty_between(&dominant, &second).map(|t| t.kind);
+            let sanction_pressure = self.has_sanction(&dominant, &second)
+                || self.has_sanction(&second, &dominant);
+            let hostility = self.hostility_score_between(&dominant, &second);
+            let (kind, title, description, reward_rep, risk) = if sanction_pressure {
+                (
+                    MissionKind::SanctionRunning,
+                    "Sanction Pressure Run".to_owned(),
+                    "Move critical supplies through hostile trade filters before shortages spread."
+                        .to_owned(),
+                    6,
+                    0.60,
+                )
+            } else if treaty_kind == Some(DiplomaticTreatyKind::Alliance) {
+                (
+                    MissionKind::AllianceSupport,
+                    "Alliance Support Convoy".to_owned(),
+                    "Reinforce allied logistics and maintain bloc cohesion under regional stress."
+                        .to_owned(),
+                    4,
+                    0.40,
+                )
+            } else {
+                match sim.conflict {
+                ConflictState::Embargo => (
+                    MissionKind::SupplyRelief,
+                    "Break the Embargo".to_owned(),
+                    "Deliver emergency goods and stabilize local markets.".to_owned(),
+                    5,
+                    0.45,
+                ),
+                ConflictState::ProxyWar | ConflictState::PatrolSurge => (
+                    MissionKind::ReconSweep,
+                    "Recon Conflict Lanes".to_owned(),
+                    "Map patrol activity and recover tactical intel.".to_owned(),
+                    4,
+                    0.55,
+                ),
+                _ => (
+                    MissionKind::InfluenceOp,
+                    if hostility > 0.45 {
+                        "Rival Influence Push".to_owned()
+                    } else {
+                        "Influence Opportunity".to_owned()
+                    },
+                    if hostility > 0.45 {
+                        "Exploit faction rivalries to undermine dominant influence.".to_owned()
+                    } else {
+                        "Support local interests to shift faction control.".to_owned()
+                    },
+                    if hostility > 0.45 { 4 } else { 3 },
+                    if hostility > 0.45 { 0.45 } else { 0.35 },
+                ),
+            }
+            };
+
+            self.missions.push(MissionState {
+                id: self.next_mission_id,
+                issuer_faction: dominant,
+                target_system: sim.system,
+                kind,
+                title,
+                description,
+                reward_credits: (1_500.0 + sim.econ_pressure.max(0.0) * 4_000.0) as i64,
+                reward_tech: 0.04 + sim.econ_pressure.max(0.0) * 0.08,
+                reward_reputation: reward_rep,
+                risk,
+                expires_year: self.current_year + Self::MISSION_REFRESH_INTERVAL_YEARS,
+            });
+            self.next_mission_id = self.next_mission_id.saturating_add(1);
+            if self.missions.len() >= 8 {
+                break;
+            }
         }
     }
 
@@ -1759,10 +2565,10 @@ impl GameState {
 
     fn colony_upkeep_cost_annual(colony: &ColonyState) -> i64 {
         let stage_base = match colony.stage {
-            ColonyStage::Outpost => 3_500,
-            ColonyStage::Settlement => 15_000,
-            ColonyStage::City => 95_000,
-            ColonyStage::CoreWorld => 500_000,
+            ColonyStage::Outpost => 4_500,
+            ColonyStage::Settlement => 18_000,
+            ColonyStage::City => 78_000,
+            ColonyStage::CoreWorld => 340_000,
         };
         let policy_factor = colony.policy.definition().upkeep_multiplier;
         let defense_factor = 1.0 + colony.defense_balance.max(0.0) as f64 * 1.6;
@@ -1885,6 +2691,23 @@ impl GameState {
             return Err("This building has reached its maximum level.");
         }
 
+        let stage_rank = match colony.stage {
+            ColonyStage::Outpost => 0,
+            ColonyStage::Settlement => 1,
+            ColonyStage::City => 2,
+            ColonyStage::CoreWorld => 3,
+        };
+        let min_stage_rank = match kind {
+            ColonyBuildingKind::HabitatArcology => 1,
+            ColonyBuildingKind::SystemsAdministration => 1,
+            ColonyBuildingKind::DefenseGrid => 1,
+            ColonyBuildingKind::CatalyticRefinery => 2,
+            _ => 0,
+        };
+        if stage_rank < min_stage_rank {
+            return Err("Colony stage is too low for this building.");
+        }
+
         let requires_new_slot = current_level == 0 && kind.consumes_site_slot();
         if requires_new_slot {
             if let Some(slot_capacity) = Self::building_site_slot_capacity(site, site_profile) {
@@ -1894,24 +2717,39 @@ impl GameState {
                 }
             }
         }
+        if matches!(site, ColonyBuildingSite::Orbital) {
+            let orbital_count = colony
+                .buildings
+                .iter()
+                .filter(|b| matches!(b.site, ColonyBuildingSite::Orbital))
+                .count();
+            if current_level == 0 && orbital_count >= 2 {
+                return Err("Orbital capacity is fully allocated for this colony.");
+            }
+        }
 
         let owner_faction = colony.owner_faction.clone();
         let resource_cost = Self::colony_building_resource_cost(kind, target_level);
         let element_costs = Self::colony_building_element_costs(kind, target_level);
         let construction_cost = resource_cost.treasury;
+        let upfront_treasury_cost =
+            ((construction_cost as f32) * Self::CONSTRUCTION_UPFRONT_PAYMENT_RATIO).round() as i64;
+        let deferred_treasury_due = construction_cost.saturating_sub(upfront_treasury_cost);
+        let annual_construction_upkeep =
+            ((construction_cost as f32) * Self::CONSTRUCTION_ANNUAL_UPKEEP_RATIO).round() as i64;
         let construction_duration = Self::colony_building_duration_years(kind, target_level);
 
         let Some(faction) = self.factions.get_mut(&owner_faction) else {
             return Err("Owning faction could not be found.");
         };
-        if faction.treasury < construction_cost {
+        if faction.treasury < upfront_treasury_cost {
             return Err("Insufficient faction treasury for this construction.");
         }
         if !Self::can_afford_colony_resource_cost(colony, resource_cost, &element_costs) {
             return Err("Insufficient colony stockpiles (elements/food/industry/energy) for this construction.");
         }
 
-        faction.treasury = faction.treasury.saturating_sub(construction_cost);
+        faction.treasury = faction.treasury.saturating_sub(upfront_treasury_cost);
         if let Some(colony) = self.colonies.get_mut(&colony_id) {
             Self::spend_colony_resource_cost(colony, resource_cost, &element_costs);
         }
@@ -1922,6 +2760,8 @@ impl GameState {
             target_level,
             start_year: current_year,
             complete_year: current_year + construction_duration,
+            deferred_treasury_due,
+            annual_construction_upkeep,
         });
 
         Ok((construction_duration, construction_cost, target_level))
@@ -2241,6 +3081,11 @@ impl GameState {
                 let previous_stage = self.survey_stage(*system);
                 self.current_year = self.current_year.max(*at_year);
                 self.explored_systems.insert(*system);
+                let sim_state = self.ensure_system_sim_state(*system);
+                *sim_state
+                    .influence_by_faction
+                    .entry(by_faction.clone())
+                    .or_insert(0.0) += 0.08;
                 self.upsert_survey_record(*system, SurveyStage::Located, 0, 0, None, *at_year);
                 let updated_stage = self.survey_stage(*system);
                 if updated_stage > previous_stage {
@@ -2250,6 +3095,7 @@ impl GameState {
             GameEvent::HomeSystemSelected { at_year, system } => {
                 self.current_year = self.current_year.max(*at_year);
                 self.explored_systems.insert(*system);
+                self.ensure_system_sim_state(*system);
                 self.set_player_home_system(*system);
                 self.upsert_survey_record(*system, SurveyStage::Located, 0, 0, None, *at_year);
             }
@@ -2265,6 +3111,11 @@ impl GameState {
                 let previous_stage = self.survey_stage(*system);
                 self.current_year = self.current_year.max(*at_year);
                 self.explored_systems.insert(*system);
+                let sim_state = self.ensure_system_sim_state(*system);
+                *sim_state
+                    .influence_by_faction
+                    .entry(by_faction.clone())
+                    .or_insert(0.0) += 0.06;
                 self.upsert_survey_record(
                     *system,
                     *stage,
@@ -2296,6 +3147,11 @@ impl GameState {
             } => {
                 self.current_year = self.current_year.max(*at_year);
                 self.explored_systems.insert(*system);
+                let sim_state = self.ensure_system_sim_state(*system);
+                *sim_state
+                    .influence_by_faction
+                    .entry(founder_faction.clone())
+                    .or_insert(0.0) += 0.35;
                 let is_player_starting_colony = self.player.starting_colony_id.is_none()
                     && founder_faction == &self.player.faction_id;
                 let minimum_start_population = if is_player_starting_colony {
@@ -2430,8 +3286,131 @@ impl GameState {
                 self.current_year = self.current_year.max(*at_year);
                 let _ = self.set_player_starting_colony(*colony_id);
             }
-            GameEvent::FactionRelationChanged { at_year, .. } => {
+            GameEvent::FactionRelationChanged {
+                at_year,
+                from_faction,
+                to_faction,
+                delta,
+                ..
+            } => {
                 self.current_year = self.current_year.max(*at_year);
+                let current = self.get_relation(from_faction, to_faction);
+                self.set_relation(from_faction, to_faction, current.saturating_add(*delta));
+            }
+            GameEvent::TreatyEstablished {
+                at_year,
+                faction_a,
+                faction_b,
+                treaty,
+                expires_year,
+                ..
+            } => {
+                self.current_year = self.current_year.max(*at_year);
+                self.diplomacy_treaties.insert(
+                    Self::relation_key(faction_a, faction_b),
+                    DiplomacyTreatyState {
+                        kind: *treaty,
+                        started_year: *at_year,
+                        expires_year: *expires_year,
+                        cohesion: 0.45,
+                        strain: 0.0,
+                    },
+                );
+                let relation_boost = match treaty {
+                    DiplomaticTreatyKind::Alliance => 10,
+                    DiplomaticTreatyKind::NonAggressionPact => 6,
+                };
+                let current = self.get_relation(faction_a, faction_b);
+                self.set_relation(faction_a, faction_b, current.saturating_add(relation_boost));
+            }
+            GameEvent::TreatyDissolved {
+                at_year,
+                faction_a,
+                faction_b,
+                ..
+            } => {
+                self.current_year = self.current_year.max(*at_year);
+                self.diplomacy_treaties.remove(&Self::relation_key(faction_a, faction_b));
+                let current = self.get_relation(faction_a, faction_b);
+                self.set_relation(faction_a, faction_b, current.saturating_sub(12));
+            }
+            GameEvent::SanctionImposed {
+                at_year,
+                by_faction,
+                target_faction,
+                expires_year,
+                ..
+            } => {
+                self.current_year = self.current_year.max(*at_year);
+                self.active_sanctions
+                    .insert((by_faction.clone(), target_faction.clone()), *expires_year);
+                let current = self.get_relation(by_faction, target_faction);
+                self.set_relation(by_faction, target_faction, current.saturating_sub(8));
+            }
+            GameEvent::SanctionLifted {
+                at_year,
+                by_faction,
+                target_faction,
+                ..
+            } => {
+                self.current_year = self.current_year.max(*at_year);
+                self.active_sanctions
+                    .remove(&(by_faction.clone(), target_faction.clone()));
+                let current = self.get_relation(by_faction, target_faction);
+                self.set_relation(by_faction, target_faction, current.saturating_add(4));
+            }
+            GameEvent::PowerplayOperationResolved {
+                at_year,
+                actor_faction,
+                target_faction,
+                system,
+                operation,
+                success,
+                strength,
+                ..
+            } => {
+                self.current_year = self.current_year.max(*at_year);
+                let sim = self.ensure_system_sim_state(*system);
+                if *success {
+                    match operation {
+                        PowerplayOperationKind::UndermineInfluence => {
+                            if let Some(target) = sim.influence_by_faction.get_mut(target_faction) {
+                                *target = (*target - *strength).max(0.0);
+                            }
+                            *sim
+                                .influence_by_faction
+                                .entry(actor_faction.clone())
+                                .or_insert(0.0) += *strength * 0.55;
+                            sim.econ_pressure = (sim.econ_pressure + strength * 0.45).clamp(0.0, 1.2);
+                            sim.security = (sim.security - strength * 0.25).clamp(0.05, 1.0);
+                        }
+                        PowerplayOperationKind::SupportAlly => {
+                            *sim
+                                .influence_by_faction
+                                .entry(target_faction.clone())
+                                .or_insert(0.0) += *strength * 0.65;
+                            sim.trade_flow = (sim.trade_flow + strength * 0.40).clamp(0.0, 2.0);
+                            sim.stability = (sim.stability + strength * 0.20).clamp(0.05, 1.0);
+                        }
+                        PowerplayOperationKind::EconomicPressure => {
+                            sim.scarcity = (sim.scarcity + strength * 0.30).clamp(0.0, 1.0);
+                            sim.econ_pressure = (sim.econ_pressure + strength * 0.35).clamp(0.0, 1.2);
+                            sim.trade_flow = (sim.trade_flow - strength * 0.28).clamp(0.0, 2.0);
+                        }
+                    }
+                }
+                self.recent_powerplay_ops.push(PowerplayOperationRecord {
+                    at_year: *at_year,
+                    actor_faction: actor_faction.clone(),
+                    target_faction: target_faction.clone(),
+                    system: *system,
+                    operation: *operation,
+                    success: *success,
+                });
+                if self.recent_powerplay_ops.len() > 128 {
+                    let drop_n = self.recent_powerplay_ops.len() - 128;
+                    self.recent_powerplay_ops.drain(0..drop_n);
+                }
             }
             GameEvent::CompletedColonyBuilding {
                 at_year,
@@ -2582,23 +3561,12 @@ impl GameState {
             let growth_factor = (1.0 + annual_growth_rate).max(0.05).powf(delta_years as f64);
             colony.population = (colony.population * growth_factor).max(25.0);
 
-            colony.stage = if colony.population >= 50_000_000.0 {
-                ColonyStage::CoreWorld
-            } else if colony.population >= 2_500_000.0 {
-                ColonyStage::City
-            } else if colony.population >= 150_000.0 {
-                ColonyStage::Settlement
-            } else {
-                ColonyStage::Outpost
-            };
-
-            let stage_output_multiplier = match colony.stage {
-                ColonyStage::Outpost => 0.92,
-                ColonyStage::Settlement => 1.0,
-                ColonyStage::City => 1.15,
-                ColonyStage::CoreWorld => 1.30,
-            } * elw_output_multiplier
-              * stability_efficiency;
+            colony.stage = Self::colony_stage_for_population(colony.population);
+            let stage_output_multiplier = Self::stage_output_multiplier(
+                colony.population,
+                colony.earth_like_world,
+            ) * elw_output_multiplier
+                * stability_efficiency;
             let population_millions = (colony.population / 1_000_000.0) as f32;
             let food_demand =
                 0.0009 + population_millions * 0.0011 + building_food_demand_bonus;
@@ -2729,6 +3697,169 @@ impl GameState {
             }
         }
 
+        let mut metrics_by_system: HashMap<SystemId, (HashMap<String, f32>, f32, f32, f32)> =
+            HashMap::new();
+        for colony in self.colonies.values() {
+            let supply = colony.food_balance + colony.industry_balance + colony.energy_balance;
+            let stress = (-supply).max(0.0);
+            let trade_potential =
+                (supply.max(0.0) + colony.last_tax_revenue_annual as f32 / 35_000.0).max(0.0);
+            let entry = metrics_by_system
+                .entry(colony.system)
+                .or_insert_with(|| (HashMap::new(), 0.0, 0.0, 0.0));
+            *entry.0.entry(colony.owner_faction.clone()).or_insert(0.0) +=
+                colony.population as f32 / 1_000_000.0 + colony.stability * 2.2;
+            entry.1 += stress;
+            entry.2 += trade_potential;
+            entry.3 += (1.0 - colony.stability).max(0.0);
+        }
+        let current_year = self.current_year;
+        const MAX_RELATION_EVENTS_PER_TICK: usize = 8;
+        const MAX_DIPLOMACY_EVENTS_PER_TICK: usize = 5;
+        let mut emitted_relation_pairs: HashSet<(String, String)> = HashSet::new();
+        let mut pending_diplomacy_events: Vec<GameEvent> = Vec::new();
+        for (system_id, (influence_raw, stress, trade, unrest)) in metrics_by_system {
+            let sim = self.ensure_system_sim_state(system_id);
+            let sum = influence_raw.values().copied().sum::<f32>().max(0.001);
+            for (faction_id, value) in influence_raw {
+                let target = (value / sum).clamp(0.0, 1.0);
+                let current = sim.influence_by_faction.get(&faction_id).copied().unwrap_or(0.0);
+                let blended = current * 0.75 + target * 0.25;
+                sim.influence_by_faction.insert(faction_id, blended);
+            }
+            sim.econ_pressure = (sim.econ_pressure * 0.78 + stress * 0.22).clamp(0.0, 1.2);
+            sim.trade_flow = (sim.trade_flow * 0.80 + trade * 0.20).clamp(0.0, 2.0);
+            sim.scarcity =
+                (sim.scarcity * 0.75 + (stress - trade * 0.08).max(0.0) * 0.25).clamp(0.0, 1.0);
+            sim.stability =
+                (sim.stability + (0.05 - unrest * 0.06 + trade * 0.01) * delta_years).clamp(0.05, 1.0);
+            sim.security = (sim.security + (sim.stability - sim.scarcity - 0.4) * 0.16 * delta_years)
+                .clamp(0.05, 1.0);
+
+            sim.conflict = if sim.scarcity > 0.75 {
+                ConflictState::Embargo
+            } else if sim.security < 0.25 {
+                ConflictState::ProxyWar
+            } else if sim.security < 0.40 {
+                ConflictState::PatrolSurge
+            } else if sim.econ_pressure > 0.50 {
+                ConflictState::Tense
+            } else {
+                ConflictState::Calm
+            };
+
+            let mut top_a: Option<(&String, f32)> = None;
+            let mut top_b: Option<(&String, f32)> = None;
+            for (faction_id, influence) in &sim.influence_by_faction {
+                let value = *influence;
+                if top_a.map(|(_, a)| value > a).unwrap_or(true) {
+                    top_b = top_a;
+                    top_a = Some((faction_id, value));
+                } else if top_b.map(|(_, b)| value > b).unwrap_or(true) {
+                    top_b = Some((faction_id, value));
+                }
+            }
+            if let (Some(top_a), Some(top_b)) = (top_a, top_b) {
+                let conflict_pressure = sim.econ_pressure + sim.scarcity + (1.0 - sim.security);
+                let top_a_id = top_a.0.clone();
+                let top_b_id = top_b.0.clone();
+                let top_a_influence = top_a.1;
+                let top_b_influence = top_b.1;
+                if top_a.1 > 0.26
+                    && top_b.1 > 0.26
+                    && conflict_pressure > 1.25
+                    && emitted_relation_pairs.len() < MAX_RELATION_EVENTS_PER_TICK
+                {
+                    let pair = Self::relation_key(top_a.0, top_b.0);
+                    if emitted_relation_pairs.insert(pair) {
+                        generated_events.push(GameEvent::FactionRelationChanged {
+                            at_year: current_year,
+                            from_faction: top_a_id.clone(),
+                            to_faction: top_b_id.clone(),
+                            delta: -1,
+                            reason: "Influence contest".to_owned(),
+                        });
+                    }
+                }
+                let _ = sim;
+
+                if pending_diplomacy_events.len() < MAX_DIPLOMACY_EVENTS_PER_TICK {
+                    let relation = self.get_relation(&top_a_id, &top_b_id);
+                    let treaty = self.treaty_between(&top_a_id, &top_b_id).cloned();
+                    let sanction_active = self.has_sanction(&top_a_id, &top_b_id)
+                        || self.has_sanction(&top_b_id, &top_a_id);
+
+                    if relation >= 48
+                        && conflict_pressure < 1.15
+                        && treaty.is_none()
+                        && top_a_influence > 0.18
+                        && top_b_influence > 0.18
+                    {
+                        pending_diplomacy_events.push(GameEvent::TreatyEstablished {
+                            at_year: current_year,
+                            faction_a: top_a_id.clone(),
+                            faction_b: top_b_id.clone(),
+                            treaty: DiplomaticTreatyKind::Alliance,
+                            expires_year: current_year + 2.8,
+                            reason: "Shared regional interests".to_owned(),
+                        });
+                    } else if relation >= 25 && relation < 48 && treaty.is_none() && !sanction_active {
+                        pending_diplomacy_events.push(GameEvent::TreatyEstablished {
+                            at_year: current_year,
+                            faction_a: top_a_id.clone(),
+                            faction_b: top_b_id.clone(),
+                            treaty: DiplomaticTreatyKind::NonAggressionPact,
+                            expires_year: current_year + 1.8,
+                            reason: "Temporary frontier detente".to_owned(),
+                        });
+                    } else if relation <= -45
+                        && conflict_pressure > 1.20
+                        && !sanction_active
+                    {
+                        pending_diplomacy_events.push(GameEvent::SanctionImposed {
+                            at_year: current_year,
+                            by_faction: top_a_id.clone(),
+                            target_faction: top_b_id.clone(),
+                            expires_year: current_year + 1.2,
+                            reason: "Escalating influence dispute".to_owned(),
+                        });
+                    } else if sanction_active && relation > -10 && conflict_pressure < 1.0 {
+                        pending_diplomacy_events.push(GameEvent::SanctionLifted {
+                            at_year: current_year,
+                            by_faction: top_a_id.clone(),
+                            target_faction: top_b_id.clone(),
+                            reason: "Conflict cooling".to_owned(),
+                        });
+                    }
+                }
+            }
+        }
+        generated_events.extend(pending_diplomacy_events);
+
+        let expired_treaties: Vec<_> = self
+            .diplomacy_treaties
+            .iter()
+            .filter_map(|(pair, treaty)| {
+                if treaty.expires_year <= self.current_year {
+                    Some((pair.clone(), treaty.kind))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for ((a, b), treaty_kind) in expired_treaties {
+            generated_events.push(GameEvent::TreatyDissolved {
+                at_year: self.current_year,
+                faction_a: a,
+                faction_b: b,
+                treaty: treaty_kind,
+                reason: "Treaty expired".to_owned(),
+            });
+        }
+        self.active_sanctions.retain(|_, expires_year| *expires_year > self.current_year);
+        self.diplomacy_treaties
+            .retain(|_, treaty| treaty.expires_year > self.current_year);
+
         let mut insolvency_penalty_by_faction = HashMap::<String, f32>::new();
         for faction in self.factions.values() {
             if faction.treasury < 0 {
@@ -2746,20 +3877,14 @@ impl GameState {
         }
 
         let mut completed_scans = Vec::new();
-        self.pending_survey_scans.retain(|scan| {
+        let mut pending_scans = std::mem::take(&mut self.pending_survey_scans);
+        for scan in pending_scans.drain(..) {
             if scan.complete_year <= self.current_year {
-                completed_scans.push(scan.clone());
-                false
+                completed_scans.push(scan);
             } else {
-                true
+                self.pending_survey_scans.push(scan);
             }
-        });
-        completed_scans.sort_by(|a, b| {
-            a.complete_year
-                .total_cmp(&b.complete_year)
-                .then_with(|| a.system.cmp(&b.system))
-                .then_with(|| a.target_stage.cmp(&b.target_stage))
-        });
+        }
         for scan in completed_scans {
             let at_year = scan.complete_year;
             if scan.target_stage == SurveyStage::Located {
@@ -2782,19 +3907,14 @@ impl GameState {
         }
 
         let mut completed_foundings = Vec::new();
-        self.pending_colony_foundings.retain(|founding| {
+        let mut pending_foundings = std::mem::take(&mut self.pending_colony_foundings);
+        for founding in pending_foundings.drain(..) {
             if founding.complete_year <= self.current_year {
-                completed_foundings.push(founding.clone());
-                false
+                completed_foundings.push(founding);
             } else {
-                true
+                self.pending_colony_foundings.push(founding);
             }
-        });
-        completed_foundings.sort_by(|a, b| {
-            a.complete_year
-                .total_cmp(&b.complete_year)
-                .then_with(|| a.colony_id.cmp(&b.colony_id))
-        });
+        }
         for founding in completed_foundings {
             generated_events.push(GameEvent::FoundedColony {
                 at_year: founding.complete_year,
@@ -2815,22 +3935,41 @@ impl GameState {
         }
 
         let mut completed_buildings = Vec::new();
-        self.pending_colony_buildings.retain(|pending| {
-            if pending.complete_year <= self.current_year {
-                completed_buildings.push(pending.clone());
-                false
-            } else {
-                true
+        let mut pending_buildings = std::mem::take(&mut self.pending_colony_buildings);
+        for mut pending in pending_buildings.drain(..) {
+            if let Some(colony) = self.colonies.get(&pending.colony_id) {
+                if let Some(faction) = self.factions.get_mut(&colony.owner_faction) {
+                    let upkeep_cost = (pending.annual_construction_upkeep as f32 * delta_years)
+                        .round() as i64;
+                    if upkeep_cost > 0 {
+                        faction.treasury = faction.treasury.saturating_sub(upkeep_cost);
+                    }
+                }
             }
-        });
-        completed_buildings.sort_by(|a, b| {
-            a.complete_year
-                .total_cmp(&b.complete_year)
-                .then_with(|| a.colony_id.cmp(&b.colony_id))
-                .then_with(|| a.kind.cmp(&b.kind))
-                .then_with(|| a.site.cmp(&b.site))
-                .then_with(|| a.target_level.cmp(&b.target_level))
-        });
+            if pending.complete_year <= self.current_year {
+                let mut can_complete = true;
+                if pending.deferred_treasury_due > 0 {
+                    if let Some(colony) = self.colonies.get(&pending.colony_id) {
+                        if let Some(faction) = self.factions.get_mut(&colony.owner_faction) {
+                            if faction.treasury >= pending.deferred_treasury_due {
+                                faction.treasury =
+                                    faction.treasury.saturating_sub(pending.deferred_treasury_due);
+                            } else {
+                                can_complete = false;
+                            }
+                        }
+                    }
+                }
+                if can_complete {
+                    completed_buildings.push(pending);
+                } else {
+                    pending.complete_year = (self.current_year + 0.18).max(pending.complete_year + 0.05);
+                    self.pending_colony_buildings.push(pending);
+                }
+            } else {
+                self.pending_colony_buildings.push(pending);
+            }
+        }
         for pending in completed_buildings {
             generated_events.push(GameEvent::CompletedColonyBuilding {
                 at_year: pending.complete_year,
@@ -2843,14 +3982,14 @@ impl GameState {
 
         // Complete pending population transfers.
         let mut completed_transfers = Vec::new();
-        self.pending_population_transfers.retain(|transfer| {
+        let mut pending_transfers = std::mem::take(&mut self.pending_population_transfers);
+        for transfer in pending_transfers.drain(..) {
             if transfer.complete_year <= self.current_year {
-                completed_transfers.push(transfer.clone());
-                false
+                completed_transfers.push(transfer);
             } else {
-                true
+                self.pending_population_transfers.push(transfer);
             }
-        });
+        }
         for transfer in completed_transfers {
             if let Some(dest) = self.colonies.get_mut(&transfer.target_colony_id) {
                 dest.population += transfer.colonists as f64;
@@ -2859,7 +3998,64 @@ impl GameState {
             }
         }
 
+        self.regenerate_missions();
+
         generated_events
+    }
+
+    pub fn mission_board(&self) -> &[MissionState] {
+        &self.missions
+    }
+
+    pub fn player_reputation_with(&self, faction_id: &str) -> i16 {
+        self.player_reputation.get(faction_id).copied().unwrap_or(0)
+    }
+
+    pub fn complete_mission(&mut self, mission_id: u64) -> Result<(), String> {
+        let Some(index) = self.missions.iter().position(|mission| mission.id == mission_id) else {
+            return Err("Mission not found.".to_owned());
+        };
+        let mission = self.missions.remove(index);
+        if let Some(faction) = self.factions.get_mut(&mission.issuer_faction) {
+            faction.treasury = faction.treasury.saturating_add(mission.reward_credits);
+            faction.colonization_tech_progress += mission.reward_tech;
+        }
+        let rep = self
+            .player_reputation
+            .entry(mission.issuer_faction.clone())
+            .or_insert(0);
+        *rep = (*rep + mission.reward_reputation).clamp(-100, 100);
+        if let Some(sim) = self.system_sim.get_mut(&mission.target_system) {
+            match mission.kind {
+                MissionKind::SanctionRunning => {
+                    sim.econ_pressure = (sim.econ_pressure - 0.18).max(0.0);
+                    sim.scarcity = (sim.scarcity - 0.22).max(0.0);
+                    sim.trade_flow = (sim.trade_flow + 0.10).clamp(0.0, 2.0);
+                    sim.stability = (sim.stability + 0.04).clamp(0.0, 1.0);
+                }
+                MissionKind::AllianceSupport => {
+                    sim.econ_pressure = (sim.econ_pressure - 0.12).max(0.0);
+                    sim.scarcity = (sim.scarcity - 0.12).max(0.0);
+                    sim.trade_flow = (sim.trade_flow + 0.14).clamp(0.0, 2.0);
+                    sim.stability = (sim.stability + 0.06).clamp(0.0, 1.0);
+                }
+                _ => {
+                    sim.econ_pressure = (sim.econ_pressure - 0.15).max(0.0);
+                    sim.scarcity = (sim.scarcity - 0.18).max(0.0);
+                    sim.stability = (sim.stability + 0.05).clamp(0.0, 1.0);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn galactic_hotspots(&self) -> Vec<&SystemSimState> {
+        let mut hotspots: Vec<&SystemSimState> = self.system_sim.values().collect();
+        hotspots.sort_by(|a, b| {
+            (b.econ_pressure + (1.0 - b.security) + b.scarcity)
+                .total_cmp(&(a.econ_pressure + (1.0 - a.security) + a.scarcity))
+        });
+        hotspots
     }
 }
 
@@ -3029,7 +4225,12 @@ mod tests {
             | GameEvent::HomeSystemSelected { at_year, .. }
             | GameEvent::StartingColonySelected { at_year, .. }
             | GameEvent::FactionRelationChanged { at_year, .. }
-            | GameEvent::CompletedColonyBuilding { at_year, .. } => *at_year,
+            | GameEvent::CompletedColonyBuilding { at_year, .. }
+            | GameEvent::TreatyEstablished { at_year, .. }
+            | GameEvent::TreatyDissolved { at_year, .. }
+            | GameEvent::SanctionImposed { at_year, .. }
+            | GameEvent::SanctionLifted { at_year, .. }
+            | GameEvent::PowerplayOperationResolved { at_year, .. } => *at_year,
         };
         let year1 = match &events[1] {
             GameEvent::DiscoveredSystem { at_year, .. }
@@ -3038,7 +4239,12 @@ mod tests {
             | GameEvent::HomeSystemSelected { at_year, .. }
             | GameEvent::StartingColonySelected { at_year, .. }
             | GameEvent::FactionRelationChanged { at_year, .. }
-            | GameEvent::CompletedColonyBuilding { at_year, .. } => *at_year,
+            | GameEvent::CompletedColonyBuilding { at_year, .. }
+            | GameEvent::TreatyEstablished { at_year, .. }
+            | GameEvent::TreatyDissolved { at_year, .. }
+            | GameEvent::SanctionImposed { at_year, .. }
+            | GameEvent::SanctionLifted { at_year, .. }
+            | GameEvent::PowerplayOperationResolved { at_year, .. } => *at_year,
         };
         assert!(year0 <= year1, "events were not ordered: {year0} then {year1}");
     }

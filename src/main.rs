@@ -6,7 +6,7 @@ use std::f32::consts::PI;
 use std::fs;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::events::GameEvent;
 use crate::game_state::{
@@ -44,6 +44,8 @@ const STAR_DRAW_RADIUS_PX: f32 = 1.5;
 const GAME_SAVE_PATH: &str = "galaxy_game_state.json";
 const DELTA_SAVE_PATH: &str = "galaxy_deltas.json";
 const MAX_SAVED_GAME_EVENTS: usize = 10_000;
+const AI_CLUSTER_RADIUS_MIN: f32 = 1_200.0;
+const AI_CLUSTER_RADIUS_MAX: f32 = 18_000.0;
 
 const DEFAULT_GALAXY_SEED: u64 = 0xED11_E5DA_7A5E_ED01;
 const TARGET_SYSTEM_COUNT: usize = 400_000_000_000;
@@ -57,6 +59,11 @@ const MAX_PENDING_REQUESTS: usize = 512;
 const MAX_REQUESTS_PER_FRAME: usize = 64;
 const MAX_RESULTS_PER_FRAME: usize = 96;
 const MAX_WORKER_THREADS: usize = 8;
+const UI_CACHE_REFRESH_INTERVAL_MS: f64 = 250.0;
+const MIN_REBUILD_INTERVAL_MS: f64 = 45.0;
+const LOD_SWITCH_COOLDOWN_MS: f64 = 200.0;
+const MAX_VISIBLE_BUILD_SECTORS: usize = 300;
+const MAX_VISIBLE_CHUNK_POINTS: usize = 90_000;
 const SYSTEM_VIEW_POINT_SOFT_LIMIT: usize = 90_000;
 const SYSTEM_VIEW_POINT_HARD_LIMIT: usize = 160_000;
 const SYSTEM_VIEW_READINESS_MIN: f32 = 0.98;
@@ -275,6 +282,16 @@ struct VisibleBuildResult {
     build_ms: f32,
 }
 
+enum SimCommand {
+    Advance { ticks: u32, tick_years: f32 },
+    CompleteMission { mission_id: u64 },
+}
+
+struct SimSnapshot {
+    state: GameState,
+    events: Vec<GameEvent>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LodPreset {
     Compatibility,
@@ -317,6 +334,34 @@ struct LodProfile {
     system_view_max_missing_sectors: usize,
 }
 
+#[derive(Clone, Debug)]
+struct ResourcesSnapshot {
+    faction_summaries: Vec<(String, String, i64, u32, f32, usize, f32, f32, f32, f32)>,
+    total_element_amounts: Vec<f32>,
+    total_atmosphere_amounts: Vec<f32>,
+    pending_building_count: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ColonyRowSnapshot {
+    id: u64,
+    name: String,
+    owner_faction: String,
+    stage: &'static str,
+    population: f64,
+    system: SystemId,
+    policy: crate::game_state::ColonyPolicy,
+    taxation_policy: crate::game_state::TaxationPolicy,
+    stability: f32,
+    food: f32,
+    industry: f32,
+    energy: f32,
+    defense: f32,
+    tax_revenue: i64,
+    net_revenue: i64,
+    buildings: Vec<crate::game_state::ColonyBuildingState>,
+}
+
 pub struct GalaxyApp {
     phase: AppPhase,
     menu_seed_input: String,
@@ -334,6 +379,11 @@ pub struct GalaxyApp {
     render_budget: usize,
     request_tx: mpsc::Sender<SectorCoord>,
     result_rx: mpsc::Receiver<(SectorCoord, Vec<SolarSystem>)>,
+    save_request_tx: mpsc::Sender<(GameState, Vec<GameEvent>)>,
+    save_result_rx: mpsc::Receiver<Result<(), String>>,
+    sim_command_tx: mpsc::Sender<SimCommand>,
+    sim_result_rx: mpsc::Receiver<SimSnapshot>,
+    sim_inflight: bool,
     visible_build_request_tx: mpsc::SyncSender<VisibleBuildRequest>,
     visible_build_result_rx: mpsc::Receiver<VisibleBuildResult>,
     visible_build_inflight: bool,
@@ -367,13 +417,23 @@ pub struct GalaxyApp {
     game_state: GameState,
     game_events: Vec<GameEvent>,
     game_paused: bool,
+    pending_sim_ticks: u32,
     strategic_clock: StrategicClock,
     game_autosave_accum_years: f32,
     game_save_error: Option<String>,
     game_notice: Option<String>,
+    save_inflight: bool,
+    ui_cache_dirty: bool,
+    last_ui_cache_refresh_ms: f64,
+    last_visible_rebuild_request_ms: f64,
+    last_lod_switch_ms: f64,
+    cached_resources: Option<ResourcesSnapshot>,
+    cached_colonies: Option<Vec<ColonyRowSnapshot>>,
+    cached_hotspots: Option<Vec<crate::game_state::SystemSimState>>,
     settings_window_open: bool,
     settings_seed_input: String,
     settings_render_budget: usize,
+    settings_ai_cluster_radius_world: f32,
     lod_preset: LodPreset,
     settings_lod_preset: LodPreset,
     lod_chunk_point_min_budget: usize,
@@ -387,6 +447,8 @@ pub struct GalaxyApp {
     construction_window_open: bool,
     debug_panel_open: bool,
     resources_panel_open: bool,
+    galactic_situation_open: bool,
+    mission_board_open: bool,
     favorites_window_open: bool,
     travel_system: Option<SystemDetail>,
     travel_window_open: bool,
@@ -403,7 +465,7 @@ pub struct GalaxyApp {
     travel_atmosphere_info_open: bool,
     music_player: music::MusicPlayer,
     music_window_open: bool,
-    ai_controller: ai_factions::AiFactionController,
+    ai_home_spawn_config: ai_factions::AiHomeSpawnConfig,
 }
 
 impl Default for GalaxyApp {
@@ -423,6 +485,7 @@ impl Default for GalaxyApp {
         let sector_cache_capacity = MAX_CACHED_SECTORS.max(full_view_sector_capacity);
         let (request_tx, result_rx) =
             GalaxyApp::spawn_sector_workers(worker_count, Arc::clone(&procedural_generator));
+        let (save_request_tx, save_result_rx) = GalaxyApp::spawn_save_worker();
         let (visible_build_request_tx, visible_build_result_rx) =
             GalaxyApp::spawn_visible_build_worker();
         let (mut game_state, mut game_events, game_save_error) =
@@ -468,7 +531,13 @@ impl Default for GalaxyApp {
         }
         Self::trim_game_event_history(&mut game_events);
         let has_save_file = std::path::Path::new(GAME_SAVE_PATH).exists();
-        let ai_controller = ai_factions::AiFactionController::new(&procedural_generator);
+        let ai_home_spawn_config = ai_factions::AiHomeSpawnConfig::default();
+        let (sim_command_tx, sim_result_rx) = GalaxyApp::spawn_sim_worker(
+            Arc::clone(&procedural_generator),
+            game_state.clone(),
+            game_events.clone(),
+            ai_home_spawn_config,
+        );
         Self {
             phase: AppPhase::MainMenu,
             menu_seed_input: String::new(),
@@ -486,6 +555,11 @@ impl Default for GalaxyApp {
             render_budget: lod_profile.render_budget,
             request_tx,
             result_rx,
+            save_request_tx,
+            save_result_rx,
+            sim_command_tx,
+            sim_result_rx,
+            sim_inflight: false,
             visible_build_request_tx,
             visible_build_result_rx,
             visible_build_inflight: false,
@@ -519,13 +593,23 @@ impl Default for GalaxyApp {
             game_state,
             game_events,
             game_paused: true,
+            pending_sim_ticks: 0,
             strategic_clock: StrategicClock::default(),
             game_autosave_accum_years: 0.0,
             game_save_error,
             game_notice: None,
+            save_inflight: false,
+            ui_cache_dirty: true,
+            last_ui_cache_refresh_ms: -1_000.0,
+            last_visible_rebuild_request_ms: -1_000.0,
+            last_lod_switch_ms: -1_000.0,
+            cached_resources: None,
+            cached_colonies: None,
+            cached_hotspots: None,
             settings_window_open: false,
             settings_seed_input: galaxy_seed.to_string(),
             settings_render_budget: lod_profile.render_budget,
+            settings_ai_cluster_radius_world: ai_home_spawn_config.cluster_radius_world,
             lod_preset,
             settings_lod_preset: lod_preset,
             lod_chunk_point_min_budget: lod_profile.chunk_point_min_budget,
@@ -539,6 +623,8 @@ impl Default for GalaxyApp {
             construction_window_open: false,
             debug_panel_open: false,
             resources_panel_open: false,
+            galactic_situation_open: false,
+            mission_board_open: false,
             favorites_window_open: false,
             travel_system: None,
             travel_window_open: false,
@@ -555,12 +641,19 @@ impl Default for GalaxyApp {
             travel_atmosphere_info_open: false,
             music_player: music::MusicPlayer::new(),
             music_window_open: false,
-            ai_controller,
+            ai_home_spawn_config,
         }
     }
 }
 
 impl GalaxyApp {
+    fn wall_time_ms() -> f64 {
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_secs_f64() * 1000.0,
+            Err(_) => 0.0,
+        }
+    }
+
     fn trim_game_event_history(events: &mut Vec<GameEvent>) {
         if events.len() <= MAX_SAVED_GAME_EVENTS {
             return;
@@ -725,7 +818,8 @@ impl GalaxyApp {
         self.travel_last_input_time = None;
         self.travel_selected_body = None;
         self.reset_travel_view();
-        self.ai_controller = ai_factions::AiFactionController::new(&self.procedural_generator);
+        self.ui_cache_dirty = true;
+        self.restart_sim_worker();
     }
 
     fn restart_simulation_with_seed(&mut self, galaxy_seed: u64) {
@@ -975,66 +1069,14 @@ impl GalaxyApp {
         if !self.resources_panel_open {
             return;
         }
-
-        // Gather per-faction summaries.
-        let mut faction_summaries: Vec<(String, String, i64, u32, f32, usize, f32, f32, f32, f32)> =
-            Vec::new();
+        if self.cached_resources.is_none() {
+            self.refresh_ui_caches();
+        }
+        let Some(resources) = self.cached_resources.as_ref() else {
+            return;
+        };
         let element_catalog = composition_element_resource_catalog();
         let atmosphere_catalog = atmosphere_resource_catalog();
-        let mut total_element_amounts = vec![0.0f32; element_catalog.len()];
-        let mut total_atmosphere_amounts = vec![0.0f32; atmosphere_catalog.len()];
-
-        let mut faction_ids: Vec<String> = self.game_state.factions.keys().cloned().collect();
-        faction_ids.sort();
-
-        for fid in &faction_ids {
-            let faction = &self.game_state.factions[fid];
-            let display_name = faction.display_name.clone();
-            let treasury = faction.treasury;
-            let tech_level = faction.colonization_tech_level;
-            let tech_progress = faction.colonization_tech_progress;
-
-            let mut colony_count = 0usize;
-            let mut food_stock = 0.0_f32;
-            let mut industry_stock = 0.0_f32;
-            let mut energy_stock = 0.0_f32;
-            let mut stockpile_cap = 0.0_f32;
-
-            for colony in self.game_state.colonies.values() {
-                if colony.owner_faction == *fid {
-                    colony_count += 1;
-                    food_stock += colony.food_stockpile;
-                    industry_stock += colony.industry_stockpile;
-                    energy_stock += colony.energy_stockpile;
-                    stockpile_cap += colony.stockpile_capacity;
-                    for (symbol, amount) in &colony.element_stockpiles {
-                        if let Some(idx) = element_catalog.iter().position(|e| e.symbol == symbol) {
-                            total_element_amounts[idx] += amount.max(0.0);
-                        }
-                    }
-                    for (formula, amount) in &colony.atmosphere_stockpiles {
-                        if let Some(idx) = atmosphere_catalog.iter().position(|e| e.formula == formula) {
-                            total_atmosphere_amounts[idx] += amount.max(0.0);
-                        }
-                    }
-                }
-            }
-
-            faction_summaries.push((
-                fid.clone(),
-                display_name,
-                treasury,
-                tech_level,
-                tech_progress,
-                colony_count,
-                food_stock,
-                industry_stock,
-                energy_stock,
-                stockpile_cap,
-            ));
-        }
-
-        let pending_building_count = self.game_state.pending_colony_buildings.len();
 
         let mut open = self.resources_panel_open;
         egui::Window::new("Galaxy Economy")
@@ -1072,7 +1114,7 @@ impl GalaxyApp {
                                     industry_stock,
                                     energy_stock,
                                     stockpile_cap,
-                                ) in &faction_summaries
+                                ) in &resources.faction_summaries
                                 {
                                     ui.label(display_name.as_str());
                                     ui.label(format!("{}", treasury));
@@ -1090,7 +1132,7 @@ impl GalaxyApp {
                 ui.separator();
                 ui.small(format!(
                     "Pending building projects galaxy-wide: {}",
-                    pending_building_count
+                    resources.pending_building_count
                 ));
                 ui.small(
                     "Element and atmosphere amounts below are summed across ALL faction colony stockpiles.",
@@ -1114,7 +1156,7 @@ impl GalaxyApp {
                                         ui.end_row();
 
                                         for (idx, entry) in element_catalog.iter().enumerate() {
-                                            let amount = total_element_amounts[idx];
+                                            let amount = resources.total_element_amounts[idx];
                                             if amount <= 0.0 { continue; }
                                             ui.label(entry.atomic_number.to_string());
                                             ui.label(entry.symbol);
@@ -1142,7 +1184,7 @@ impl GalaxyApp {
                                         ui.end_row();
 
                                         for (idx, entry) in atmosphere_catalog.iter().enumerate() {
-                                            let amount = total_atmosphere_amounts[idx];
+                                            let amount = resources.total_atmosphere_amounts[idx];
                                             if amount <= 0.0 { continue; }
                                             ui.label(entry.formula);
                                             ui.label(entry.name);
@@ -1158,16 +1200,301 @@ impl GalaxyApp {
         self.resources_panel_open = open;
     }
 
-    fn persist_game_state(&mut self) {
-        self.trim_game_events();
-        match save::save_game_save(GAME_SAVE_PATH, &self.game_state, &self.game_events) {
-            Ok(()) => {
-                self.game_save_error = None;
-            }
-            Err(err) => {
-                self.game_save_error = Some(format!("Failed to save game state: {err}"));
+    fn show_galactic_situation_window(&mut self, ctx: &egui::Context) {
+        if !self.galactic_situation_open {
+            return;
+        }
+        if self.cached_hotspots.is_none() {
+            self.refresh_ui_caches();
+        }
+        let mut open = self.galactic_situation_open;
+        let hotspots = self
+            .cached_hotspots
+            .as_ref()
+            .map(|rows| rows.as_slice())
+            .unwrap_or(&[]);
+        egui::Window::new("Galactic Situation")
+            .open(&mut open)
+            .resizable(true)
+            .default_size([620.0, 460.0])
+            .show(ctx, |ui| {
+                ui.label("Live systems under pressure. Higher pressure means more opportunities and risks.");
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    egui::Grid::new("galactic_hotspots_grid")
+                        .num_columns(8)
+                        .spacing([10.0, 4.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new("System").underline());
+                            ui.label(egui::RichText::new("Security").underline());
+                            ui.label(egui::RichText::new("Stability").underline());
+                            ui.label(egui::RichText::new("Pressure").underline());
+                            ui.label(egui::RichText::new("Scarcity").underline());
+                            ui.label(egui::RichText::new("Conflict").underline());
+                            ui.label(egui::RichText::new("Top Influence").underline());
+                            ui.label(egui::RichText::new("Diplomacy").underline());
+                            ui.end_row();
+
+                            for sim in hotspots.iter().take(20) {
+                                let mut top_faction = "-".to_owned();
+                                let mut top_influence = 0.0_f32;
+                                let mut second_faction = "-".to_owned();
+                                let mut second_influence = 0.0_f32;
+                                for (faction_id, influence) in &sim.influence_by_faction {
+                                    if *influence > top_influence {
+                                        second_influence = top_influence;
+                                        second_faction = top_faction.clone();
+                                        top_influence = *influence;
+                                        top_faction = faction_id.clone();
+                                    } else if *influence > second_influence {
+                                        second_influence = *influence;
+                                        second_faction = faction_id.clone();
+                                    }
+                                }
+                                let diplomacy_label = if top_faction != "-" && second_faction != "-" {
+                                    if let Some(treaty) = self.game_state.treaty_between(&top_faction, &second_faction) {
+                                        format!("{:?}", treaty.kind)
+                                    } else if self.game_state.has_sanction(&top_faction, &second_faction)
+                                        || self.game_state.has_sanction(&second_faction, &top_faction)
+                                    {
+                                        "Sanction".to_owned()
+                                    } else {
+                                        let relation = self.game_state.relation_between(&top_faction, &second_faction);
+                                        format!("Rel {relation}")
+                                    }
+                                } else {
+                                    "-".to_owned()
+                                };
+                                let conflict_label = format!("{:?}", sim.conflict);
+                                ui.label(format!("({}, {})#{}", sim.system.sector.x, sim.system.sector.y, sim.system.local_index));
+                                ui.label(format!("{:.2}", sim.security));
+                                ui.label(format!("{:.2}", sim.stability));
+                                ui.label(format!("{:.2}", sim.econ_pressure));
+                                ui.label(format!("{:.2}", sim.scarcity));
+                                ui.label(conflict_label);
+                                ui.label(format!("{top_faction} ({:.0}%)", top_influence * 100.0));
+                                ui.label(diplomacy_label);
+                                ui.end_row();
+                            }
+                        });
+                });
+            });
+        self.galactic_situation_open = open;
+    }
+
+    fn show_mission_board_window(&mut self, ctx: &egui::Context) {
+        if !self.mission_board_open {
+            return;
+        }
+        let mut open = self.mission_board_open;
+        let missions = self.game_state.mission_board().to_vec();
+        let mut complete_clicked: Option<u64> = None;
+        egui::Window::new("Mission Board")
+            .open(&mut open)
+            .resizable(true)
+            .default_size([700.0, 480.0])
+            .show(ctx, |ui| {
+                ui.label("Faction contracts generated by live galactic pressures.");
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for mission in missions {
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.strong(format!("#{} {}", mission.id, mission.title));
+                                ui.label(format!("Issuer: {}", mission.issuer_faction));
+                                let rep = self.game_state.player_reputation_with(&mission.issuer_faction);
+                                ui.label(format!("Rep: {}", rep));
+                            });
+                            ui.label(mission.description);
+                            ui.label(format!(
+                                "Target: ({}, {})#{} | Reward: {} cr, {:.2} tech, {} rep | Risk {:.0}% | Expires in {:.2}y",
+                                mission.target_system.sector.x,
+                                mission.target_system.sector.y,
+                                mission.target_system.local_index,
+                                mission.reward_credits,
+                                mission.reward_tech,
+                                mission.reward_reputation,
+                                mission.risk * 100.0,
+                                (mission.expires_year - self.game_state.current_year).max(0.0),
+                            ));
+                            if ui.button("Complete contract").clicked() {
+                                complete_clicked = Some(mission.id);
+                            }
+                        });
+                        ui.separator();
+                    }
+                });
+            });
+        if let Some(mission_id) = complete_clicked {
+            if self
+                .sim_command_tx
+                .send(SimCommand::CompleteMission { mission_id })
+                .is_ok()
+            {
+                self.sim_inflight = true;
+                self.game_notice = Some(format!("Mission #{} submitted.", mission_id));
+            } else {
+                self.game_notice = Some("Simulation worker is unavailable.".to_owned());
             }
         }
+        self.mission_board_open = open;
+    }
+
+    fn persist_game_state(&mut self) {
+        self.trim_game_events();
+        if self.save_inflight {
+            return;
+        }
+        let snapshot_state = self.game_state.clone();
+        let snapshot_events = self.game_events.clone();
+        if self
+            .save_request_tx
+            .send((snapshot_state, snapshot_events))
+            .is_ok()
+        {
+            self.save_inflight = true;
+        }
+    }
+
+    fn poll_save_results(&mut self) {
+        while let Ok(result) = self.save_result_rx.try_recv() {
+            self.save_inflight = false;
+            match result {
+                Ok(()) => {
+                    self.game_save_error = None;
+                }
+                Err(err) => {
+                    self.game_save_error = Some(format!("Failed to save game state: {err}"));
+                }
+            }
+        }
+    }
+
+    fn poll_sim_results(&mut self) {
+        let mut latest = None;
+        while let Ok(snapshot) = self.sim_result_rx.try_recv() {
+            latest = Some(snapshot);
+            self.sim_inflight = false;
+        }
+        if let Some(snapshot) = latest {
+            self.game_state = snapshot.state;
+            self.game_events = snapshot.events;
+            self.ui_cache_dirty = true;
+        }
+    }
+
+    fn restart_sim_worker(&mut self) {
+        let (sim_command_tx, sim_result_rx) = Self::spawn_sim_worker(
+            Arc::clone(&self.procedural_generator),
+            self.game_state.clone(),
+            self.game_events.clone(),
+            self.ai_home_spawn_config,
+        );
+        self.sim_command_tx = sim_command_tx;
+        self.sim_result_rx = sim_result_rx;
+        self.sim_inflight = false;
+    }
+
+    fn refresh_ui_caches(&mut self) {
+        if !self.ui_cache_dirty {
+            return;
+        }
+        let element_catalog = composition_element_resource_catalog();
+        let atmosphere_catalog = atmosphere_resource_catalog();
+        let element_index_by_symbol: HashMap<&str, usize> = element_catalog
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| (entry.symbol, idx))
+            .collect();
+        let atmosphere_index_by_formula: HashMap<&str, usize> = atmosphere_catalog
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| (entry.formula, idx))
+            .collect();
+
+        let mut by_faction_accum: HashMap<String, (usize, f32, f32, f32, f32)> = HashMap::new();
+        let mut total_element_amounts = vec![0.0f32; element_catalog.len()];
+        let mut total_atmosphere_amounts = vec![0.0f32; atmosphere_catalog.len()];
+        let mut colony_rows = Vec::with_capacity(self.game_state.colonies.len());
+        for colony in self.game_state.colonies.values() {
+            let entry = by_faction_accum
+                .entry(colony.owner_faction.clone())
+                .or_insert((0, 0.0, 0.0, 0.0, 0.0));
+            entry.0 += 1;
+            entry.1 += colony.food_stockpile;
+            entry.2 += colony.industry_stockpile;
+            entry.3 += colony.energy_stockpile;
+            entry.4 += colony.stockpile_capacity;
+            for (symbol, amount) in &colony.element_stockpiles {
+                if let Some(idx) = element_index_by_symbol.get(symbol.as_str()) {
+                    total_element_amounts[*idx] += amount.max(0.0);
+                }
+            }
+            for (formula, amount) in &colony.atmosphere_stockpiles {
+                if let Some(idx) = atmosphere_index_by_formula.get(formula.as_str()) {
+                    total_atmosphere_amounts[*idx] += amount.max(0.0);
+                }
+            }
+            colony_rows.push(ColonyRowSnapshot {
+                id: colony.id,
+                name: colony.name.clone(),
+                owner_faction: colony.owner_faction.clone(),
+                stage: colony.stage.label(),
+                population: colony.population,
+                system: colony.system,
+                policy: colony.policy,
+                taxation_policy: colony.taxation_policy,
+                stability: colony.stability,
+                food: colony.food_balance,
+                industry: colony.industry_balance,
+                energy: colony.energy_balance,
+                defense: colony.defense_balance,
+                tax_revenue: colony.last_tax_revenue_annual,
+                net_revenue: colony.last_net_revenue_annual,
+                buildings: colony.buildings.clone(),
+            });
+        }
+        colony_rows.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let mut faction_ids: Vec<String> = self.game_state.factions.keys().cloned().collect();
+        faction_ids.sort();
+        let mut faction_summaries = Vec::with_capacity(faction_ids.len());
+        for fid in faction_ids {
+            if let Some(faction) = self.game_state.factions.get(&fid) {
+                let (colony_count, food_stock, industry_stock, energy_stock, stockpile_cap) =
+                    by_faction_accum.get(&fid).copied().unwrap_or((0, 0.0, 0.0, 0.0, 0.0));
+                faction_summaries.push((
+                    fid.clone(),
+                    faction.display_name.clone(),
+                    faction.treasury,
+                    faction.colonization_tech_level,
+                    faction.colonization_tech_progress,
+                    colony_count,
+                    food_stock,
+                    industry_stock,
+                    energy_stock,
+                    stockpile_cap,
+                ));
+            }
+        }
+        let hotspots = self
+            .game_state
+            .galactic_hotspots()
+            .into_iter()
+            .take(48)
+            .cloned()
+            .collect::<Vec<_>>();
+        self.cached_resources = Some(ResourcesSnapshot {
+            faction_summaries,
+            total_element_amounts,
+            total_atmosphere_amounts,
+            pending_building_count: self.game_state.pending_colony_buildings.len(),
+        });
+        self.cached_colonies = Some(colony_rows);
+        self.cached_hotspots = Some(hotspots);
+        self.ui_cache_dirty = false;
+        self.last_ui_cache_refresh_ms = Self::wall_time_ms();
     }
 
     fn reset_all_progress(&mut self) {
@@ -1175,9 +1502,16 @@ impl GalaxyApp {
         self.game_state = GameState::default();
         self.game_events.clear();
         self.game_paused = true;
+        self.pending_sim_ticks = 0;
         self.game_autosave_accum_years = 0.0;
         self.game_save_error = None;
         self.game_notice = Some("All saved progress has been reset.".to_owned());
+        self.save_inflight = false;
+        self.ui_cache_dirty = true;
+        self.last_ui_cache_refresh_ms = -1_000.0;
+        self.cached_resources = None;
+        self.cached_colonies = None;
+        self.cached_hotspots = None;
         self.reset_progress_armed = false;
         self.colonies_window_open = false;
         self.construction_window_open = false;
@@ -1195,6 +1529,7 @@ impl GalaxyApp {
         self.reset_travel_view();
 
         self.strategic_clock.reset_timebase();
+        self.restart_sim_worker();
 
         let mut remove_errors = Vec::new();
         for path in [GAME_SAVE_PATH, DELTA_SAVE_PATH] {
@@ -1424,6 +1759,14 @@ impl GalaxyApp {
         if !self.colonies_window_open {
             return;
         }
+        if self.cached_colonies.is_none() {
+            self.refresh_ui_caches();
+        }
+        let colonies = self
+            .cached_colonies
+            .as_ref()
+            .map(|rows| rows.as_slice())
+            .unwrap_or(&[]);
 
         let mut open = self.colonies_window_open;
         let mut focus_colony: Option<u64> = None;
@@ -1435,34 +1778,6 @@ impl GalaxyApp {
             .default_size([940.0, 500.0])
             .show(ctx, |ui| {
                 ui.label(format!("Total colonies: {}", self.game_state.colonies.len()));
-
-                let mut colonies = self
-                    .game_state
-                    .colonies
-                    .values()
-                    .map(|colony| {
-                        (
-                            colony.id,
-                            colony.name.clone(),
-                            colony.owner_faction.clone(),
-                            colony.stage.label(),
-                            colony.population,
-                            colony.system,
-                            colony.body_index,
-                            colony.policy,
-                            colony.taxation_policy,
-                            colony.stability,
-                            colony.food_balance,
-                            colony.industry_balance,
-                            colony.energy_balance,
-                            colony.defense_balance,
-                            colony.last_tax_revenue_annual,
-                            colony.last_net_revenue_annual,
-                            colony.buildings.clone(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                colonies.sort_by(|a, b| a.1.cmp(&b.1));
 
                 egui::ScrollArea::vertical()
                     .max_height(410.0)
@@ -1486,40 +1801,21 @@ impl GalaxyApp {
                                 ui.label(egui::RichText::new("").underline());
                                 ui.end_row();
 
-                                for (
-                                    id,
-                                    name,
-                                    owner_faction,
-                                    stage,
-                                    population,
-                                    system,
-                                    _body_index,
-                                    policy,
-                                    taxation_policy,
-                                    stability,
-                                    food,
-                                    industry,
-                                    energy,
-                                    defense,
-                                    tax_revenue,
-                                    net_revenue,
-                                    buildings,
-                                ) in &colonies
-                                {
-                                    ui.label(name);
-                                    ui.label(owner_faction.as_str());
-                                    ui.label(*stage);
-                                    ui.label(format!("{:.0}", population));
+                                for colony in colonies {
+                                    ui.label(&colony.name);
+                                    ui.label(colony.owner_faction.as_str());
+                                    ui.label(colony.stage);
+                                    ui.label(format!("{:.0}", colony.population));
                                     ui.label(format!(
                                         "({}, {}) / #{}",
-                                        system.sector.x, system.sector.y, system.local_index
+                                        colony.system.sector.x, colony.system.sector.y, colony.system.local_index
                                     ));
 
-                                    ui.label(policy.label());
-                                    ui.label(taxation_policy.label());
+                                    ui.label(colony.policy.label());
+                                    ui.label(colony.taxation_policy.label());
 
                                     {
-                                        let pct = stability * 100.0;
+                                        let pct = colony.stability * 100.0;
                                         let color = if pct >= 70.0 {
                                             egui::Color32::from_rgb(120, 210, 120)
                                         } else if pct >= 40.0 {
@@ -1535,16 +1831,16 @@ impl GalaxyApp {
 
                                     ui.label(format!(
                                         "F {:+.2}  I {:+.2}  E {:+.2}  D {:+.2}",
-                                        food, industry, energy, defense
+                                        colony.food, colony.industry, colony.energy, colony.defense
                                     ));
 
                                     ui.label(format!(
                                         "Tax {}  Net {:+}",
-                                        tax_revenue, net_revenue
+                                        colony.tax_revenue, colony.net_revenue
                                     ));
 
                                     {
-                                        let bld_count = buildings.len();
+                                        let bld_count = colony.buildings.len();
                                         let label_text = if bld_count == 0 {
                                             "None".to_owned()
                                         } else {
@@ -1553,7 +1849,7 @@ impl GalaxyApp {
                                         let resp = ui.label(&label_text);
                                         if bld_count > 0 {
                                             let mut tooltip_lines = Vec::new();
-                                            for bld in buildings {
+                                            for bld in &colony.buildings {
                                                 tooltip_lines.push(format!(
                                                     "L{} {} @ {}",
                                                     bld.level,
@@ -1567,10 +1863,10 @@ impl GalaxyApp {
 
                                     ui.horizontal(|ui| {
                                         if ui.small_button("Focus").clicked() {
-                                            focus_colony = Some(*id);
+                                            focus_colony = Some(colony.id);
                                         }
                                         if ui.small_button("Select").clicked() {
-                                            select_colony = Some(*id);
+                                            select_colony = Some(colony.id);
                                         }
                                     });
                                     ui.end_row();
@@ -2678,12 +2974,10 @@ impl GalaxyApp {
             });
         }
 
-        let mut uploads = chunk_map
+        chunk_map
             .into_iter()
             .map(|(key, points)| gpu_stars::ChunkUpload { key, points })
-            .collect::<Vec<_>>();
-        uploads.sort_by_key(|chunk| chunk.key);
-        uploads
+            .collect::<Vec<_>>()
     }
 
     fn spawn_sector_workers(
@@ -2811,6 +3105,72 @@ impl GalaxyApp {
         (request_tx, result_rx)
     }
 
+    fn spawn_save_worker(
+    ) -> (
+        mpsc::Sender<(GameState, Vec<GameEvent>)>,
+        mpsc::Receiver<Result<(), String>>,
+    ) {
+        let (request_tx, request_rx) = mpsc::channel::<(GameState, Vec<GameEvent>)>();
+        let (result_tx, result_rx) = mpsc::channel::<Result<(), String>>();
+        thread::spawn(move || {
+            while let Ok((state, events)) = request_rx.recv() {
+                let result = save::save_game_save_compact(GAME_SAVE_PATH, &state, &events)
+                    .map_err(|err| err.to_string());
+                let _ = result_tx.send(result);
+            }
+        });
+        (request_tx, result_rx)
+    }
+
+    fn spawn_sim_worker(
+        generator: Arc<GalaxyGenerator>,
+        mut state: GameState,
+        mut events: Vec<GameEvent>,
+        spawn_config: ai_factions::AiHomeSpawnConfig,
+    ) -> (mpsc::Sender<SimCommand>, mpsc::Receiver<SimSnapshot>) {
+        let (command_tx, command_rx) = mpsc::channel::<SimCommand>();
+        let (result_tx, result_rx) = mpsc::channel::<SimSnapshot>();
+        thread::spawn(move || {
+            let mut ai_controller =
+                ai_factions::AiFactionController::new_with_spawn_config(&generator, spawn_config);
+            while let Ok(command) = command_rx.recv() {
+                match command {
+                    SimCommand::Advance { ticks, tick_years } => {
+                        for _ in 0..ticks {
+                            let generated_events = state.advance_strategic_tick(tick_years);
+                            for event in generated_events {
+                                state.apply_event(&event);
+                                events.push(event);
+                            }
+                            let ai_events = ai_controller.tick(&mut state, &generator);
+                            for event in ai_events {
+                                state.apply_event(&event);
+                                events.push(event);
+                            }
+                        }
+                    }
+                    SimCommand::CompleteMission { mission_id } => {
+                        let _ = state.complete_mission(mission_id);
+                    }
+                }
+                if events.len() > MAX_SAVED_GAME_EVENTS {
+                    let overflow = events.len() - MAX_SAVED_GAME_EVENTS;
+                    events.drain(0..overflow);
+                }
+                if result_tx
+                    .send(SimSnapshot {
+                        state: state.clone(),
+                        events: events.clone(),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        (command_tx, result_rx)
+    }
+
     fn drain_visible_build_results(&mut self) {
         let mut latest_matching = None;
         while let Ok(result) = self.visible_build_result_rx.try_recv() {
@@ -2927,7 +3287,7 @@ impl GalaxyApp {
     fn desired_chunk_point_budget(&self) -> usize {
         let min_budget = self.lod_chunk_point_min_budget.min(self.render_budget);
         if min_budget >= self.render_budget {
-            return self.render_budget;
+            return self.render_budget.min(MAX_VISIBLE_CHUNK_POINTS);
         }
 
         let sector_pixels = self.sector_size * self.zoom;
@@ -2935,7 +3295,7 @@ impl GalaxyApp {
             .clamp(0.0, 1.0)
             .powf(0.85);
         let budget_range = self.render_budget - min_budget;
-        min_budget + (budget_range as f32 * t).round() as usize
+        (min_budget + (budget_range as f32 * t).round() as usize).min(MAX_VISIBLE_CHUNK_POINTS)
     }
 
     fn choose_lod_tier(
@@ -3214,7 +3574,7 @@ impl GalaxyApp {
             return (visible_system_count, Vec::new());
         }
 
-        let mut summaries = chunks
+        let summaries = chunks
             .into_iter()
             .map(|(coord, chunk)| {
                 let inv_count = 1.0 / chunk.count.max(1) as f32;
@@ -3229,8 +3589,6 @@ impl GalaxyApp {
                 }
             })
             .collect::<Vec<_>>();
-
-        summaries.sort_by_key(|chunk| (chunk.coord.x, chunk.coord.y, chunk.coord.z));
 
         let rep_counts = Self::allocate_representatives(&summaries, target_points);
         let point_capacity = rep_counts.iter().map(|count| *count as usize).sum::<usize>();
@@ -3288,6 +3646,7 @@ impl GalaxyApp {
 
     fn update_visible_buffer(&mut self, center: [f32; 3], viewport_size: egui::Vec2) {
         let update_start = Instant::now();
+        let now_ms = Self::wall_time_ms();
         self.rebuilt_this_frame = false;
         if self.zoom <= 0.0 {
             self.cpu_visible_update_ms_last = 0.0;
@@ -3355,9 +3714,6 @@ impl GalaxyApp {
             for coord in missing.into_iter().take(request_count) {
                 if self.request_tx.send(coord).is_ok() {
                     self.pending_sectors.insert(coord);
-                } else {
-                    let systems = self.procedural_generator.generate_sector(coord);
-                    self.sector_cache.insert(coord, systems);
                 }
             }
         }
@@ -3372,7 +3728,15 @@ impl GalaxyApp {
               ^ (c.y as i64 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
         });
 
-        self.lod_tier = new_lod_tier;
+        let lod_changed = self.lod_tier.label() != new_lod_tier.label();
+        if lod_changed && now_ms - self.last_lod_switch_ms < LOD_SWITCH_COOLDOWN_MS {
+            // keep current LOD to avoid rapid boundary flapping
+        } else {
+            self.lod_tier = new_lod_tier;
+            if lod_changed {
+                self.last_lod_switch_ms = now_ms;
+            }
+        }
 
         let required_ready_hash = required.iter().fold(0xD6E8_FEB8_6659_FD93u64, |h, coord| {
             let coord_hash = (coord.x as i64 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -3402,12 +3766,27 @@ impl GalaxyApp {
                 self.galaxy_seed,
             );
 
-            if !self.visible_build_inflight
+            let rebuild_throttled = now_ms - self.last_visible_rebuild_request_ms < MIN_REBUILD_INTERVAL_MS;
+            if (!self.visible_build_inflight
                 || self.visible_build_requested_signature != desired_signature
+            ) && !rebuild_throttled
             {
-                let mut sectors = Vec::new();
-                for coord in &required {
-                    if let Some(systems) = self.sector_cache.get(*coord) {
+                let mut ready_required = required
+                    .iter()
+                    .copied()
+                    .filter(|coord| self.sector_cache.contains(*coord))
+                    .collect::<Vec<_>>();
+                if ready_required.len() > MAX_VISIBLE_BUILD_SECTORS {
+                    ready_required.sort_by_key(|coord| {
+                        let dx = coord.x - center_sector.x;
+                        let dy = coord.y - center_sector.y;
+                        dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy))
+                    });
+                    ready_required.truncate(MAX_VISIBLE_BUILD_SECTORS);
+                }
+                let mut sectors = Vec::with_capacity(ready_required.len());
+                for coord in ready_required {
+                    if let Some(systems) = self.sector_cache.get(coord) {
                         sectors.push(systems);
                     }
                 }
@@ -3430,6 +3809,7 @@ impl GalaxyApp {
                     Ok(()) => {
                         self.visible_build_requested_signature = desired_signature;
                         self.visible_build_inflight = true;
+                        self.last_visible_rebuild_request_ms = now_ms;
                     }
                     Err(mpsc::TrySendError::Full(_)) => {}
                     Err(mpsc::TrySendError::Disconnected(_)) => {
@@ -3539,6 +3919,20 @@ impl GalaxyApp {
                         .hint_text("e.g. 42 or 0xDEADBEEF"),
                 );
                 ui.add_space(4.0);
+                ui.add_sized(
+                    [button_width, 22.0],
+                    egui::Slider::new(
+                        &mut self.settings_ai_cluster_radius_world,
+                        AI_CLUSTER_RADIUS_MIN..=AI_CLUSTER_RADIUS_MAX,
+                    )
+                    .text("Faction cluster radius")
+                    .logarithmic(true),
+                );
+                self.ai_home_spawn_config.cluster_radius_world = self
+                    .settings_ai_cluster_radius_world
+                    .clamp(AI_CLUSTER_RADIUS_MIN, AI_CLUSTER_RADIUS_MAX);
+                ui.small("Lower = factions start closer together (used for new games).");
+                ui.add_space(4.0);
                 let new_game_btn = ui.add_sized(
                     [button_width, 36.0],
                     egui::Button::new(egui::RichText::new("New Game").size(16.0)),
@@ -3569,31 +3963,40 @@ impl GalaxyApp {
     }
 
     fn update_game(&mut self, ctx: &egui::Context) {
+        self.poll_save_results();
+        self.poll_sim_results();
         let sim_advance = self
             .strategic_clock
             .advance(ctx.input(|i| i.time), self.game_paused);
-        if sim_advance.ticks > 0 {
-            for _ in 0..sim_advance.ticks {
-                let generated_events = self.game_state.advance_strategic_tick(sim_advance.tick_years);
-                for event in generated_events {
-                    self.game_state.apply_event(&event);
-                    self.game_events.push(event);
-                }
-                let ai_events = self.ai_controller.tick(
-                    &mut self.game_state,
-                    &self.procedural_generator,
-                );
-                for event in ai_events {
-                    self.game_state.apply_event(&event);
-                    self.game_events.push(event);
+        self.pending_sim_ticks = self
+            .pending_sim_ticks
+            .saturating_add(sim_advance.ticks);
+        if self.pending_sim_ticks > 0 && !self.sim_inflight {
+            let dispatch_ticks = self.pending_sim_ticks.min(24);
+            if self
+                .sim_command_tx
+                .send(SimCommand::Advance {
+                    ticks: dispatch_ticks,
+                    tick_years: sim_advance.tick_years,
+                })
+                .is_ok()
+            {
+                self.pending_sim_ticks = self.pending_sim_ticks.saturating_sub(dispatch_ticks);
+                self.sim_inflight = true;
+                self.game_autosave_accum_years += sim_advance.tick_years * dispatch_ticks as f32;
+                if self.game_autosave_accum_years >= 1.5 {
+                    self.game_autosave_accum_years = 0.0;
+                    self.persist_game_state();
                 }
             }
-            self.trim_game_events();
-            self.game_autosave_accum_years +=
-                sim_advance.tick_years * sim_advance.ticks as f32;
-            if self.game_autosave_accum_years >= 0.5 {
-                self.game_autosave_accum_years = 0.0;
-                self.persist_game_state();
+        }
+        let expensive_windows_open = self.resources_panel_open
+            || self.colonies_window_open
+            || self.galactic_situation_open;
+        if expensive_windows_open && self.ui_cache_dirty {
+            let now_ms = Self::wall_time_ms();
+            if now_ms - self.last_ui_cache_refresh_ms >= UI_CACHE_REFRESH_INTERVAL_MS {
+                self.refresh_ui_caches();
             }
         }
 
@@ -3646,6 +4049,7 @@ impl GalaxyApp {
                     self.settings_window_open = true;
                     self.settings_seed_input = self.galaxy_seed.to_string();
                     self.settings_render_budget = self.render_budget;
+                    self.settings_ai_cluster_radius_world = self.ai_home_spawn_config.cluster_radius_world;
                     self.settings_lod_preset = self.lod_preset;
                 }
                 if ui
@@ -3667,6 +4071,26 @@ impl GalaxyApp {
                     .clicked()
                 {
                     self.resources_panel_open = !self.resources_panel_open;
+                }
+                if ui
+                    .button(if self.galactic_situation_open {
+                        "Hide situation"
+                    } else {
+                        "Galactic Situation"
+                    })
+                    .clicked()
+                {
+                    self.galactic_situation_open = !self.galactic_situation_open;
+                }
+                if ui
+                    .button(if self.mission_board_open {
+                        "Hide missions"
+                    } else {
+                        "Mission Board"
+                    })
+                    .clicked()
+                {
+                    self.mission_board_open = !self.mission_board_open;
                 }
                 if ui
                     .button(if self.debug_panel_open {
@@ -3758,6 +4182,87 @@ impl GalaxyApp {
                         gpu_work.max_visible_count,
                         gpu_work.cull_dispatch_groups,
                         gpu_work.keep_prob,
+                    ));
+                    let blocked_builds = self
+                        .game_state
+                        .colonies
+                        .values()
+                        .filter(|colony| self.game_state.pending_colony_building_for_colony(colony.id).is_none())
+                        .count();
+                    let blocked_by_deferred_treasury = self
+                        .game_state
+                        .pending_colony_buildings
+                        .iter()
+                        .filter(|pending| pending.complete_year <= self.game_state.current_year)
+                        .filter(|pending| {
+                            self.game_state
+                                .colonies
+                                .get(&pending.colony_id)
+                                .and_then(|colony| self.game_state.factions.get(&colony.owner_faction))
+                                .map(|faction| faction.treasury < pending.deferred_treasury_due)
+                                .unwrap_or(false)
+                        })
+                        .count();
+                    let ai_intent_economy_recovery = self
+                        .game_state
+                        .colonies
+                        .values()
+                        .filter(|colony| colony.last_net_revenue_annual < 0)
+                        .count();
+                    let ai_intent_stability = self
+                        .game_state
+                        .colonies
+                        .values()
+                        .filter(|colony| colony.stability < 0.55)
+                        .count();
+                    let ai_intent_resource = self
+                        .game_state
+                        .colonies
+                        .values()
+                        .filter(|colony| colony.food_balance < -0.02
+                            || colony.industry_balance < -0.02
+                            || colony.energy_balance < -0.02)
+                        .count();
+                    let avg_break_even_years = self
+                        .game_state
+                        .colonies
+                        .values()
+                        .filter_map(|colony| {
+                            if colony.last_net_revenue_annual > 0 {
+                                Some((colony.stockpile_capacity.max(1.0) / 45.0) as f64)
+                            } else {
+                                None
+                            }
+                        })
+                        .sum::<f64>()
+                        / (self.game_state.colonies.len().max(1) as f64);
+                    ui.label(format!(
+                        "Economy telemetry: pending builds {} | idle colonies {} | blocked(deferred treasury) {} | avg break-even proxy {:.2} years",
+                        self.game_state.pending_colony_buildings.len(),
+                        blocked_builds,
+                        blocked_by_deferred_treasury,
+                        avg_break_even_years,
+                    ));
+                    let (alliance_count, pact_count, sanction_count) =
+                        self.game_state.diplomacy_summary_counts();
+                    let active_ops_recent = self
+                        .game_state
+                        .recent_powerplay_ops
+                        .iter()
+                        .filter(|op| self.game_state.current_year - op.at_year <= 1.0)
+                        .count();
+                    ui.label(format!(
+                        "Diplomacy telemetry: alliances {} | pacts {} | sanctions {} | powerplay ops (last 1y) {}",
+                        alliance_count,
+                        pact_count,
+                        sanction_count,
+                        active_ops_recent,
+                    ));
+                    ui.label(format!(
+                        "AI intent categories (proxy): economy-recovery {} | stability {} | resource-balance {}",
+                        ai_intent_economy_recovery,
+                        ai_intent_stability,
+                        ai_intent_resource,
                     ));
                     if gpu_runtime.renderer_initialized && gpu_runtime.likely_software_adapter {
                         ui.colored_label(
@@ -4227,7 +4732,7 @@ impl GalaxyApp {
                                 });
 
                             if let Some(next_stage) = survey_stage.next() {
-                                let (_, reward_tech) = GameState::survey_stage_rewards(next_stage);
+                                let (_, reward_tech, _) = GameState::survey_stage_rewards(next_stage);
                                 ui.label(format!(
                                     "Next survey reward: +{:.2} technology points",
                                     reward_tech
@@ -4381,7 +4886,11 @@ impl GalaxyApp {
             }
             if window_travel {
                 if let Some(detail) = &self.selected_system {
-                    if self.game_state.survey_stage(detail.id) < SurveyStage::ColonyAssessment {
+                    let sim_allows = self.game_state.survey_stage(detail.id) >= SurveyStage::ColonyAssessment;
+                    // With async simulation snapshots, the strategic state can briefly lag behind
+                    // the selected detail. If full detail is already available, allow travel.
+                    let detail_allows = detail.explored || !detail.planets.is_empty();
+                    if !(sim_allows || detail_allows) {
                         self.game_notice = Some(
                             "Travel unavailable: complete all scans for this system first.".to_owned(),
                         );
@@ -4404,6 +4913,8 @@ impl GalaxyApp {
 
         self.show_travel_window(ctx);
         self.show_resources_window(ctx);
+        self.show_galactic_situation_window(ctx);
+        self.show_mission_board_window(ctx);
         self.show_colonies_window(ctx, center3d);
         self.show_favorites_window(ctx, center3d);
         self.show_settings_window(ctx);
@@ -4426,7 +4937,7 @@ impl GalaxyApp {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
-        vsync: false,
+        vsync: true,
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
             device_descriptor: Arc::new(|adapter| {
                 let base_limits = if adapter.get_info().backend == eframe::egui_wgpu::wgpu::Backend::Gl {

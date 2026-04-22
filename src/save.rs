@@ -12,7 +12,10 @@ const SAVE_VERSION_V1: u32 = 1;
 const SAVE_VERSION_V2: u32 = 2;
 const SAVE_VERSION_V3: u32 = 3;
 const SAVE_VERSION_V4: u32 = 4;
-const CURRENT_SAVE_VERSION: u32 = SAVE_VERSION_V4;
+const SAVE_VERSION_V5: u32 = 5;
+const SAVE_VERSION_V6: u32 = 6;
+const SAVE_VERSION_V7: u32 = 7;
+const CURRENT_SAVE_VERSION: u32 = SAVE_VERSION_V7;
 const V1_TO_V2_COLONIZATION_RANGE_SCALE: f32 = 0.05;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -54,11 +57,26 @@ fn migrate_game_save(raw: Value) -> io::Result<GameSaveFile> {
                 format!("failed to parse current save format: {err}"),
             )
         }),
-        SAVE_VERSION_V3 => migrate_v3_to_v4(raw),
-        SAVE_VERSION_V2 => migrate_v2_to_v3(raw).and_then(migrate_v3_to_v4_file),
+        SAVE_VERSION_V6 => migrate_v6_to_v7(raw),
+        SAVE_VERSION_V5 => migrate_v5_to_v6(raw).and_then(migrate_v6_to_v7_file),
+        SAVE_VERSION_V4 => migrate_v4_to_v5(raw)
+            .and_then(migrate_v5_to_v6_file)
+            .and_then(migrate_v6_to_v7_file),
+        SAVE_VERSION_V3 => migrate_v3_to_v4(raw)
+            .and_then(migrate_v4_to_v5_file)
+            .and_then(migrate_v5_to_v6_file)
+            .and_then(migrate_v6_to_v7_file),
+        SAVE_VERSION_V2 => migrate_v2_to_v3(raw)
+            .and_then(migrate_v3_to_v4_file)
+            .and_then(migrate_v4_to_v5_file)
+            .and_then(migrate_v5_to_v6_file)
+            .and_then(migrate_v6_to_v7_file),
         SAVE_VERSION_V1 => migrate_v1_to_v2(raw)
             .and_then(migrate_v2_to_v3_file)
-            .and_then(migrate_v3_to_v4_file),
+            .and_then(migrate_v3_to_v4_file)
+            .and_then(migrate_v4_to_v5_file)
+            .and_then(migrate_v5_to_v6_file)
+            .and_then(migrate_v6_to_v7_file),
         0 => migrate_legacy_v0(raw),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -123,6 +141,70 @@ fn migrate_v3_to_v4_file(mut parsed_v3: GameSaveFile) -> io::Result<GameSaveFile
         seed_element_stockpiles(colony);
     }
     Ok(parsed_v3)
+}
+
+fn migrate_v4_to_v5(raw: Value) -> io::Result<GameSaveFile> {
+    let parsed_v4: GameSaveFile = serde_json::from_value(raw).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to parse v4 save format: {err}"),
+        )
+    })?;
+    migrate_v4_to_v5_file(parsed_v4)
+}
+
+fn migrate_v4_to_v5_file(mut parsed_v4: GameSaveFile) -> io::Result<GameSaveFile> {
+    parsed_v4.version = SAVE_VERSION_V5;
+    for faction_id in parsed_v4.state.factions.keys() {
+        parsed_v4
+            .state
+            .player_reputation
+            .entry(faction_id.clone())
+            .or_insert(0);
+    }
+    Ok(parsed_v4)
+}
+
+fn migrate_v5_to_v6(raw: Value) -> io::Result<GameSaveFile> {
+    let parsed_v5: GameSaveFile = serde_json::from_value(raw).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to parse v5 save format: {err}"),
+        )
+    })?;
+    migrate_v5_to_v6_file(parsed_v5)
+}
+
+fn migrate_v5_to_v6_file(mut parsed_v5: GameSaveFile) -> io::Result<GameSaveFile> {
+    parsed_v5.version = SAVE_VERSION_V6;
+    for pending in parsed_v5.state.pending_colony_buildings.iter_mut() {
+        pending.deferred_treasury_due = pending.deferred_treasury_due.max(0);
+        pending.annual_construction_upkeep = pending.annual_construction_upkeep.max(0);
+    }
+    Ok(parsed_v5)
+}
+
+fn migrate_v6_to_v7(raw: Value) -> io::Result<GameSaveFile> {
+    let parsed_v6: GameSaveFile = serde_json::from_value(raw).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to parse v6 save format: {err}"),
+        )
+    })?;
+    migrate_v6_to_v7_file(parsed_v6)
+}
+
+fn migrate_v6_to_v7_file(mut parsed_v6: GameSaveFile) -> io::Result<GameSaveFile> {
+    parsed_v6.version = SAVE_VERSION_V7;
+    parsed_v6
+        .state
+        .recent_powerplay_ops
+        .retain(|op| op.at_year.is_finite());
+    parsed_v6
+        .state
+        .active_sanctions
+        .retain(|_, expires| expires.is_finite() && *expires >= parsed_v6.state.current_year - 10.0);
+    Ok(parsed_v6)
 }
 
 fn seed_colony_stockpiles(colony: &mut ColonyState) {
@@ -202,7 +284,11 @@ fn migrate_legacy_v0(raw: Value) -> io::Result<GameSaveFile> {
             state: v0.state,
             events: v0.events,
         };
-        return migrate_v2_to_v3_file(file).and_then(migrate_v3_to_v4_file);
+        return migrate_v2_to_v3_file(file)
+            .and_then(migrate_v3_to_v4_file)
+            .and_then(migrate_v4_to_v5_file)
+            .and_then(migrate_v5_to_v6_file)
+            .and_then(migrate_v6_to_v7_file);
     }
 
     if let Ok(state_only) = serde_json::from_value::<GameState>(raw) {
@@ -211,7 +297,11 @@ fn migrate_legacy_v0(raw: Value) -> io::Result<GameSaveFile> {
             state: state_only,
             events: Vec::new(),
         };
-        return migrate_v2_to_v3_file(file).and_then(migrate_v3_to_v4_file);
+        return migrate_v2_to_v3_file(file)
+            .and_then(migrate_v3_to_v4_file)
+            .and_then(migrate_v4_to_v5_file)
+            .and_then(migrate_v5_to_v6_file)
+            .and_then(migrate_v6_to_v7_file);
     }
 
     Err(io::Error::new(
@@ -238,6 +328,7 @@ pub fn load_game_save(path: impl AsRef<Path>) -> io::Result<(GameState, Vec<Game
     Ok((parsed.state, parsed.events))
 }
 
+#[allow(dead_code)]
 pub fn save_game_save(
     path: impl AsRef<Path>,
     state: &GameState,
@@ -258,6 +349,32 @@ pub fn save_game_save(
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("failed to serialize game save JSON: {err}"),
+        )
+    })?;
+
+    fs::write(path, json)
+}
+
+pub fn save_game_save_compact(
+    path: impl AsRef<Path>,
+    state: &GameState,
+    events: &[GameEvent],
+) -> io::Result<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let file = GameSaveFile {
+        version: CURRENT_SAVE_VERSION,
+        state: state.clone(),
+        events: events.to_vec(),
+    };
+
+    let json = serde_json::to_string(&file).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to serialize compact game save JSON: {err}"),
         )
     })?;
 
