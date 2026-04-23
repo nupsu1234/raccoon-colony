@@ -13,3 +13,4 @@ glam = "0.25"
 rand_distr = "0.4"
 bytemuck = { version = "1.16", features = ["derive"] }
 rodio = "0.19"
+rayon = "1.10"
