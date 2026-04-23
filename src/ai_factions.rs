@@ -2,10 +2,11 @@ use std::collections::{HashMap, HashSet};
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use rayon::prelude::*;
 
 use crate::events::GameEvent;
 use crate::game_state::{
-    ColonyBuildingKind, ColonyBuildingSite, ColonyBuildingSiteProfile, GameState,
+    AiBuildTelemetry, ColonyBuildingKind, ColonyBuildingSite, ColonyBuildingSiteProfile, GameState,
     PowerplayOperationKind,
     PendingColonyFounding, SurveyStage,
 };
@@ -24,11 +25,16 @@ const MAX_CONCURRENT_COLONY_FOUNDINGS: usize = 2;
 /// How many sectors outward from each colony the AI scans for survey targets.
 const SURVEY_SEARCH_RADIUS_SECTORS: i32 = 2;
 /// Maximum candidate systems to evaluate per decision cycle.
-const MAX_SURVEY_CANDIDATES_PER_CYCLE: usize = 8;
+const MAX_SURVEY_CANDIDATES_PER_CYCLE: usize = 4;
 
 /// Maximum number of sector generations allowed per AI faction per decision cycle.
 /// This is the primary knob to prevent frame-time spikes.
-const MAX_SECTOR_GENS_PER_CYCLE: usize = 6;
+const MAX_SECTOR_GENS_PER_CYCLE: usize = 2;
+/// Per-tick faction decision budgets to avoid synchronized multi-second AI bursts.
+const MAX_SURVEY_FACTIONS_PER_TICK: usize = 1;
+const MAX_BUILD_FACTIONS_PER_TICK: usize = 1;
+const MAX_COLONIZE_FACTIONS_PER_TICK: usize = 1;
+const MAX_POWERPLAY_FACTIONS_PER_TICK: usize = 1;
 
 /// Colony founding parameters.
 const COLONY_FOUNDING_DURATION_YEARS: f32 = 1.80;
@@ -38,7 +44,11 @@ const COLONISTS_SENT: u32 = 5_000;
 const MIN_FACTION_INCOME_FOR_COLONY: i64 = 8_500;
 const MIN_TREASURY_FOR_BUILDING: i64 = 35_000;
 const MIN_TREASURY_RESERVE_FOR_COLONY: i64 = 220_000;
+const MIN_RESERVE_DEPTH_AFTER_BUILD: f32 = 0.10;
+const MAX_SUBSTITUTION_STRESS: f32 = 0.55;
 const MIN_SOURCE_POPULATION_FOR_COLONY: f64 = 2_000.0;
+const BOOTSTRAP_MIN_NON_MOON_PLANETS: usize = 3;
+const BOOTSTRAP_MIN_HABITABLE_PLANETS: usize = 1;
 
 /// AI faction identifiers.
 const AI_FACTION_IDS: &[&str] = &[
@@ -80,47 +90,68 @@ fn generate_home_positions(
     let center = cfg.center;
     let z_mid = (cfg.z_min + cfg.z_max) * 0.5;
     let max_radius = spawn_config.cluster_radius_world.clamp(900.0, 30_000.0);
-    let min_radius = (max_radius * 0.35).max(300.0);
-    let min_separation = (max_radius * HOME_MIN_SEPARATION_FACTOR).max(600.0);
+    let min_radius = (max_radius * 0.20).max(220.0);
+    let min_separation = (max_radius * HOME_MIN_SEPARATION_FACTOR).max(520.0);
+    let target_count = AI_FACTION_IDS.len();
 
-    let mut positions = Vec::with_capacity(AI_FACTION_IDS.len());
-    for _ in 0..AI_FACTION_IDS.len() {
-        let mut accepted = None;
-        // Rejection sampling with a max attempt count keeps placements random.
-        for _ in 0..128 {
-            // Uniform in disk area (sqrt random) to avoid ring/corner bias.
-            let angle: f32 = rng.gen_range(0.0..std::f32::consts::TAU);
-            let radius_t: f32 = rng.gen_range(0.0..1.0);
-            let radius = min_radius + radius_t.sqrt() * (max_radius - min_radius);
-            let x = center[0] + angle.cos() * radius;
-            let y = center[1] + angle.sin() * radius;
-            let z = z_mid + rng.gen_range(-1800.0..1800.0);
-            let candidate = [x, y, z];
+    let sample_point = |rng: &mut StdRng| -> [f32; 3] {
+        let angle: f32 = rng.gen_range(0.0..std::f32::consts::TAU);
+        let radius_t: f32 = rng.gen_range(0.0..1.0);
+        let radius = min_radius + radius_t.sqrt() * (max_radius - min_radius);
+        [
+            center[0] + angle.cos() * radius,
+            center[1] + angle.sin() * radius,
+            z_mid + rng.gen_range(-1800.0..1800.0),
+        ]
+    };
 
-            let far_enough = positions.iter().all(|prev: &[f32; 3]| {
-                let dx = prev[0] - candidate[0];
-                let dy = prev[1] - candidate[1];
-                let dz = prev[2] - candidate[2];
-                (dx * dx + dy * dy + dz * dz).sqrt() >= min_separation
-            });
-            if far_enough {
-                accepted = Some(candidate);
-                break;
-            }
+    let mut positions = Vec::with_capacity(target_count);
+    for _ in 0..target_count {
+        let mut candidates = Vec::with_capacity(96);
+        for _ in 0..96 {
+            let candidate = sample_point(&mut rng);
+            let min_dist = positions
+                .iter()
+                .map(|prev: &[f32; 3]| {
+                    let dx = prev[0] - candidate[0];
+                    let dy = prev[1] - candidate[1];
+                    let dz = prev[2] - candidate[2];
+                    (dx * dx + dy * dy + dz * dz).sqrt()
+                })
+                .min_by(|a: &f32, b: &f32| a.total_cmp(b))
+                .unwrap_or(f32::MAX);
+            // Prefer separation, but keep stochasticity to avoid geometric patterns.
+            let jitter = rng.gen_range(0.0..(min_separation * 0.35));
+            let score = min_dist + jitter;
+            candidates.push((score, candidate));
         }
-
-        // Fallback: if cluster is packed, accept a random sample anyway.
-        let candidate = accepted.unwrap_or_else(|| {
-            let angle: f32 = rng.gen_range(0.0..std::f32::consts::TAU);
-            let radius_t: f32 = rng.gen_range(0.0..1.0);
-            let radius = min_radius + radius_t.sqrt() * (max_radius - min_radius);
-            [
-                center[0] + angle.cos() * radius,
-                center[1] + angle.sin() * radius,
-                z_mid + rng.gen_range(-1800.0..1800.0),
-            ]
-        });
-        positions.push(candidate);
+        candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let pick_band = candidates.len().min(6);
+        let pick_idx = rng.gen_range(0..pick_band);
+        let mut picked = candidates[pick_idx].1;
+        if !positions.is_empty() {
+            // Nudge away from too-close neighbors without forcing rigid symmetry.
+            for prev in &positions {
+                let dx = picked[0] - prev[0];
+                let dy = picked[1] - prev[1];
+                let dz = picked[2] - prev[2];
+                let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(0.001);
+                if dist < min_separation * 0.86 {
+                    let push = (min_separation * 0.86 - dist) * 0.45;
+                    picked[0] += dx / dist * push;
+                    picked[1] += dy / dist * push;
+                    picked[2] += dz / dist * push * 0.45;
+                }
+            }
+            // Clamp back into spawn annulus.
+            let ox = picked[0] - center[0];
+            let oy = picked[1] - center[1];
+            let radial = (ox * ox + oy * oy).sqrt().max(0.001);
+            let clamped_r = radial.clamp(min_radius, max_radius);
+            picked[0] = center[0] + ox / radial * clamped_r;
+            picked[1] = center[1] + oy / radial * clamped_r;
+        }
+        positions.push(picked);
     }
     positions
 }
@@ -143,6 +174,10 @@ struct FactionAiState {
 #[derive(Clone)]
 pub struct AiFactionController {
     factions: Vec<FactionAiState>,
+    survey_cursor: usize,
+    colonize_cursor: usize,
+    build_cursor: usize,
+    powerplay_cursor: usize,
 }
 
 impl AiFactionController {
@@ -173,7 +208,20 @@ impl AiFactionController {
                 }
             })
             .collect();
-        Self { factions }
+        Self {
+            factions,
+            survey_cursor: 0,
+            colonize_cursor: 0,
+            build_cursor: 0,
+            powerplay_cursor: 0,
+        }
+    }
+
+    pub fn debug_home_positions(&self) -> Vec<(String, [f32; 3])> {
+        self.factions
+            .iter()
+            .map(|ai| (ai.faction_id.clone(), ai.home_pos))
+            .collect()
     }
 
     /// Run one AI decision pass. Call once per strategic tick from the main loop.
@@ -183,6 +231,37 @@ impl AiFactionController {
         game_state: &mut GameState,
         generator: &GalaxyGenerator,
     ) -> Vec<GameEvent> {
+        fn pick_due_indices(
+            due: &[bool],
+            cursor: &mut usize,
+            max_per_tick: usize,
+        ) -> HashSet<usize> {
+            let len = due.len();
+            if len == 0 || max_per_tick == 0 {
+                return HashSet::new();
+            }
+            let mut picked = HashSet::new();
+            let start = (*cursor).min(len.saturating_sub(1));
+            let mut scanned = 0usize;
+            let mut idx = start;
+            while scanned < len && picked.len() < max_per_tick {
+                if due[idx] {
+                    picked.insert(idx);
+                }
+                idx = (idx + 1) % len;
+                scanned += 1;
+            }
+            *cursor = idx;
+            picked
+        }
+
+        #[derive(Clone, Copy)]
+        struct FactionDecisionPlan {
+            run_survey: bool,
+            run_colonize: bool,
+            run_build: bool,
+            run_powerplay: bool,
+        }
         let mut events = Vec::new();
         let mut reserved_bootstrap_systems: HashSet<SystemId> = game_state
             .colonies
@@ -198,8 +277,63 @@ impl AiFactionController {
         let current_year = game_state.current_year;
         let sector_size = generator.config().sector_size;
         let center = generator.config().center;
+        let decision_plans: Vec<FactionDecisionPlan> = self
+            .factions
+            .par_iter()
+            .map(|ai| FactionDecisionPlan {
+                run_survey: current_year - ai.last_survey_year >= SURVEY_INTERVAL_YEARS,
+                run_colonize: current_year - ai.last_colonize_year >= COLONIZE_INTERVAL_YEARS,
+                run_build: current_year - ai.last_build_year >= BUILD_INTERVAL_YEARS,
+                run_powerplay: current_year - ai.last_powerplay_year >= POWERPLAY_INTERVAL_YEARS,
+            })
+            .collect();
+        let survey_due = decision_plans
+            .iter()
+            .map(|p| p.run_survey)
+            .collect::<Vec<_>>();
+        let colonize_due = decision_plans
+            .iter()
+            .map(|p| p.run_colonize)
+            .collect::<Vec<_>>();
+        let build_due = decision_plans
+            .iter()
+            .map(|p| p.run_build)
+            .collect::<Vec<_>>();
+        let powerplay_due = decision_plans
+            .iter()
+            .map(|p| p.run_powerplay)
+            .collect::<Vec<_>>();
+        let survey_selected = pick_due_indices(
+            &survey_due,
+            &mut self.survey_cursor,
+            MAX_SURVEY_FACTIONS_PER_TICK,
+        );
+        let colonize_selected = pick_due_indices(
+            &colonize_due,
+            &mut self.colonize_cursor,
+            MAX_COLONIZE_FACTIONS_PER_TICK,
+        );
+        let build_selected = pick_due_indices(
+            &build_due,
+            &mut self.build_cursor,
+            MAX_BUILD_FACTIONS_PER_TICK,
+        );
+        let powerplay_selected = pick_due_indices(
+            &powerplay_due,
+            &mut self.powerplay_cursor,
+            MAX_POWERPLAY_FACTIONS_PER_TICK,
+        );
 
-        for ai in &mut self.factions {
+        for (idx, ai) in self.factions.iter_mut().enumerate() {
+            let plan = decision_plans
+                .get(idx)
+                .copied()
+                .unwrap_or(FactionDecisionPlan {
+                    run_survey: false,
+                    run_colonize: false,
+                    run_build: false,
+                    run_powerplay: false,
+                });
             // Skip factions that no longer exist in the game state.
             if !game_state.factions.contains_key(&ai.faction_id) {
                 continue;
@@ -225,23 +359,23 @@ impl AiFactionController {
             }
 
             // ── Survey: discover and scan systems near colonies ──
-            if current_year - ai.last_survey_year >= SURVEY_INTERVAL_YEARS {
+            if plan.run_survey && survey_selected.contains(&idx) {
                 ai.last_survey_year = current_year;
                 run_survey_decisions(ai, game_state, generator, sector_size, center);
             }
 
             // ── Colonize: found new colonies on assessed systems ──
-            if current_year - ai.last_colonize_year >= COLONIZE_INTERVAL_YEARS {
+            if plan.run_colonize && colonize_selected.contains(&idx) {
                 ai.last_colonize_year = current_year;
                 run_colonize_decisions(ai, game_state, generator);
             }
 
             // ── Build: queue buildings at existing colonies ──
-            if current_year - ai.last_build_year >= BUILD_INTERVAL_YEARS {
+            if plan.run_build && build_selected.contains(&idx) {
                 ai.last_build_year = current_year;
-                run_build_decisions(ai, game_state);
+                run_build_decisions(ai, game_state, generator);
             }
-            if current_year - ai.last_powerplay_year >= POWERPLAY_INTERVAL_YEARS {
+            if plan.run_powerplay && powerplay_selected.contains(&idx) {
                 ai.last_powerplay_year = current_year;
                 events.extend(run_powerplay_decisions(ai, game_state));
             }
@@ -263,12 +397,27 @@ fn bootstrap_colony(
     generator: &GalaxyGenerator,
     reserved_systems: &mut HashSet<SystemId>,
 ) -> Option<GameEvent> {
+    const MAX_BOOTSTRAP_EVALUATIONS: usize = 180;
+    #[derive(Clone)]
+    struct BootstrapPick {
+        score: f32,
+        summary: SystemSummary,
+        body_index: usize,
+        earth_like_world: bool,
+        atmosphere_pressure_atm: f32,
+        element_resource_profile: HashMap<String, f32>,
+        atmosphere_resource_profile: HashMap<String, f32>,
+    }
+
     let cfg = generator.config();
     let sx = ((ai.home_pos[0] - cfg.center[0]) / cfg.sector_size).floor() as i32;
     let sy = ((ai.home_pos[1] - cfg.center[1]) / cfg.sector_size).floor() as i32;
 
-    // Search expanding rings of sectors around home_pos for a habitable system.
-    for radius in 0i32..=6 {
+    let mut strict_best: Option<BootstrapPick> = None;
+    let mut relaxed_best: Option<BootstrapPick> = None;
+    let mut evaluated = 0usize;
+    // Search expanding rings of sectors around home_pos.
+    'search: for radius in 0i32..=6 {
         for dx in -radius..=radius {
             for dy in -radius..=radius {
                 if dx.abs() != radius && dy.abs() != radius {
@@ -280,69 +429,138 @@ fn bootstrap_colony(
                 };
                 let systems = generator.generate_sector(coord);
                 for summary in &systems {
+                    if evaluated >= MAX_BOOTSTRAP_EVALUATIONS {
+                        break 'search;
+                    }
                     // Skip systems already colonized by anyone.
                     if reserved_systems.contains(&summary.id) {
                         continue;
                     }
 
                     let detail = generator.generate_system_detail(summary);
-                    let candidate = detail
-                        .planets
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, p)| p.habitable && p.host_planet_index.is_none())
-                        .max_by_key(|(_, p)| {
-                            // Prefer ELW, then habitable rocky, then water worlds.
-                            match p.kind {
-                                PlanetKind::EarthLikeWorld => 100,
-                                PlanetKind::WaterWorld => 60,
-                                _ => 30,
-                            }
-                        });
-
-                    let Some((body_index, planet)) = candidate else {
+                    evaluated += 1;
+                    let Some((best_body_idx, score, habitable_count, non_moon_count)) =
+                        score_bootstrap_system(&detail)
+                    else {
                         continue;
                     };
-
-                    let colony_id = game_state.reserve_colony_id();
-                    let colony_name = format!(
-                        "{} Prime",
-                        game_state
-                            .factions
-                            .get(&ai.faction_id)
-                            .map(|f| f.display_name.as_str())
-                            .unwrap_or("Colony")
-                    );
-
-                    let element_profile =
-                        normalized_composition_profile(&planet.composition);
-                    let atmosphere_profile =
-                        normalized_atmosphere_profile(&planet.atmosphere);
-
-                    // Reserve immediately so later factions in this same tick cannot
-                    // bootstrap into the same system before events are applied.
-                    reserved_systems.insert(summary.id);
-                    return Some(GameEvent::FoundedColony {
-                        at_year: game_state.current_year,
-                        colony_id,
-                        colony_name,
-                        founder_faction: ai.faction_id.clone(),
-                        system: summary.id,
-                        body_index: body_index as u16,
-                        habitable_site: true,
+                    let dx = ai.home_pos[0] - summary.pos[0];
+                    let dy = ai.home_pos[1] - summary.pos[1];
+                    let dz = ai.home_pos[2] - summary.pos[2];
+                    let distance_penalty = (dx * dx + dy * dy + dz * dz).sqrt() / 20_000.0;
+                    let adjusted_score = score - distance_penalty;
+                    let planet = &detail.planets[best_body_idx];
+                    let pick = BootstrapPick {
+                        score: adjusted_score,
+                        summary: summary.clone(),
+                        body_index: best_body_idx,
                         earth_like_world: planet.kind == PlanetKind::EarthLikeWorld,
-                        system_pos: summary.pos,
-                        element_resource_profile: element_profile,
-                        atmosphere_resource_profile: atmosphere_profile,
                         atmosphere_pressure_atm: planet.atmosphere_pressure_atm,
-                        colonists_sent: 10_000,
-                        source_colony_id: None,
-                    });
+                        element_resource_profile: normalized_composition_profile(&planet.composition),
+                        atmosphere_resource_profile: normalized_atmosphere_profile(&planet.atmosphere),
+                    };
+                    if habitable_count >= BOOTSTRAP_MIN_HABITABLE_PLANETS
+                        && non_moon_count >= BOOTSTRAP_MIN_NON_MOON_PLANETS
+                    {
+                        if strict_best
+                            .as_ref()
+                            .map(|best| pick.score > best.score)
+                            .unwrap_or(true)
+                        {
+                            strict_best = Some(pick);
+                        }
+                    } else {
+                        if relaxed_best
+                            .as_ref()
+                            .map(|best| pick.score > best.score)
+                            .unwrap_or(true)
+                        {
+                            relaxed_best = Some(pick);
+                        }
+                    }
                 }
             }
         }
     }
-    None
+    let picked = strict_best.or(relaxed_best);
+    let Some(pick) = picked else {
+        return None;
+    };
+    let colony_id = game_state.reserve_colony_id();
+    let colony_name = format!(
+        "{} Prime",
+        game_state
+            .factions
+            .get(&ai.faction_id)
+            .map(|f| f.display_name.as_str())
+            .unwrap_or("Colony")
+    );
+    reserved_systems.insert(pick.summary.id);
+    Some(GameEvent::FoundedColony {
+        at_year: game_state.current_year,
+        colony_id,
+        colony_name,
+        founder_faction: ai.faction_id.clone(),
+        system: pick.summary.id,
+        body_index: pick.body_index as u16,
+        habitable_site: true,
+        earth_like_world: pick.earth_like_world,
+        system_pos: pick.summary.pos,
+        element_resource_profile: pick.element_resource_profile,
+        atmosphere_resource_profile: pick.atmosphere_resource_profile,
+        atmosphere_pressure_atm: pick.atmosphere_pressure_atm,
+        colonists_sent: 10_000,
+        source_colony_id: None,
+    })
+}
+
+fn score_bootstrap_system(
+    detail: &crate::procedural_galaxy::SystemDetail,
+) -> Option<(usize, f32, usize, usize)> {
+    let mut best_idx: Option<usize> = None;
+    let mut best_score = f32::NEG_INFINITY;
+    let mut habitable_count = 0usize;
+    let mut non_moon_count = 0usize;
+    for (idx, planet) in detail.planets.iter().enumerate() {
+        if planet.host_planet_index.is_some() {
+            continue;
+        }
+        non_moon_count += 1;
+        if !planet.habitable {
+            continue;
+        }
+        habitable_count += 1;
+        let kind_score = match planet.kind {
+            PlanetKind::EarthLikeWorld => 120.0,
+            PlanetKind::WaterWorld => 78.0,
+            PlanetKind::Rocky | PlanetKind::MetalRich | PlanetKind::Metal => 54.0,
+            PlanetKind::AmmoniaWorld => 36.0,
+            _ => 24.0,
+        };
+        let atmosphere_score = if planet.atmosphere_pressure_atm > 0.1 {
+            if (0.4..=2.2).contains(&planet.atmosphere_pressure_atm) {
+                18.0
+            } else {
+                9.0
+            }
+        } else {
+            2.0
+        };
+        let composition_score = (planet.composition.len() as f32 * 2.0).min(16.0);
+        let body_score = kind_score
+            + atmosphere_score
+            + composition_score
+            + (planet.radius_earth.clamp(0.4, 2.6) * 8.0);
+        if body_score > best_score {
+            best_score = body_score;
+            best_idx = Some(idx);
+        }
+    }
+    let best_idx = best_idx?;
+    // richness bonus to favor systems that can expand after bootstrap
+    let richness_bonus = (non_moon_count as f32 * 2.5).min(15.0)
+        + (habitable_count as f32 * 8.0).min(24.0);
+    Some((best_idx, best_score + richness_bonus, habitable_count, non_moon_count))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -393,13 +611,15 @@ fn run_survey_decisions(
 
     // First: advance already-known systems through survey stages.
     // Use sector proximity (cheap) instead of find_system_summary (expensive).
+    let nearby_colony_sectors =
+        expand_sector_neighborhood(&colony_sectors, SURVEY_SEARCH_RADIUS_SECTORS);
     let known_systems: Vec<(SystemId, SurveyStage)> = game_state
         .survey_records
         .values()
         .filter(|r| {
             r.stage.next().is_some()
                 && !pending_scan_systems.contains(&r.system)
-                && is_sector_near_colony_sectors(&colony_sectors, r.system.sector, SURVEY_SEARCH_RADIUS_SECTORS)
+                && nearby_colony_sectors.contains(&r.system.sector)
         })
         .map(|r| (r.system, r.stage))
         .take(slots * 4)
@@ -485,7 +705,7 @@ fn run_survey_decisions(
         .map(|c| c.system_pos)
         .collect();
 
-    let mut candidates: Vec<SystemSummary> = Vec::new();
+    let mut candidates: Vec<(f32, SystemSummary)> = Vec::new();
     for i in 0..sectors_to_scan {
         let idx = (start + i) % total;
         let coord = discovery_sectors[idx];
@@ -494,21 +714,18 @@ fn run_survey_decisions(
             if game_state.survey_stage(sys.id) == SurveyStage::Unknown
                 && !pending_scan_systems.contains(&sys.id)
             {
-                candidates.push(sys);
+                let distance_key = min_distance_to_positions(&colony_positions, sys.pos);
+                candidates.push((distance_key, sys));
             }
         }
     }
     ai.discovery_sector_cursor = (start + sectors_to_scan) % total;
 
     // Sort by distance to the nearest colony, closest first.
-    candidates.sort_by(|a, b| {
-        let da = min_distance_to_positions(&colony_positions, a.pos);
-        let db = min_distance_to_positions(&colony_positions, b.pos);
-        da.total_cmp(&db)
-    });
+    candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
     candidates.truncate(MAX_SURVEY_CANDIDATES_PER_CYCLE);
 
-    for sys in candidates {
+    for (_, sys) in candidates {
         if queued >= slots {
             break;
         }
@@ -600,6 +817,7 @@ fn run_colonize_decisions(
 
     // Max sector distance that could still be within colonization range.
     let max_sector_dist = (colonization_range / sector_size).ceil() as i32 + 1;
+    let nearby_colony_sectors = expand_sector_neighborhood(&colony_sectors, max_sector_dist);
 
     // Gather candidate system IDs (cheap pre-filter, no sector generation).
     let candidate_ids: Vec<SystemId> = game_state
@@ -611,7 +829,7 @@ fn run_colonize_decisions(
             }
             let system_id = record.system;
 
-            if !is_sector_near_colony_sectors(&colony_sectors, system_id.sector, max_sector_dist) {
+            if !nearby_colony_sectors.contains(&system_id.sector) {
                 return None;
             }
             if occupied_or_claimed_systems.contains(&system_id) {
@@ -844,18 +1062,58 @@ fn score_system_for_colonization(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Queue buildings for AI-owned colonies that lack active construction.
-fn run_build_decisions(ai: &FactionAiState, game_state: &mut GameState) {
+#[derive(Clone, Copy, Debug)]
+enum BuildIntent {
+    Recovery,
+    Extraction,
+    Throughput,
+    Growth,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BuildRejectReason {
+    Reserve,
+    SubstitutionStress,
+    SiteInvalid,
+}
+
+#[derive(Debug)]
+struct BuildChoice {
+    kind: ColonyBuildingKind,
+    site: ColonyBuildingSite,
+    profile: ColonyBuildingSiteProfile,
+    intent: BuildIntent,
+    score: f32,
+}
+
+fn run_build_decisions(ai: &FactionAiState, game_state: &mut GameState, generator: &GalaxyGenerator) {
+    let mut telemetry = AiBuildTelemetry::default();
     let colonies_with_pending_build: HashSet<u64> = game_state
         .pending_colony_buildings
         .iter()
         .map(|pending| pending.colony_id)
         .collect();
-    let colony_ids: Vec<u64> = game_state
+    let mut colony_ids: Vec<u64> = game_state
         .colonies
         .values()
         .filter(|c| c.owner_faction == ai.faction_id)
         .map(|c| c.id)
         .collect();
+    colony_ids.sort_by(|a, b| {
+        let a_need = game_state
+            .colonies
+            .get(a)
+            .map(colony_need_score)
+            .unwrap_or(0.0);
+        let b_need = game_state
+            .colonies
+            .get(b)
+            .map(colony_need_score)
+            .unwrap_or(0.0);
+        b_need.total_cmp(&a_need)
+    });
+    let mut reserve_depth_total = 0.0f32;
+    let mut reserve_depth_count = 0usize;
 
     for colony_id in colony_ids {
         // Re-read treasury each iteration so earlier builds are accounted for.
@@ -865,7 +1123,7 @@ fn run_build_decisions(ai: &FactionAiState, game_state: &mut GameState) {
             .map(|f| f.treasury)
             .unwrap_or(0);
         if treasury < MIN_TREASURY_FOR_BUILDING {
-            return;
+            break;
         }
 
         // Skip if already constructing.
@@ -877,85 +1135,329 @@ fn run_build_decisions(ai: &FactionAiState, game_state: &mut GameState) {
             continue;
         };
 
-        // Determine best building to construct.
-        let body_site = ColonyBuildingSite::Planet(colony.body_index);
-        let slot_capacity = match colony.stage {
-            crate::game_state::ColonyStage::Outpost => 3,
-            crate::game_state::ColonyStage::Settlement => 5,
-            crate::game_state::ColonyStage::City => 7,
-            crate::game_state::ColonyStage::CoreWorld => 9,
-        };
-        let site_profile = ColonyBuildingSiteProfile {
-            planet_is_gas_giant: Some(false),
-            planet_habitable: Some(colony.habitable_site),
-            planet_building_slot_capacity: Some(slot_capacity),
-            planet_has_atmosphere: Some(colony.atmosphere_pressure_atm > 0.01),
-            star_is_scoopable: Some(true),
-        };
-
-        let is_sanctioned = game_state
-            .active_sanctions
-            .iter()
-            .any(|((_, target), expires)| target == &ai.faction_id && *expires > game_state.current_year);
-        let mut forced_pick: Option<(ColonyBuildingKind, ColonyBuildingSite)> = None;
-        if is_sanctioned || colony.last_net_revenue_annual < 0 {
-            if can_ai_afford_building(
-                colony,
-                ColonyBuildingKind::SystemsAdministration,
-                body_site,
-                treasury,
-            ) {
-                forced_pick = Some((ColonyBuildingKind::SystemsAdministration, body_site));
-            } else if can_ai_afford_building(
-                colony,
-                ColonyBuildingKind::LogisticsExchange,
-                body_site,
-                treasury,
-            ) {
-                forced_pick = Some((ColonyBuildingKind::LogisticsExchange, body_site));
-            }
-        }
-        if forced_pick.is_none() {
-            if let Some(sim) = game_state.system_sim.get(&colony.system) {
-                let hostile_frontier = sim.security < 0.38
-                    && sim
-                        .influence_by_faction
-                        .iter()
-                        .any(|(other_faction, _)| {
-                            other_faction != &ai.faction_id
-                                && game_state.hostility_score_between(&ai.faction_id, other_faction) > 0.40
-                        });
-                if hostile_frontier
-                    && can_ai_afford_building(
-                        colony,
-                        ColonyBuildingKind::DefenseGrid,
-                        ColonyBuildingSite::Orbital,
-                        treasury,
-                    )
-                {
-                    forced_pick = Some((ColonyBuildingKind::DefenseGrid, ColonyBuildingSite::Orbital));
-                }
-            }
-        }
-
-        let Some((kind, site)) = forced_pick.or_else(|| pick_building(colony, body_site, treasury)) else {
+        reserve_depth_total += colony_reserve_depth(colony);
+        reserve_depth_count += 1;
+        let Some(choice) = select_build_choice(ai, colony, treasury, game_state, generator, &mut telemetry) else {
             continue;
-        };
-
-        let profile = if matches!(site, ColonyBuildingSite::Planet(_)) {
-            site_profile
-        } else {
-            ColonyBuildingSiteProfile::default()
         };
 
         let _ = game_state.queue_colony_building_with_profile(
             game_state.current_year,
             colony_id,
-            kind,
-            site,
-            profile,
+            choice.kind,
+            choice.site,
+            choice.profile,
         );
+        match choice.intent {
+            BuildIntent::Recovery => telemetry.intent_recovery = telemetry.intent_recovery.saturating_add(1),
+            BuildIntent::Extraction => telemetry.intent_extraction = telemetry.intent_extraction.saturating_add(1),
+            BuildIntent::Throughput => telemetry.intent_throughput = telemetry.intent_throughput.saturating_add(1),
+            BuildIntent::Growth => telemetry.intent_growth = telemetry.intent_growth.saturating_add(1),
+        }
     }
+    telemetry.avg_reserve_depth = if reserve_depth_count > 0 {
+        reserve_depth_total / reserve_depth_count as f32
+    } else {
+        0.0
+    };
+    game_state.ai_build_telemetry = telemetry;
+}
+
+fn colony_need_score(colony: &crate::game_state::ColonyState) -> f32 {
+    let reserve_penalty = (0.45 - colony_reserve_depth(colony)).max(0.0) * 2.0;
+    let deficit = (-colony.food_balance).max(0.0)
+        + (-colony.industry_balance).max(0.0)
+        + (-colony.energy_balance).max(0.0);
+    let economic_penalty = if colony.last_net_revenue_annual < 0 { 0.9 } else { 0.0 };
+    reserve_penalty + deficit * 1.6 + economic_penalty
+}
+
+fn colony_reserve_depth(colony: &crate::game_state::ColonyState) -> f32 {
+    let capacity = colony.stockpile_capacity.max(1.0);
+    let food = (colony.food_stockpile / capacity).clamp(0.0, 1.0);
+    let industry = (colony.industry_stockpile / capacity).clamp(0.0, 1.0);
+    let energy = (colony.energy_stockpile / capacity).clamp(0.0, 1.0);
+    food.min(industry).min(energy)
+}
+
+fn select_build_choice(
+    ai: &FactionAiState,
+    colony: &crate::game_state::ColonyState,
+    treasury: i64,
+    game_state: &GameState,
+    generator: &GalaxyGenerator,
+    telemetry: &mut AiBuildTelemetry,
+) -> Option<BuildChoice> {
+    let site_candidates = candidate_sites_for_colony(colony, generator);
+    let is_sanctioned = game_state
+        .active_sanctions
+        .iter()
+        .any(|((_, target), expires)| target == &ai.faction_id && *expires > game_state.current_year);
+    let in_recovery = is_sanctioned
+        || colony.last_net_revenue_annual < 0
+        || colony_reserve_depth(colony) < 0.18
+        || ((-colony.food_balance).max(0.0)
+            + (-colony.industry_balance).max(0.0)
+            + (-colony.energy_balance).max(0.0))
+            > 0.045;
+
+    let mut best: Option<BuildChoice> = None;
+    let mut rejected_site = false;
+    for (site, profile) in site_candidates {
+        for kind in ColonyBuildingKind::all().into_iter().filter(|k| *k != ColonyBuildingKind::SpaceStation) {
+            if !kind.is_player_queueable() {
+                continue;
+            }
+            if let Some(reason) =
+                evaluate_build_candidate(colony, kind, site, profile, treasury, in_recovery)
+            {
+                match reason {
+                    Ok(choice) => {
+                        if best.as_ref().map(|b| choice.score > b.score).unwrap_or(true) {
+                            best = Some(choice);
+                        }
+                    }
+                    Err(BuildRejectReason::Reserve) => {
+                        telemetry.reject_reserve = telemetry.reject_reserve.saturating_add(1);
+                    }
+                    Err(BuildRejectReason::SubstitutionStress) => {
+                        telemetry.reject_substitution_stress =
+                            telemetry.reject_substitution_stress.saturating_add(1);
+                    }
+                    Err(BuildRejectReason::SiteInvalid) => {
+                        rejected_site = true;
+                    }
+                }
+            }
+        }
+    }
+    if rejected_site {
+        telemetry.reject_site_invalid = telemetry.reject_site_invalid.saturating_add(1);
+    }
+    best
+}
+
+fn candidate_sites_for_colony(
+    colony: &crate::game_state::ColonyState,
+    generator: &GalaxyGenerator,
+) -> Vec<(ColonyBuildingSite, ColonyBuildingSiteProfile)> {
+    let slot_capacity = match colony.stage {
+        crate::game_state::ColonyStage::Outpost => 3,
+        crate::game_state::ColonyStage::Settlement => 5,
+        crate::game_state::ColonyStage::City => 7,
+        crate::game_state::ColonyStage::CoreWorld => 9,
+    };
+    let mut candidates = Vec::new();
+    if let Some(summary) = generator.find_system_summary(colony.system) {
+        let detail = generator.generate_system_detail(&summary);
+        for (idx, planet) in detail.planets.iter().enumerate().take(6) {
+            if planet.host_planet_index.is_some() {
+                continue;
+            }
+            candidates.push((
+                ColonyBuildingSite::Planet(idx as u16),
+                ColonyBuildingSiteProfile {
+                    planet_is_gas_giant: Some(planet.kind.is_gas_giant()),
+                    planet_habitable: Some(planet.habitable),
+                    planet_building_slot_capacity: Some(slot_capacity),
+                    planet_has_atmosphere: Some(planet.atmosphere_pressure_atm > 0.01),
+                    star_is_scoopable: None,
+                },
+            ));
+        }
+        for (idx, star) in detail.stars.iter().enumerate().take(2) {
+            candidates.push((
+                ColonyBuildingSite::Star(idx as u16),
+                ColonyBuildingSiteProfile {
+                    star_is_scoopable: Some(star.class.spectral.is_scoopable()),
+                    ..ColonyBuildingSiteProfile::default()
+                },
+            ));
+        }
+    }
+    // Always include home body + orbital fallback.
+    candidates.push((
+        ColonyBuildingSite::Planet(colony.body_index),
+        ColonyBuildingSiteProfile {
+            planet_is_gas_giant: Some(false),
+            planet_habitable: Some(colony.habitable_site),
+            planet_building_slot_capacity: Some(slot_capacity),
+            planet_has_atmosphere: Some(colony.atmosphere_pressure_atm > 0.01),
+            star_is_scoopable: None,
+        },
+    ));
+    candidates.push((
+        ColonyBuildingSite::Orbital,
+        ColonyBuildingSiteProfile::default(),
+    ));
+    candidates.sort_by_key(|(site, _)| *site);
+    candidates.dedup_by_key(|(site, _)| *site);
+    candidates
+}
+
+fn evaluate_build_candidate(
+    colony: &crate::game_state::ColonyState,
+    kind: ColonyBuildingKind,
+    site: ColonyBuildingSite,
+    site_profile: ColonyBuildingSiteProfile,
+    treasury: i64,
+    in_recovery: bool,
+) -> Option<Result<BuildChoice, BuildRejectReason>> {
+    if GameState::building_site_support_error(kind, site, site_profile).is_some() {
+        return Some(Err(BuildRejectReason::SiteInvalid));
+    }
+    let current = colony.building_level_at_site(kind, site);
+    let target = current.saturating_add(1);
+    if target > kind.max_level() {
+        return None;
+    }
+    let cost = GameState::colony_building_cost_preview(kind, target);
+    if treasury < cost.treasury {
+        return None;
+    }
+    if colony.food_stockpile + 0.0001 < cost.food
+        || colony.industry_stockpile + 0.0001 < cost.industry
+        || colony.energy_stockpile + 0.0001 < cost.energy
+    {
+        return None;
+    }
+    let (elements_ok, substitution_stress) =
+        affordability_and_substitution_stress(&colony.element_stockpiles, &cost.element_costs);
+    if !elements_ok {
+        return None;
+    }
+    if substitution_stress > MAX_SUBSTITUTION_STRESS {
+        return Some(Err(BuildRejectReason::SubstitutionStress));
+    }
+    let reserve_after = estimate_reserve_depth_after_build(colony, &cost);
+    if reserve_after < MIN_RESERVE_DEPTH_AFTER_BUILD {
+        return Some(Err(BuildRejectReason::Reserve));
+    }
+    let intent = classify_build_intent(kind, in_recovery);
+    let mut score = score_build_candidate(colony, kind, intent, substitution_stress, reserve_after);
+    if matches!(site, ColonyBuildingSite::Planet(idx) if idx == colony.body_index) {
+        score += 0.15;
+    }
+    Some(Ok(BuildChoice {
+        kind,
+        site,
+        profile: site_profile,
+        intent,
+        score,
+    }))
+}
+
+fn affordability_and_substitution_stress(
+    stockpiles: &HashMap<String, f32>,
+    costs: &[(String, f32)],
+) -> (bool, f32) {
+    use crate::game_state::{element_substitutes, element_substitution_penalty};
+    let mut remaining: HashMap<&str, f32> =
+        stockpiles.iter().map(|(sym, amt)| (sym.as_str(), *amt)).collect();
+    let mut total_required = 0.0f32;
+    let mut substituted_effective = 0.0f32;
+    for (symbol, amount) in costs {
+        total_required += *amount;
+        let available = remaining.get(symbol.as_str()).copied().unwrap_or(0.0);
+        if available + 0.0001 >= *amount {
+            *remaining.entry(symbol.as_str()).or_insert(0.0) -= *amount;
+            continue;
+        }
+        let mut still_needed = *amount - available.max(0.0);
+        if available > 0.0 {
+            *remaining.entry(symbol.as_str()).or_insert(0.0) = 0.0;
+        }
+        for sub in element_substitutes(symbol.as_str()) {
+            if still_needed <= 0.0001 {
+                break;
+            }
+            let sub_available = remaining.get(sub).copied().unwrap_or(0.0);
+            if sub_available <= 0.01 {
+                continue;
+            }
+            let penalty = element_substitution_penalty(symbol.as_str());
+            let needed_sub = still_needed * penalty;
+            let used = sub_available.min(needed_sub);
+            *remaining.entry(sub).or_insert(0.0) -= used;
+            let covered_original = used / penalty;
+            substituted_effective += covered_original * penalty.min(2.0);
+            still_needed -= covered_original;
+        }
+        if still_needed > 0.0001 {
+            return (false, 1.0);
+        }
+    }
+    let stress = if total_required > 0.001 {
+        (substituted_effective / total_required).clamp(0.0, 1.5)
+    } else {
+        0.0
+    };
+    (true, stress)
+}
+
+fn estimate_reserve_depth_after_build(
+    colony: &crate::game_state::ColonyState,
+    cost: &crate::game_state::ColonyBuildingCostPreview,
+) -> f32 {
+    let capacity = colony.stockpile_capacity.max(1.0);
+    let food = ((colony.food_stockpile - cost.food).max(0.0) / capacity).clamp(0.0, 1.0);
+    let industry =
+        ((colony.industry_stockpile - cost.industry).max(0.0) / capacity).clamp(0.0, 1.0);
+    let energy = ((colony.energy_stockpile - cost.energy).max(0.0) / capacity).clamp(0.0, 1.0);
+    food.min(industry).min(energy)
+}
+
+fn classify_build_intent(kind: ColonyBuildingKind, in_recovery: bool) -> BuildIntent {
+    if in_recovery {
+        return BuildIntent::Recovery;
+    }
+    match kind {
+        ColonyBuildingKind::DeepMantleMiningStation
+        | ColonyBuildingKind::AtmosphereHarvester
+        | ColonyBuildingKind::CatalyticRefinery => BuildIntent::Extraction,
+        ColonyBuildingKind::LogisticsExchange
+        | ColonyBuildingKind::SystemsAdministration
+        | ColonyBuildingKind::TradingHub
+        | ColonyBuildingKind::IndustrialHub
+        | ColonyBuildingKind::FuelScoopDroneSwarm => BuildIntent::Throughput,
+        _ => BuildIntent::Growth,
+    }
+}
+
+fn score_build_candidate(
+    colony: &crate::game_state::ColonyState,
+    kind: ColonyBuildingKind,
+    intent: BuildIntent,
+    substitution_stress: f32,
+    reserve_after: f32,
+) -> f32 {
+    let mut score = 1.0 + reserve_after * 2.0 - substitution_stress * 1.8;
+    match intent {
+        BuildIntent::Recovery => score += 3.2,
+        BuildIntent::Extraction => score += 2.6,
+        BuildIntent::Throughput => score += 2.0,
+        BuildIntent::Growth => score += 1.2,
+    }
+    if colony.food_balance < -0.02 && kind == ColonyBuildingKind::AgriDome {
+        score += 2.3;
+    }
+    if colony.industry_balance < -0.02 && kind == ColonyBuildingKind::IndustrialHub {
+        score += 2.1;
+    }
+    if colony.energy_balance < -0.02 && kind == ColonyBuildingKind::FuelScoopDroneSwarm {
+        score += 2.1;
+    }
+    if total_element_stockpile(colony) < 64.0
+        && matches!(
+            kind,
+            ColonyBuildingKind::DeepMantleMiningStation
+                | ColonyBuildingKind::AtmosphereHarvester
+                | ColonyBuildingKind::CatalyticRefinery
+        )
+    {
+        score += 2.8;
+    }
+    score
 }
 
 fn run_powerplay_decisions(ai: &FactionAiState, game_state: &mut GameState) -> Vec<GameEvent> {
@@ -1042,290 +1544,9 @@ fn run_powerplay_decisions(ai: &FactionAiState, game_state: &mut GameState) -> V
     events
 }
 
-/// Check if the colony can afford a building (treasury + stockpile costs with substitution).
-fn can_ai_afford_building(
-    colony: &crate::game_state::ColonyState,
-    kind: ColonyBuildingKind,
-    site: ColonyBuildingSite,
-    treasury: i64,
-) -> bool {
-    let current_level = colony.building_level_at_site(kind, site);
-    let target_level = current_level.saturating_add(1);
-    if target_level > kind.max_level() {
-        return false;
-    }
-    let cost = GameState::colony_building_cost_preview(kind, target_level);
-    if treasury < cost.treasury {
-        return false;
-    }
-    if colony.food_stockpile + 0.0001 < cost.food
-        || colony.industry_stockpile + 0.0001 < cost.industry
-        || colony.energy_stockpile + 0.0001 < cost.energy
-    {
-        return false;
-    }
-    // Check element costs with substitution.
-    let element_costs: Vec<_> = cost
-        .element_costs
-        .iter()
-        .map(|(sym, amt)| (sym.as_str(), *amt))
-        .collect();
-    can_afford_elements_with_substitution(&colony.element_stockpiles, &element_costs)
-}
-
-/// Lightweight element affordability check using substitution groups.
-fn can_afford_elements_with_substitution(
-    stockpiles: &HashMap<String, f32>,
-    costs: &[(&str, f32)],
-) -> bool {
-    use crate::game_state::element_substitutes;
-    use crate::game_state::element_substitution_penalty;
-
-    let mut remaining: HashMap<&str, f32> = HashMap::new();
-    for (sym, amt) in stockpiles.iter() {
-        remaining.insert(sym.as_str(), *amt);
-    }
-
-    for &(symbol, amount) in costs {
-        let available = remaining.get(symbol).copied().unwrap_or(0.0);
-        if available + 0.0001 >= amount {
-            *remaining.entry(symbol).or_insert(0.0) -= amount;
-            continue;
-        }
-        let mut still_needed = amount - available.max(0.0);
-        if available > 0.0 {
-            *remaining.entry(symbol).or_insert(0.0) = 0.0;
-        }
-        for &sub in element_substitutes(symbol) {
-            if still_needed <= 0.0001 {
-                break;
-            }
-            let sub_available = remaining.get(sub).copied().unwrap_or(0.0);
-            if sub_available < 0.01 {
-                continue;
-            }
-            let penalty = element_substitution_penalty(symbol);
-            let sub_needed = still_needed * penalty;
-            let sub_used = sub_available.min(sub_needed);
-            *remaining.entry(sub).or_insert(0.0) -= sub_used;
-            still_needed -= sub_used / penalty;
-        }
-        if still_needed > 0.0001 {
-            return false;
-        }
-    }
-    true
-}
-
 /// Compute total element stockpile as a simple sum of all element amounts.
 fn total_element_stockpile(colony: &crate::game_state::ColonyState) -> f32 {
     colony.element_stockpiles.values().copied().sum()
-}
-
-/// Check how many elements the colony has vs. the cheapest affordable building's costs.
-/// Returns true if the colony should prioritize resource extraction.
-fn needs_element_production(colony: &crate::game_state::ColonyState) -> bool {
-    let total = total_element_stockpile(colony);
-    // If total element stockpile is below this threshold, the colony needs mining.
-    // A single L1 building typically needs 15-35 total element units.
-    let mining_level = colony.building_level_at_site(
-        ColonyBuildingKind::DeepMantleMiningStation,
-        ColonyBuildingSite::Planet(colony.body_index),
-    );
-    // More lenient threshold if mining exists (production is incoming).
-    let threshold = if mining_level > 0 { 26.0 } else { 62.0 };
-    total < threshold
-}
-
-/// Heuristic: pick the most beneficial building for a colony's current state.
-/// Considers element stockpiles, affordability, and balanced growth.
-/// Returns None if no building can be afforded or is worth building.
-fn pick_building(
-    colony: &crate::game_state::ColonyState,
-    planet_site: ColonyBuildingSite,
-    treasury: i64,
-) -> Option<(ColonyBuildingKind, ColonyBuildingSite)> {
-    let star_site = ColonyBuildingSite::Star(0);
-    let has_atmosphere = colony.atmosphere_pressure_atm > 0.01;
-
-    // Helper: check if a building is upgradeable and affordable.
-    let can_build = |kind: ColonyBuildingKind, site: ColonyBuildingSite| -> bool {
-        let current = colony.building_level_at_site(kind, site);
-        current < kind.max_level() && can_ai_afford_building(colony, kind, site, treasury)
-    };
-
-    let mining_level = colony.building_level_at_site(ColonyBuildingKind::DeepMantleMiningStation, planet_site);
-    let logistics_level = colony.building_level_at_site(ColonyBuildingKind::LogisticsExchange, planet_site);
-    let arcology_level = colony.building_level_at_site(ColonyBuildingKind::HabitatArcology, planet_site);
-    let defense_level = colony.building_level_at_site(ColonyBuildingKind::DefenseGrid, ColonyBuildingSite::Orbital);
-    let admin_level = colony.building_level_at_site(ColonyBuildingKind::SystemsAdministration, planet_site);
-    let refinery_level = colony.building_level_at_site(ColonyBuildingKind::CatalyticRefinery, planet_site);
-    let harvester_level = if has_atmosphere {
-        colony.building_level_at_site(ColonyBuildingKind::AtmosphereHarvester, planet_site)
-    } else {
-        u16::MAX // Mark as unavailable
-    };
-    let wants_elements = needs_element_production(colony);
-
-    // ── Priority 0: Resource extraction when element stockpiles are critically low ──
-    // Without elements, no other buildings can be constructed.
-    if wants_elements {
-        if can_build(ColonyBuildingKind::DeepMantleMiningStation, planet_site) {
-            return Some((ColonyBuildingKind::DeepMantleMiningStation, planet_site));
-        }
-        if has_atmosphere && can_build(ColonyBuildingKind::AtmosphereHarvester, planet_site) {
-            return Some((ColonyBuildingKind::AtmosphereHarvester, planet_site));
-        }
-        // If we can't afford mining either, try the cheapest possible building to
-        // avoid getting permanently stuck.
-    }
-
-    // ── Priority 1: Critical deficits (food, energy) ──
-    if colony.food_balance < -0.02 {
-        if can_build(ColonyBuildingKind::AgriDome, planet_site) {
-            return Some((ColonyBuildingKind::AgriDome, planet_site));
-        }
-    }
-
-    if colony.energy_balance < -0.02 {
-        if can_build(ColonyBuildingKind::FuelScoopDroneSwarm, star_site) {
-            return Some((ColonyBuildingKind::FuelScoopDroneSwarm, star_site));
-        }
-    }
-
-    // ── Priority 2: Low stability ──
-    if colony.stability < 0.55 {
-        if can_build(ColonyBuildingKind::EntertainmentPlaza, planet_site) {
-            return Some((ColonyBuildingKind::EntertainmentPlaza, planet_site));
-        }
-        if can_build(ColonyBuildingKind::DefenseGrid, ColonyBuildingSite::Orbital) {
-            return Some((ColonyBuildingKind::DefenseGrid, ColonyBuildingSite::Orbital));
-        }
-    }
-
-    // ── Priority 3: Industry deficit ──
-    if colony.industry_balance < -0.02 {
-        if can_build(ColonyBuildingKind::IndustrialHub, planet_site) {
-            return Some((ColonyBuildingKind::IndustrialHub, planet_site));
-        }
-    }
-    if colony.last_net_revenue_annual < 0 {
-        if can_build(ColonyBuildingKind::SystemsAdministration, planet_site) {
-            return Some((ColonyBuildingKind::SystemsAdministration, planet_site));
-        }
-        if can_build(ColonyBuildingKind::LogisticsExchange, planet_site) {
-            return Some((ColonyBuildingKind::LogisticsExchange, planet_site));
-        }
-    }
-
-    // ── Priority 4: Ensure foundational buildings are built (L1 of each) ──
-    let trading_level = colony.building_level_at_site(ColonyBuildingKind::TradingHub, planet_site);
-    let agri_level = colony.building_level_at_site(ColonyBuildingKind::AgriDome, planet_site);
-    let entertainment_level = colony.building_level_at_site(ColonyBuildingKind::EntertainmentPlaza, planet_site);
-    let industrial_level = colony.building_level_at_site(ColonyBuildingKind::IndustrialHub, planet_site);
-
-    // Mining L1 is essential — ensures element production for future buildings.
-    if mining_level < 1 && can_build(ColonyBuildingKind::DeepMantleMiningStation, planet_site) {
-        return Some((ColonyBuildingKind::DeepMantleMiningStation, planet_site));
-    }
-
-    // Revenue: TradingHub for income.
-    if trading_level < 1 && can_build(ColonyBuildingKind::TradingHub, planet_site) {
-        return Some((ColonyBuildingKind::TradingHub, planet_site));
-    }
-
-    // Food for growth.
-    if agri_level < 1 && can_build(ColonyBuildingKind::AgriDome, planet_site) {
-        return Some((ColonyBuildingKind::AgriDome, planet_site));
-    }
-
-    // Stability for growth.
-    if entertainment_level < 1 && can_build(ColonyBuildingKind::EntertainmentPlaza, planet_site) {
-        return Some((ColonyBuildingKind::EntertainmentPlaza, planet_site));
-    }
-
-    // Industry for production.
-    if industrial_level < 1 && can_build(ColonyBuildingKind::IndustrialHub, planet_site) {
-        return Some((ColonyBuildingKind::IndustrialHub, planet_site));
-    }
-    if logistics_level < 1 && can_build(ColonyBuildingKind::LogisticsExchange, planet_site) {
-        return Some((ColonyBuildingKind::LogisticsExchange, planet_site));
-    }
-    if admin_level < 1 && can_build(ColonyBuildingKind::SystemsAdministration, planet_site) {
-        return Some((ColonyBuildingKind::SystemsAdministration, planet_site));
-    }
-
-    // Atmosphere harvester L1 if available.
-    if has_atmosphere && harvester_level < 1 && can_build(ColonyBuildingKind::AtmosphereHarvester, planet_site) {
-        return Some((ColonyBuildingKind::AtmosphereHarvester, planet_site));
-    }
-
-    // ── Priority 5: Upgrade to L2 — revenue and growth focus ──
-    if trading_level < 2 && can_build(ColonyBuildingKind::TradingHub, planet_site) {
-        return Some((ColonyBuildingKind::TradingHub, planet_site));
-    }
-    if mining_level < 2 && can_build(ColonyBuildingKind::DeepMantleMiningStation, planet_site) {
-        return Some((ColonyBuildingKind::DeepMantleMiningStation, planet_site));
-    }
-    if agri_level < 2 && can_build(ColonyBuildingKind::AgriDome, planet_site) {
-        return Some((ColonyBuildingKind::AgriDome, planet_site));
-    }
-    if defense_level < 1 && can_build(ColonyBuildingKind::DefenseGrid, ColonyBuildingSite::Orbital) {
-        return Some((ColonyBuildingKind::DefenseGrid, ColonyBuildingSite::Orbital));
-    }
-    if refinery_level < 1 && can_build(ColonyBuildingKind::CatalyticRefinery, planet_site) {
-        return Some((ColonyBuildingKind::CatalyticRefinery, planet_site));
-    }
-    if colony.population > 180_000.0
-        && arcology_level < 1
-        && can_build(ColonyBuildingKind::HabitatArcology, planet_site)
-    {
-        return Some((ColonyBuildingKind::HabitatArcology, planet_site));
-    }
-
-    // ── Priority 6: Upgrade existing buildings to higher levels ──
-    // Prefer upgrading the lowest-level building for balanced development.
-    let mut upgrade_candidates: Vec<(ColonyBuildingKind, ColonyBuildingSite, u16)> = vec![
-        (ColonyBuildingKind::TradingHub, planet_site, trading_level),
-        (ColonyBuildingKind::AgriDome, planet_site, agri_level),
-        (ColonyBuildingKind::EntertainmentPlaza, planet_site, entertainment_level),
-        (ColonyBuildingKind::IndustrialHub, planet_site, industrial_level),
-        (ColonyBuildingKind::DeepMantleMiningStation, planet_site, mining_level),
-        (ColonyBuildingKind::LogisticsExchange, planet_site, logistics_level),
-        (ColonyBuildingKind::HabitatArcology, planet_site, arcology_level),
-        (ColonyBuildingKind::SystemsAdministration, planet_site, admin_level),
-        (ColonyBuildingKind::CatalyticRefinery, planet_site, refinery_level),
-        (ColonyBuildingKind::DefenseGrid, ColonyBuildingSite::Orbital, defense_level),
-    ];
-
-    if has_atmosphere {
-        upgrade_candidates.push((
-            ColonyBuildingKind::AtmosphereHarvester,
-            planet_site,
-            harvester_level,
-        ));
-    }
-
-    let fuel_level = colony.building_level_at_site(
-        ColonyBuildingKind::FuelScoopDroneSwarm,
-        star_site,
-    );
-    upgrade_candidates.push((
-        ColonyBuildingKind::FuelScoopDroneSwarm,
-        star_site,
-        fuel_level,
-    ));
-
-    // Sort by level ascending (upgrade lowest first), then filter to affordable.
-    upgrade_candidates.sort_by_key(|&(_, _, level)| level);
-
-    for (kind, site, _) in upgrade_candidates {
-        if can_build(kind, site) {
-            return Some((kind, site));
-        }
-    }
-
-    None
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1345,15 +1566,26 @@ fn min_distance_to_positions(positions: &[[f32; 3]], target: [f32; 3]) -> f32 {
         .unwrap_or(f32::MAX)
 }
 
-fn is_sector_near_colony_sectors(
+fn expand_sector_neighborhood(
     colony_sectors: &HashSet<SectorCoord>,
-    system_sector: SectorCoord,
     radius: i32,
-) -> bool {
-    colony_sectors.iter().any(|cs| {
-        (cs.x - system_sector.x).abs() <= radius
-            && (cs.y - system_sector.y).abs() <= radius
-    })
+) -> HashSet<SectorCoord> {
+    let mut nearby = HashSet::with_capacity(
+        colony_sectors
+            .len()
+            .saturating_mul(((radius * 2 + 1) * (radius * 2 + 1)) as usize),
+    );
+    for cs in colony_sectors {
+        for dx in -radius..=radius {
+            for dy in -radius..=radius {
+                nearby.insert(SectorCoord {
+                    x: cs.x + dx,
+                    y: cs.y + dy,
+                });
+            }
+        }
+    }
+    nearby
 }
 
 fn survey_body_info(
@@ -1396,4 +1628,147 @@ fn normalized_atmosphere_profile(
         .iter()
         .map(|a| (a.formula.clone(), a.percent / total))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game_state::{ColonyPolicy, ColonyStage, TaxationPolicy, PLAYER_FACTION_ID};
+    use crate::procedural_galaxy::{GalaxyGenerator, GeneratorConfig, SectorCoord, SystemId};
+
+    fn test_colony(system: SystemId) -> crate::game_state::ColonyState {
+        crate::game_state::ColonyState {
+            id: 1,
+            name: "Test Colony".to_owned(),
+            owner_faction: PLAYER_FACTION_ID.to_owned(),
+            system,
+            body_index: 0,
+            habitable_site: true,
+            earth_like_world: false,
+            system_pos: [0.0, 0.0, 0.0],
+            policy: ColonyPolicy::Balanced,
+            taxation_policy: TaxationPolicy::Standard,
+            stage: ColonyStage::Settlement,
+            population: 220_000.0,
+            stability: 0.65,
+            food_balance: -0.01,
+            industry_balance: -0.01,
+            energy_balance: -0.01,
+            defense_balance: 0.0,
+            stockpile_capacity: 100.0,
+            food_stockpile: 60.0,
+            industry_stockpile: 60.0,
+            energy_stockpile: 60.0,
+            element_stockpiles: [
+                ("Fe".to_owned(), 100.0),
+                ("Si".to_owned(), 85.0),
+                ("Al".to_owned(), 65.0),
+                ("Cu".to_owned(), 50.0),
+                ("Ti".to_owned(), 35.0),
+                ("Ni".to_owned(), 35.0),
+            ]
+            .into_iter()
+            .collect(),
+            atmosphere_stockpiles: HashMap::new(),
+            element_resource_profile: HashMap::new(),
+            atmosphere_resource_profile: HashMap::new(),
+            atmosphere_pressure_atm: 1.0,
+            buildings: Vec::new(),
+            last_tax_revenue_annual: 0,
+            last_upkeep_cost_annual: 0,
+            last_net_revenue_annual: 2_000,
+        }
+    }
+
+    fn test_system(local_index: u32) -> SystemId {
+        SystemId {
+            sector: SectorCoord { x: 0, y: 0 },
+            local_index,
+        }
+    }
+
+    #[test]
+    fn reserve_gate_rejects_low_buffer_build() {
+        let mut colony = test_colony(test_system(1));
+        let preview = GameState::colony_building_cost_preview(ColonyBuildingKind::IndustrialHub, 1);
+        colony.food_stockpile = preview.food + 0.2;
+        colony.industry_stockpile = preview.industry + 0.2;
+        colony.energy_stockpile = preview.energy + 0.2;
+        let result = evaluate_build_candidate(
+            &colony,
+            ColonyBuildingKind::IndustrialHub,
+            ColonyBuildingSite::Planet(0),
+            ColonyBuildingSiteProfile {
+                planet_is_gas_giant: Some(false),
+                planet_habitable: Some(true),
+                planet_building_slot_capacity: Some(6),
+                planet_has_atmosphere: Some(true),
+                star_is_scoopable: Some(true),
+            },
+            5_000_000,
+            false,
+        );
+        assert!(
+            matches!(result, Some(Err(BuildRejectReason::Reserve))),
+            "unexpected candidate result: {result:?}"
+        );
+    }
+
+    #[test]
+    fn stressed_colony_has_higher_need_score() {
+        let mut healthy = test_colony(test_system(2));
+        let mut stressed = test_colony(test_system(3));
+        healthy.food_balance = 0.08;
+        healthy.industry_balance = 0.07;
+        healthy.energy_balance = 0.06;
+        healthy.food_stockpile = 88.0;
+        healthy.industry_stockpile = 82.0;
+        healthy.energy_stockpile = 84.0;
+        stressed.food_balance = -0.18;
+        stressed.industry_balance = -0.14;
+        stressed.energy_balance = -0.16;
+        stressed.food_stockpile = 12.0;
+        stressed.industry_stockpile = 10.0;
+        stressed.energy_stockpile = 11.0;
+        stressed.last_net_revenue_annual = -3_000;
+        assert!(colony_need_score(&stressed) > colony_need_score(&healthy));
+    }
+
+    #[test]
+    fn candidate_sites_include_multiple_planets_when_available() {
+        let generator = GalaxyGenerator::new(GeneratorConfig {
+            galaxy_seed: 42,
+            ..Default::default()
+        });
+        let mut picked: Option<SystemId> = None;
+        'search: for x in -2..=2 {
+            for y in -2..=2 {
+                let coord = SectorCoord { x, y };
+                let systems = generator.generate_sector(coord);
+                for summary in systems {
+                    let detail = generator.generate_system_detail(&summary);
+                    let non_moon_planets = detail
+                        .planets
+                        .iter()
+                        .filter(|p| p.host_planet_index.is_none())
+                        .count();
+                    if non_moon_planets >= 2 {
+                        picked = Some(summary.id);
+                        break 'search;
+                    }
+                }
+            }
+        }
+        let system = picked.expect("expected to find system with multiple planets");
+        let colony = test_colony(system);
+        let candidates = candidate_sites_for_colony(&colony, &generator);
+        let mut unique_planet_sites = candidates
+            .iter()
+            .filter(|(site, _)| matches!(site, ColonyBuildingSite::Planet(_)))
+            .map(|(site, _)| *site)
+            .collect::<Vec<_>>();
+        unique_planet_sites.sort();
+        unique_planet_sites.dedup();
+        assert!(unique_planet_sites.len() >= 2);
+    }
 }

@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::events::GameEvent;
@@ -568,6 +569,26 @@ pub struct MissionState {
     pub expires_year: f32,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AiBuildTelemetry {
+    #[serde(default)]
+    pub intent_recovery: u32,
+    #[serde(default)]
+    pub intent_extraction: u32,
+    #[serde(default)]
+    pub intent_throughput: u32,
+    #[serde(default)]
+    pub intent_growth: u32,
+    #[serde(default)]
+    pub reject_reserve: u32,
+    #[serde(default)]
+    pub reject_substitution_stress: u32,
+    #[serde(default)]
+    pub reject_site_invalid: u32,
+    #[serde(default)]
+    pub avg_reserve_depth: f32,
+}
+
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)]
 pub struct NearestColonyInfo {
@@ -893,6 +914,8 @@ pub struct GameState {
     pub missions: Vec<MissionState>,
     #[serde(default = "GameState::default_next_mission_id")]
     pub next_mission_id: u64,
+    #[serde(default)]
+    pub ai_build_telemetry: AiBuildTelemetry,
     pub explored_systems: HashSet<SystemId>,
     pub colonies: HashMap<u64, ColonyState>,
 }
@@ -1867,6 +1890,7 @@ impl Default for GameState {
             player_reputation: HashMap::new(),
             missions: Vec::new(),
             next_mission_id: Self::default_next_mission_id(),
+            ai_build_telemetry: AiBuildTelemetry::default(),
             explored_systems: HashSet::new(),
             colonies: HashMap::new(),
         }
@@ -3697,21 +3721,35 @@ impl GameState {
             }
         }
 
+        let mut colony_metric_input = self.colonies.values().collect::<Vec<_>>();
+        colony_metric_input.sort_by_key(|colony| colony.id);
+        let colony_metric_rows: Vec<(SystemId, String, f32, f32, f32, f32)> = colony_metric_input
+            .par_iter()
+            .map(|colony| {
+                let supply = colony.food_balance + colony.industry_balance + colony.energy_balance;
+                let stress = (-supply).max(0.0);
+                let trade_potential =
+                    (supply.max(0.0) + colony.last_tax_revenue_annual as f32 / 35_000.0).max(0.0);
+                (
+                    colony.system,
+                    colony.owner_faction.clone(),
+                    colony.population as f32 / 1_000_000.0 + colony.stability * 2.2,
+                    stress,
+                    trade_potential,
+                    (1.0 - colony.stability).max(0.0),
+                )
+            })
+            .collect();
         let mut metrics_by_system: HashMap<SystemId, (HashMap<String, f32>, f32, f32, f32)> =
             HashMap::new();
-        for colony in self.colonies.values() {
-            let supply = colony.food_balance + colony.industry_balance + colony.energy_balance;
-            let stress = (-supply).max(0.0);
-            let trade_potential =
-                (supply.max(0.0) + colony.last_tax_revenue_annual as f32 / 35_000.0).max(0.0);
+        for (system_id, owner_faction, influence, stress, trade_potential, unrest) in colony_metric_rows {
             let entry = metrics_by_system
-                .entry(colony.system)
+                .entry(system_id)
                 .or_insert_with(|| (HashMap::new(), 0.0, 0.0, 0.0));
-            *entry.0.entry(colony.owner_faction.clone()).or_insert(0.0) +=
-                colony.population as f32 / 1_000_000.0 + colony.stability * 2.2;
+            *entry.0.entry(owner_faction).or_insert(0.0) += influence;
             entry.1 += stress;
             entry.2 += trade_potential;
-            entry.3 += (1.0 - colony.stability).max(0.0);
+            entry.3 += unrest;
         }
         let current_year = self.current_year;
         const MAX_RELATION_EVENTS_PER_TICK: usize = 8;

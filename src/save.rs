@@ -1,6 +1,8 @@
 use std::fs;
 use std::io;
+use std::io::BufWriter;
 use std::path::Path;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,6 +25,14 @@ struct GameSaveFile {
     version: u32,
     state: GameState,
     events: Vec<GameEvent>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SaveWriteTelemetry {
+    pub serialize_ms: f32,
+    pub write_ms: f32,
+    pub total_ms: f32,
+    pub bytes_written: usize,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -355,11 +365,11 @@ pub fn save_game_save(
     fs::write(path, json)
 }
 
-pub fn save_game_save_compact(
+pub fn save_game_save_compact_owned(
     path: impl AsRef<Path>,
-    state: &GameState,
-    events: &[GameEvent],
-) -> io::Result<()> {
+    state: GameState,
+    events: Vec<GameEvent>,
+) -> io::Result<SaveWriteTelemetry> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -367,18 +377,36 @@ pub fn save_game_save_compact(
 
     let file = GameSaveFile {
         version: CURRENT_SAVE_VERSION,
-        state: state.clone(),
-        events: events.to_vec(),
+        state,
+        events,
     };
 
-    let json = serde_json::to_string(&file).map_err(|err| {
+    let total_started = Instant::now();
+    let file_handle = fs::File::create(path)?;
+    let mut writer = BufWriter::new(file_handle);
+    let serialize_started = Instant::now();
+    serde_json::to_writer(&mut writer, &file).map_err(|err| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("failed to serialize compact game save JSON: {err}"),
         )
     })?;
-
-    fs::write(path, json)
+    let serialize_ms = serialize_started.elapsed().as_secs_f64() as f32 * 1000.0;
+    let write_started = Instant::now();
+    use std::io::Write;
+    writer.flush()?;
+    let write_ms = write_started.elapsed().as_secs_f64() as f32 * 1000.0;
+    let bytes_written = writer
+        .get_ref()
+        .metadata()
+        .map(|meta| meta.len() as usize)
+        .unwrap_or(0);
+    Ok(SaveWriteTelemetry {
+        serialize_ms,
+        write_ms,
+        total_ms: total_started.elapsed().as_secs_f64() as f32 * 1000.0,
+        bytes_written,
+    })
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 use eframe::egui;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::f32::consts::PI;
 use std::fs;
 use std::sync::{mpsc, Arc, Mutex};
@@ -44,6 +44,8 @@ const STAR_DRAW_RADIUS_PX: f32 = 1.5;
 const GAME_SAVE_PATH: &str = "galaxy_game_state.json";
 const DELTA_SAVE_PATH: &str = "galaxy_deltas.json";
 const MAX_SAVED_GAME_EVENTS: usize = 10_000;
+const SIM_SNAPSHOT_MIN_INTERVAL_MS: u64 = 120;
+const MAX_PENDING_SIM_TICKS: u32 = 240;
 const AI_CLUSTER_RADIUS_MIN: f32 = 1_200.0;
 const AI_CLUSTER_RADIUS_MAX: f32 = 18_000.0;
 
@@ -285,11 +287,76 @@ struct VisibleBuildResult {
 enum SimCommand {
     Advance { ticks: u32, tick_years: f32 },
     CompleteMission { mission_id: u64 },
+    UpdateThreadBudget { threads: usize },
 }
 
 struct SimSnapshot {
+    state: Option<GameState>,
+    events: Option<VecDeque<GameEvent>>,
+    ai_home_positions: Vec<(String, [f32; 3])>,
+    clone_ms: f32,
+    trim_ms: f32,
+    emitted_full_snapshot: bool,
+    stage_a_ms: f32,
+    stage_b_ms: f32,
+    stage_c_ms: f32,
+    events_generated: usize,
+    worker_threads: usize,
+    command_total_ms: f32,
+}
+
+struct SaveWorkerPayload {
     state: GameState,
     events: Vec<GameEvent>,
+}
+
+struct SaveWorkerResult {
+    telemetry: save::SaveWriteTelemetry,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SimCpuMode {
+    Adaptive,
+    Manual,
+}
+
+impl SimCpuMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Adaptive => "Adaptive",
+            Self::Manual => "Manual",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PerfTelemetry {
+    save_clone_ms_last: f32,
+    save_clone_ms_smooth: f32,
+    save_serialize_ms_last: f32,
+    save_serialize_ms_smooth: f32,
+    save_write_ms_last: f32,
+    save_write_ms_smooth: f32,
+    save_total_ms_last: f32,
+    save_total_ms_smooth: f32,
+    save_bytes_last: usize,
+    event_trim_ms_last: f32,
+    event_trim_ms_smooth: f32,
+    sim_snapshot_clone_ms_last: f32,
+    sim_snapshot_clone_ms_smooth: f32,
+    sim_event_trim_ms_last: f32,
+    sim_event_trim_ms_smooth: f32,
+    sim_stage_a_ms_last: f32,
+    sim_stage_a_ms_smooth: f32,
+    sim_stage_b_ms_last: f32,
+    sim_stage_b_ms_smooth: f32,
+    sim_stage_c_ms_last: f32,
+    sim_stage_c_ms_smooth: f32,
+    sim_events_generated_last: usize,
+    sim_events_generated_smooth: f32,
+    sim_worker_threads_last: usize,
+    sim_command_total_ms_last: f32,
+    sim_command_total_ms_smooth: f32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -379,8 +446,8 @@ pub struct GalaxyApp {
     render_budget: usize,
     request_tx: mpsc::Sender<SectorCoord>,
     result_rx: mpsc::Receiver<(SectorCoord, Vec<SolarSystem>)>,
-    save_request_tx: mpsc::Sender<(GameState, Vec<GameEvent>)>,
-    save_result_rx: mpsc::Receiver<Result<(), String>>,
+    save_request_tx: mpsc::Sender<SaveWorkerPayload>,
+    save_result_rx: mpsc::Receiver<Result<SaveWorkerResult, String>>,
     sim_command_tx: mpsc::Sender<SimCommand>,
     sim_result_rx: mpsc::Receiver<SimSnapshot>,
     sim_inflight: bool,
@@ -415,7 +482,7 @@ pub struct GalaxyApp {
     selected_system: Option<SystemDetail>,
     delta_store: DeltaStore,
     game_state: GameState,
-    game_events: Vec<GameEvent>,
+    game_events: VecDeque<GameEvent>,
     game_paused: bool,
     pending_sim_ticks: u32,
     strategic_clock: StrategicClock,
@@ -434,6 +501,8 @@ pub struct GalaxyApp {
     settings_seed_input: String,
     settings_render_budget: usize,
     settings_ai_cluster_radius_world: f32,
+    settings_sim_cpu_mode: SimCpuMode,
+    settings_max_sim_threads: usize,
     lod_preset: LodPreset,
     settings_lod_preset: LodPreset,
     lod_chunk_point_min_budget: usize,
@@ -450,6 +519,8 @@ pub struct GalaxyApp {
     galactic_situation_open: bool,
     mission_board_open: bool,
     favorites_window_open: bool,
+    debug_show_ai_home_positions: bool,
+    ai_home_positions: Vec<(String, [f32; 3])>,
     travel_system: Option<SystemDetail>,
     travel_window_open: bool,
     travel_paused: bool,
@@ -466,6 +537,14 @@ pub struct GalaxyApp {
     music_player: music::MusicPlayer,
     music_window_open: bool,
     ai_home_spawn_config: ai_factions::AiHomeSpawnConfig,
+    perf_telemetry: PerfTelemetry,
+    sim_cpu_mode: SimCpuMode,
+    max_sim_threads: usize,
+    sim_dispatch_cap: u32,
+    autotune_counter: u32,
+    adaptive_rebuild_interval_ms: f64,
+    last_sent_sim_thread_budget: usize,
+    sim_spike_cooldown_commands: u32,
 }
 
 impl Default for GalaxyApp {
@@ -488,7 +567,7 @@ impl Default for GalaxyApp {
         let (save_request_tx, save_result_rx) = GalaxyApp::spawn_save_worker();
         let (visible_build_request_tx, visible_build_result_rx) =
             GalaxyApp::spawn_visible_build_worker();
-        let (mut game_state, mut game_events, game_save_error) =
+        let (mut game_state, game_events, game_save_error) =
             match save::load_game_save(GAME_SAVE_PATH) {
                 Ok((state, events)) => (state, events, None),
                 Err(err) => (
@@ -529,14 +608,17 @@ impl Default for GalaxyApp {
                 game_state.player.home_system = Some(*new_id);
             }
         }
+        let mut game_events = VecDeque::from(game_events);
         Self::trim_game_event_history(&mut game_events);
         let has_save_file = std::path::Path::new(GAME_SAVE_PATH).exists();
         let ai_home_spawn_config = ai_factions::AiHomeSpawnConfig::default();
+        let max_sim_threads = Self::worker_thread_count();
         let (sim_command_tx, sim_result_rx) = GalaxyApp::spawn_sim_worker(
             Arc::clone(&procedural_generator),
             game_state.clone(),
             game_events.clone(),
             ai_home_spawn_config,
+            max_sim_threads,
         );
         Self {
             phase: AppPhase::MainMenu,
@@ -610,6 +692,8 @@ impl Default for GalaxyApp {
             settings_seed_input: galaxy_seed.to_string(),
             settings_render_budget: lod_profile.render_budget,
             settings_ai_cluster_radius_world: ai_home_spawn_config.cluster_radius_world,
+            settings_sim_cpu_mode: SimCpuMode::Adaptive,
+            settings_max_sim_threads: max_sim_threads,
             lod_preset,
             settings_lod_preset: lod_preset,
             lod_chunk_point_min_budget: lod_profile.chunk_point_min_budget,
@@ -626,6 +710,8 @@ impl Default for GalaxyApp {
             galactic_situation_open: false,
             mission_board_open: false,
             favorites_window_open: false,
+            debug_show_ai_home_positions: false,
+            ai_home_positions: Vec::new(),
             travel_system: None,
             travel_window_open: false,
             travel_paused: false,
@@ -642,6 +728,14 @@ impl Default for GalaxyApp {
             music_player: music::MusicPlayer::new(),
             music_window_open: false,
             ai_home_spawn_config,
+            perf_telemetry: PerfTelemetry::default(),
+            sim_cpu_mode: SimCpuMode::Adaptive,
+            max_sim_threads,
+            sim_dispatch_cap: 24,
+            autotune_counter: 0,
+            adaptive_rebuild_interval_ms: MIN_REBUILD_INTERVAL_MS,
+            last_sent_sim_thread_budget: max_sim_threads,
+            sim_spike_cooldown_commands: 0,
         }
     }
 }
@@ -654,12 +748,14 @@ impl GalaxyApp {
         }
     }
 
-    fn trim_game_event_history(events: &mut Vec<GameEvent>) {
+    fn trim_game_event_history(events: &mut VecDeque<GameEvent>) {
         if events.len() <= MAX_SAVED_GAME_EVENTS {
             return;
         }
         let overflow = events.len() - MAX_SAVED_GAME_EVENTS;
-        events.drain(0..overflow);
+        for _ in 0..overflow {
+            let _ = events.pop_front();
+        }
     }
 
     fn trim_game_events(&mut self) {
@@ -964,6 +1060,7 @@ impl GalaxyApp {
 
         let mut open = self.settings_window_open;
         let mut apply_render_budget = false;
+        let mut apply_sim_budget = false;
         let mut apply_lod_preset = false;
         let mut restart_seed = None;
         let mut seed_restart_requested = false;
@@ -1007,6 +1104,30 @@ impl GalaxyApp {
                 if ui.button("Apply render budget").clicked() {
                     apply_render_budget = true;
                 }
+                ui.separator();
+                ui.heading("Simulation CPU");
+                egui::ComboBox::from_id_source("settings_sim_cpu_mode")
+                    .selected_text(self.settings_sim_cpu_mode.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.settings_sim_cpu_mode,
+                            SimCpuMode::Adaptive,
+                            SimCpuMode::Adaptive.label(),
+                        );
+                        ui.selectable_value(
+                            &mut self.settings_sim_cpu_mode,
+                            SimCpuMode::Manual,
+                            SimCpuMode::Manual.label(),
+                        );
+                    });
+                let max_hw_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+                ui.add(
+                    egui::Slider::new(&mut self.settings_max_sim_threads, 1..=max_hw_threads.max(1))
+                        .text("Max sim threads"),
+                );
+                if ui.button("Apply simulation threading").clicked() {
+                    apply_sim_budget = true;
+                }
 
                 ui.separator();
                 ui.heading("Galaxy");
@@ -1045,6 +1166,16 @@ impl GalaxyApp {
                 "Render budget set to {} (preset: {}).",
                 self.render_budget,
                 self.lod_preset.label(),
+            ));
+        }
+        if apply_sim_budget {
+            self.sim_cpu_mode = self.settings_sim_cpu_mode;
+            self.max_sim_threads = self.settings_max_sim_threads.max(1);
+            self.apply_sim_thread_budget(self.max_sim_threads);
+            self.game_notice = Some(format!(
+                "Simulation threading set: mode {} / max {} threads.",
+                self.sim_cpu_mode.label(),
+                self.max_sim_threads,
             ));
         }
 
@@ -1219,6 +1350,17 @@ impl GalaxyApp {
             .default_size([620.0, 460.0])
             .show(ctx, |ui| {
                 ui.label("Live systems under pressure. Higher pressure means more opportunities and risks.");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Faction marker legend:").strong());
+                    let mut factions: Vec<(&String, &crate::game_state::FactionState)> =
+                        self.game_state.factions.iter().collect();
+                    factions.sort_by(|a, b| a.1.display_name.cmp(&b.1.display_name));
+                    for (faction_id, faction) in factions {
+                        let color = Self::faction_marker_color(faction_id);
+                        ui.colored_label(color, "■");
+                        ui.label(faction.display_name.as_str());
+                    }
+                });
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     egui::Grid::new("galactic_hotspots_grid")
@@ -1261,7 +1403,18 @@ impl GalaxyApp {
                                         "Sanction".to_owned()
                                     } else {
                                         let relation = self.game_state.relation_between(&top_faction, &second_faction);
-                                        format!("Rel {relation}")
+                                        let stance = if relation >= 60 {
+                                            "Strong allies"
+                                        } else if relation >= 25 {
+                                            "Cooperative"
+                                        } else if relation >= -15 {
+                                            "Neutral"
+                                        } else if relation >= -45 {
+                                            "Tense"
+                                        } else {
+                                            "Hostile"
+                                        };
+                                        format!("{stance} ({relation:+})")
                                     }
                                 } else {
                                     "-".to_owned()
@@ -1342,15 +1495,31 @@ impl GalaxyApp {
     }
 
     fn persist_game_state(&mut self) {
+        let trim_started = Instant::now();
         self.trim_game_events();
+        self.perf_telemetry.event_trim_ms_last = trim_started.elapsed().as_secs_f64() as f32 * 1000.0;
+        self.perf_telemetry.event_trim_ms_smooth = Self::smooth_ms(
+            self.perf_telemetry.event_trim_ms_smooth,
+            self.perf_telemetry.event_trim_ms_last,
+        );
         if self.save_inflight {
             return;
         }
+        let clone_started = Instant::now();
         let snapshot_state = self.game_state.clone();
-        let snapshot_events = self.game_events.clone();
+        let snapshot_events: Vec<GameEvent> = self.game_events.iter().cloned().collect();
+        self.perf_telemetry.save_clone_ms_last =
+            clone_started.elapsed().as_secs_f64() as f32 * 1000.0;
+        self.perf_telemetry.save_clone_ms_smooth = Self::smooth_ms(
+            self.perf_telemetry.save_clone_ms_smooth,
+            self.perf_telemetry.save_clone_ms_last,
+        );
         if self
             .save_request_tx
-            .send((snapshot_state, snapshot_events))
+            .send(SaveWorkerPayload {
+                state: snapshot_state,
+                events: snapshot_events,
+            })
             .is_ok()
         {
             self.save_inflight = true;
@@ -1361,7 +1530,23 @@ impl GalaxyApp {
         while let Ok(result) = self.save_result_rx.try_recv() {
             self.save_inflight = false;
             match result {
-                Ok(()) => {
+                Ok(worker_result) => {
+                    self.perf_telemetry.save_serialize_ms_last = worker_result.telemetry.serialize_ms;
+                    self.perf_telemetry.save_serialize_ms_smooth = Self::smooth_ms(
+                        self.perf_telemetry.save_serialize_ms_smooth,
+                        self.perf_telemetry.save_serialize_ms_last,
+                    );
+                    self.perf_telemetry.save_write_ms_last = worker_result.telemetry.write_ms;
+                    self.perf_telemetry.save_write_ms_smooth = Self::smooth_ms(
+                        self.perf_telemetry.save_write_ms_smooth,
+                        self.perf_telemetry.save_write_ms_last,
+                    );
+                    self.perf_telemetry.save_total_ms_last = worker_result.telemetry.total_ms;
+                    self.perf_telemetry.save_total_ms_smooth = Self::smooth_ms(
+                        self.perf_telemetry.save_total_ms_smooth,
+                        self.perf_telemetry.save_total_ms_last,
+                    );
+                    self.perf_telemetry.save_bytes_last = worker_result.telemetry.bytes_written;
                     self.game_save_error = None;
                 }
                 Err(err) => {
@@ -1374,13 +1559,67 @@ impl GalaxyApp {
     fn poll_sim_results(&mut self) {
         let mut latest = None;
         while let Ok(snapshot) = self.sim_result_rx.try_recv() {
+            self.perf_telemetry.sim_snapshot_clone_ms_last = snapshot.clone_ms;
+            self.perf_telemetry.sim_snapshot_clone_ms_smooth = Self::smooth_ms(
+                self.perf_telemetry.sim_snapshot_clone_ms_smooth,
+                self.perf_telemetry.sim_snapshot_clone_ms_last,
+            );
+            self.perf_telemetry.sim_event_trim_ms_last = snapshot.trim_ms;
+            self.perf_telemetry.sim_event_trim_ms_smooth = Self::smooth_ms(
+                self.perf_telemetry.sim_event_trim_ms_smooth,
+                self.perf_telemetry.sim_event_trim_ms_last,
+            );
+            self.perf_telemetry.sim_stage_a_ms_last = snapshot.stage_a_ms;
+            self.perf_telemetry.sim_stage_a_ms_smooth = Self::smooth_ms(
+                self.perf_telemetry.sim_stage_a_ms_smooth,
+                self.perf_telemetry.sim_stage_a_ms_last,
+            );
+            self.perf_telemetry.sim_stage_b_ms_last = snapshot.stage_b_ms;
+            self.perf_telemetry.sim_stage_b_ms_smooth = Self::smooth_ms(
+                self.perf_telemetry.sim_stage_b_ms_smooth,
+                self.perf_telemetry.sim_stage_b_ms_last,
+            );
+            self.perf_telemetry.sim_stage_c_ms_last = snapshot.stage_c_ms;
+            self.perf_telemetry.sim_stage_c_ms_smooth = Self::smooth_ms(
+                self.perf_telemetry.sim_stage_c_ms_smooth,
+                self.perf_telemetry.sim_stage_c_ms_last,
+            );
+            self.perf_telemetry.sim_events_generated_last = snapshot.events_generated;
+            self.perf_telemetry.sim_events_generated_smooth = if self.perf_telemetry.sim_events_generated_smooth <= 0.0 {
+                snapshot.events_generated as f32
+            } else {
+                self.perf_telemetry.sim_events_generated_smooth * 0.85
+                    + snapshot.events_generated as f32 * 0.15
+            };
+            self.perf_telemetry.sim_worker_threads_last = snapshot.worker_threads;
+            self.perf_telemetry.sim_command_total_ms_last = snapshot.command_total_ms;
+            self.perf_telemetry.sim_command_total_ms_smooth = Self::smooth_ms(
+                self.perf_telemetry.sim_command_total_ms_smooth,
+                self.perf_telemetry.sim_command_total_ms_last,
+            );
+            if snapshot.command_total_ms > 2500.0 {
+                self.sim_spike_cooldown_commands = self.sim_spike_cooldown_commands.max(64);
+            } else if snapshot.command_total_ms > 1000.0 {
+                self.sim_spike_cooldown_commands = self.sim_spike_cooldown_commands.max(40);
+            } else if snapshot.command_total_ms > 400.0 {
+                self.sim_spike_cooldown_commands = self.sim_spike_cooldown_commands.max(24);
+            } else if snapshot.command_total_ms > 150.0 {
+                self.sim_spike_cooldown_commands = self.sim_spike_cooldown_commands.max(12);
+            }
             latest = Some(snapshot);
             self.sim_inflight = false;
         }
         if let Some(snapshot) = latest {
-            self.game_state = snapshot.state;
-            self.game_events = snapshot.events;
-            self.ui_cache_dirty = true;
+            if let Some(state) = snapshot.state {
+                self.game_state = state;
+                self.ui_cache_dirty = true;
+            }
+            if let Some(events) = snapshot.events {
+                self.game_events = events;
+            }
+            if snapshot.emitted_full_snapshot {
+                self.ai_home_positions = snapshot.ai_home_positions;
+            }
         }
     }
 
@@ -1390,6 +1629,7 @@ impl GalaxyApp {
             self.game_state.clone(),
             self.game_events.clone(),
             self.ai_home_spawn_config,
+            self.max_sim_threads,
         );
         self.sim_command_tx = sim_command_tx;
         self.sim_result_rx = sim_result_rx;
@@ -1922,6 +2162,56 @@ impl GalaxyApp {
         }
     }
 
+    fn apply_sim_thread_budget(&mut self, threads: usize) {
+        let clamped = threads.max(1);
+        if self.last_sent_sim_thread_budget == clamped {
+            return;
+        }
+        self.last_sent_sim_thread_budget = clamped;
+        let _ = self
+            .sim_command_tx
+            .send(SimCommand::UpdateThreadBudget { threads: clamped });
+    }
+
+    fn autotune_runtime(&mut self, ctx: &egui::Context, gpu_total_ms: Option<f32>) {
+        self.autotune_counter = self.autotune_counter.wrapping_add(1);
+        if self.autotune_counter % 30 != 0 {
+            return;
+        }
+        let frame_ms = ctx.input(|i| i.stable_dt) * 1000.0;
+        if self.sim_cpu_mode == SimCpuMode::Adaptive {
+            let hw_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(2).max(1);
+            let mut target = hw_threads.saturating_sub(1).max(1);
+            if frame_ms > 23.0 {
+                target = target.saturating_sub(1).max(1);
+            } else if frame_ms < 15.0 {
+                target = target.saturating_add(1).min(hw_threads);
+            }
+            target = target.min(self.max_sim_threads.max(1));
+            self.apply_sim_thread_budget(target);
+            self.perf_telemetry.sim_worker_threads_last = target;
+        }
+        if let Some(gpu_ms) = gpu_total_ms {
+            if gpu_ms > 19.0 {
+                self.sim_dispatch_cap = self.sim_dispatch_cap.saturating_sub(1).max(6);
+                self.adaptive_rebuild_interval_ms =
+                    (self.adaptive_rebuild_interval_ms + 6.0).clamp(MIN_REBUILD_INTERVAL_MS, 140.0);
+            } else if gpu_ms < 11.0 {
+                self.sim_dispatch_cap = (self.sim_dispatch_cap + 1).min(20);
+                self.adaptive_rebuild_interval_ms =
+                    (self.adaptive_rebuild_interval_ms - 4.0).clamp(MIN_REBUILD_INTERVAL_MS, 140.0);
+            }
+        }
+        let sim_cmd_ms = self.perf_telemetry.sim_command_total_ms_smooth;
+        if sim_cmd_ms > 140.0 {
+            self.sim_dispatch_cap = self.sim_dispatch_cap.saturating_sub(3).max(2);
+        } else if sim_cmd_ms > 80.0 {
+            self.sim_dispatch_cap = self.sim_dispatch_cap.saturating_sub(1).max(2);
+        } else if sim_cmd_ms < 18.0 {
+            self.sim_dispatch_cap = (self.sim_dispatch_cap + 1).min(20);
+        }
+    }
+
     fn luminosity_visual_radius_multiplier(class: LuminosityClass) -> f32 {
         class.visual_radius_multiplier()
     }
@@ -2068,6 +2358,27 @@ impl GalaxyApp {
 
         let normalized = ((pressure_atm + 0.05).ln() / 5.2).clamp(0.0, 1.0);
         0.10 + normalized * 0.52
+    }
+
+    fn faction_marker_color(faction_id: &str) -> egui::Color32 {
+        const PALETTE: [egui::Color32; 10] = [
+            egui::Color32::from_rgb(226, 160, 82),
+            egui::Color32::from_rgb(96, 196, 255),
+            egui::Color32::from_rgb(170, 220, 120),
+            egui::Color32::from_rgb(255, 132, 160),
+            egui::Color32::from_rgb(196, 150, 255),
+            egui::Color32::from_rgb(255, 210, 110),
+            egui::Color32::from_rgb(120, 230, 200),
+            egui::Color32::from_rgb(255, 168, 112),
+            egui::Color32::from_rgb(140, 176, 255),
+            egui::Color32::from_rgb(245, 145, 235),
+        ];
+        let mut hash: u64 = 1469598103934665603;
+        for &byte in faction_id.as_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(1099511628211);
+        }
+        PALETTE[(hash as usize) % PALETTE.len()]
     }
 
     fn stable_orbit_phase(&self, system: &SystemDetail, body_index: usize) -> f32 {
@@ -3107,15 +3418,20 @@ impl GalaxyApp {
 
     fn spawn_save_worker(
     ) -> (
-        mpsc::Sender<(GameState, Vec<GameEvent>)>,
-        mpsc::Receiver<Result<(), String>>,
+        mpsc::Sender<SaveWorkerPayload>,
+        mpsc::Receiver<Result<SaveWorkerResult, String>>,
     ) {
-        let (request_tx, request_rx) = mpsc::channel::<(GameState, Vec<GameEvent>)>();
-        let (result_tx, result_rx) = mpsc::channel::<Result<(), String>>();
+        let (request_tx, request_rx) = mpsc::channel::<SaveWorkerPayload>();
+        let (result_tx, result_rx) = mpsc::channel::<Result<SaveWorkerResult, String>>();
         thread::spawn(move || {
-            while let Ok((state, events)) = request_rx.recv() {
-                let result = save::save_game_save_compact(GAME_SAVE_PATH, &state, &events)
-                    .map_err(|err| err.to_string());
+            while let Ok(payload) = request_rx.recv() {
+                let result = save::save_game_save_compact_owned(
+                    GAME_SAVE_PATH,
+                    payload.state,
+                    payload.events,
+                )
+                .map(|telemetry| SaveWorkerResult { telemetry })
+                .map_err(|err| err.to_string());
                 let _ = result_tx.send(result);
             }
         });
@@ -3125,42 +3441,119 @@ impl GalaxyApp {
     fn spawn_sim_worker(
         generator: Arc<GalaxyGenerator>,
         mut state: GameState,
-        mut events: Vec<GameEvent>,
+        mut events: VecDeque<GameEvent>,
         spawn_config: ai_factions::AiHomeSpawnConfig,
+        initial_threads: usize,
     ) -> (mpsc::Sender<SimCommand>, mpsc::Receiver<SimSnapshot>) {
         let (command_tx, command_rx) = mpsc::channel::<SimCommand>();
         let (result_tx, result_rx) = mpsc::channel::<SimSnapshot>();
         thread::spawn(move || {
             let mut ai_controller =
                 ai_factions::AiFactionController::new_with_spawn_config(&generator, spawn_config);
+            let mut last_full_snapshot_at = Instant::now()
+                - Duration::from_millis(SIM_SNAPSHOT_MIN_INTERVAL_MS);
+            let mut worker_threads = initial_threads.max(1);
             while let Ok(command) = command_rx.recv() {
+                let command_started = Instant::now();
+                if let SimCommand::UpdateThreadBudget { threads } = &command {
+                    worker_threads = (*threads).max(1);
+                    let _ = result_tx.send(SimSnapshot {
+                        state: None,
+                        events: None,
+                        ai_home_positions: Vec::new(),
+                        clone_ms: 0.0,
+                        trim_ms: 0.0,
+                        emitted_full_snapshot: false,
+                        stage_a_ms: 0.0,
+                        stage_b_ms: 0.0,
+                        stage_c_ms: 0.0,
+                        events_generated: 0,
+                        worker_threads,
+                        command_total_ms: 0.0,
+                    });
+                    continue;
+                }
+                let mut stage_a_ms = 0.0;
+                let mut stage_b_ms = 0.0;
+                let mut stage_c_ms = 0.0;
+                let mut events_generated = 0usize;
                 match command {
                     SimCommand::Advance { ticks, tick_years } => {
-                        for _ in 0..ticks {
-                            let generated_events = state.advance_strategic_tick(tick_years);
-                            for event in generated_events {
-                                state.apply_event(&event);
-                                events.push(event);
+                        let mut stage_a_total = 0.0f32;
+                        let mut stage_c_total = 0.0f32;
+                        let mut run_batch = || {
+                            for _ in 0..ticks {
+                                let stage_a_started = Instant::now();
+                                let generated_events = state.advance_strategic_tick(tick_years);
+                                let ai_events = ai_controller.tick(&mut state, &generator);
+                                stage_a_total +=
+                                    stage_a_started.elapsed().as_secs_f64() as f32 * 1000.0;
+                                events_generated += generated_events.len() + ai_events.len();
+
+                                let stage_c_started = Instant::now();
+                                for event in generated_events {
+                                    state.apply_event(&event);
+                                    events.push_back(event);
+                                }
+                                for event in ai_events {
+                                    state.apply_event(&event);
+                                    events.push_back(event);
+                                }
+                                stage_c_total +=
+                                    stage_c_started.elapsed().as_secs_f64() as f32 * 1000.0;
                             }
-                            let ai_events = ai_controller.tick(&mut state, &generator);
-                            for event in ai_events {
-                                state.apply_event(&event);
-                                events.push(event);
-                            }
-                        }
+                        };
+                        run_batch();
+                        stage_a_ms = stage_a_total;
+                        stage_b_ms = 0.0;
+                        stage_c_ms = stage_c_total;
                     }
                     SimCommand::CompleteMission { mission_id } => {
+                        let stage_c_started = Instant::now();
                         let _ = state.complete_mission(mission_id);
+                        stage_c_ms = stage_c_started.elapsed().as_secs_f64() as f32 * 1000.0;
                     }
+                    SimCommand::UpdateThreadBudget { .. } => {}
                 }
+                let trim_started = Instant::now();
                 if events.len() > MAX_SAVED_GAME_EVENTS {
                     let overflow = events.len() - MAX_SAVED_GAME_EVENTS;
-                    events.drain(0..overflow);
+                    for _ in 0..overflow {
+                        let _ = events.pop_front();
+                    }
                 }
+                let trim_ms = trim_started.elapsed().as_secs_f64() as f32 * 1000.0;
+                let now = Instant::now();
+                let emit_full_snapshot = now.duration_since(last_full_snapshot_at)
+                    >= Duration::from_millis(SIM_SNAPSHOT_MIN_INTERVAL_MS)
+                    || matches!(command, SimCommand::CompleteMission { .. });
+                let mut clone_ms = 0.0;
+                let (snapshot_state, snapshot_events, snapshot_home_positions) = if emit_full_snapshot {
+                    let clone_started = Instant::now();
+                    let s = state.clone();
+                    let e = events.clone();
+                    let homes = ai_controller.debug_home_positions();
+                    clone_ms = clone_started.elapsed().as_secs_f64() as f32 * 1000.0;
+                    last_full_snapshot_at = now;
+                    (Some(s), Some(e), homes)
+                } else {
+                    (None, None, Vec::new())
+                };
+                let command_total_ms = (command_started.elapsed().as_secs_f64() as f32) * 1000.0;
                 if result_tx
                     .send(SimSnapshot {
-                        state: state.clone(),
-                        events: events.clone(),
+                        state: snapshot_state,
+                        events: snapshot_events,
+                        ai_home_positions: snapshot_home_positions,
+                        clone_ms,
+                        trim_ms,
+                        emitted_full_snapshot: emit_full_snapshot,
+                        stage_a_ms,
+                        stage_b_ms,
+                        stage_c_ms,
+                        events_generated,
+                        worker_threads,
+                        command_total_ms,
                     })
                     .is_err()
                 {
@@ -3766,7 +4159,8 @@ impl GalaxyApp {
                 self.galaxy_seed,
             );
 
-            let rebuild_throttled = now_ms - self.last_visible_rebuild_request_ms < MIN_REBUILD_INTERVAL_MS;
+            let rebuild_throttled =
+                now_ms - self.last_visible_rebuild_request_ms < self.adaptive_rebuild_interval_ms;
             if (!self.visible_build_inflight
                 || self.visible_build_requested_signature != desired_signature
             ) && !rebuild_throttled
@@ -3965,14 +4359,36 @@ impl GalaxyApp {
     fn update_game(&mut self, ctx: &egui::Context) {
         self.poll_save_results();
         self.poll_sim_results();
+        let gpu_timing_snapshot = gpu_stars::latest_timing_snapshot();
+        self.autotune_runtime(ctx, gpu_timing_snapshot.total_ms);
         let sim_advance = self
             .strategic_clock
             .advance(ctx.input(|i| i.time), self.game_paused);
         self.pending_sim_ticks = self
             .pending_sim_ticks
             .saturating_add(sim_advance.ticks);
+        if self.pending_sim_ticks > MAX_PENDING_SIM_TICKS {
+            self.pending_sim_ticks = MAX_PENDING_SIM_TICKS;
+        }
         if self.pending_sim_ticks > 0 && !self.sim_inflight {
-            let dispatch_ticks = self.pending_sim_ticks.min(24);
+            let mut effective_dispatch_cap = self.sim_dispatch_cap.max(1);
+            let last_command_ms = self.perf_telemetry.sim_command_total_ms_last;
+            if last_command_ms > 1200.0 {
+                effective_dispatch_cap = effective_dispatch_cap.min(1);
+            } else if last_command_ms > 400.0 {
+                effective_dispatch_cap = effective_dispatch_cap.min(2);
+            } else if last_command_ms > 120.0 {
+                effective_dispatch_cap = effective_dispatch_cap.min(4);
+            }
+            if self.sim_spike_cooldown_commands > 0 {
+                effective_dispatch_cap = effective_dispatch_cap.min(2);
+            }
+            if self.pending_sim_ticks >= MAX_PENDING_SIM_TICKS.saturating_sub(1) {
+                effective_dispatch_cap = effective_dispatch_cap.min(4);
+            } else if self.pending_sim_ticks >= 200 {
+                effective_dispatch_cap = effective_dispatch_cap.min(8);
+            }
+            let dispatch_ticks = self.pending_sim_ticks.min(effective_dispatch_cap);
             if self
                 .sim_command_tx
                 .send(SimCommand::Advance {
@@ -3982,6 +4398,10 @@ impl GalaxyApp {
                 .is_ok()
             {
                 self.pending_sim_ticks = self.pending_sim_ticks.saturating_sub(dispatch_ticks);
+                if self.sim_spike_cooldown_commands > 0 {
+                    self.sim_spike_cooldown_commands =
+                        self.sim_spike_cooldown_commands.saturating_sub(1);
+                }
                 self.sim_inflight = true;
                 self.game_autosave_accum_years += sim_advance.tick_years * dispatch_ticks as f32;
                 if self.game_autosave_accum_years >= 1.5 {
@@ -4051,6 +4471,8 @@ impl GalaxyApp {
                     self.settings_render_budget = self.render_budget;
                     self.settings_ai_cluster_radius_world = self.ai_home_spawn_config.cluster_radius_world;
                     self.settings_lod_preset = self.lod_preset;
+                    self.settings_sim_cpu_mode = self.sim_cpu_mode;
+                    self.settings_max_sim_threads = self.max_sim_threads;
                 }
                 if ui
                     .button(if self.music_window_open {
@@ -4259,11 +4681,57 @@ impl GalaxyApp {
                         active_ops_recent,
                     ));
                     ui.label(format!(
-                        "AI intent categories (proxy): economy-recovery {} | stability {} | resource-balance {}",
+                        "AI build intents: recovery {} | extraction {} | throughput {} | growth {} | avg reserve depth {:.2}",
+                        self.game_state.ai_build_telemetry.intent_recovery,
+                        self.game_state.ai_build_telemetry.intent_extraction,
+                        self.game_state.ai_build_telemetry.intent_throughput,
+                        self.game_state.ai_build_telemetry.intent_growth,
+                        self.game_state.ai_build_telemetry.avg_reserve_depth,
+                    ));
+                    ui.label(format!(
+                        "AI build rejects: reserve {} | substitution stress {} | invalid site {} (legacy proxy deficits: econ {} / stability {} / resource {})",
+                        self.game_state.ai_build_telemetry.reject_reserve,
+                        self.game_state.ai_build_telemetry.reject_substitution_stress,
+                        self.game_state.ai_build_telemetry.reject_site_invalid,
                         ai_intent_economy_recovery,
                         ai_intent_stability,
                         ai_intent_resource,
                     ));
+                    ui.label(format!(
+                        "Throughput telemetry: event trim {:.2} ms (avg {:.2}) | autosave clone {:.2} ms (avg {:.2}) | save serialize {:.2} ms (avg {:.2}) | save flush {:.2} ms (avg {:.2}) | save total {:.2} ms (avg {:.2}) | save bytes {} | sim snapshot clone {:.2} ms (avg {:.2}) | sim event trim {:.2} ms (avg {:.2})",
+                        self.perf_telemetry.event_trim_ms_last,
+                        self.perf_telemetry.event_trim_ms_smooth,
+                        self.perf_telemetry.save_clone_ms_last,
+                        self.perf_telemetry.save_clone_ms_smooth,
+                        self.perf_telemetry.save_serialize_ms_last,
+                        self.perf_telemetry.save_serialize_ms_smooth,
+                        self.perf_telemetry.save_write_ms_last,
+                        self.perf_telemetry.save_write_ms_smooth,
+                        self.perf_telemetry.save_total_ms_last,
+                        self.perf_telemetry.save_total_ms_smooth,
+                        self.perf_telemetry.save_bytes_last,
+                        self.perf_telemetry.sim_snapshot_clone_ms_last,
+                        self.perf_telemetry.sim_snapshot_clone_ms_smooth,
+                        self.perf_telemetry.sim_event_trim_ms_last,
+                        self.perf_telemetry.sim_event_trim_ms_smooth,
+                    ));
+                    ui.label(format!(
+                        "Sim stages: A {:.2} ms (avg {:.2}) | B {:.2} ms (avg {:.2}) | C {:.2} ms (avg {:.2}) | events/tick-batch {:.0} | worker threads {} | dispatch cap {} | rebuild interval {:.0} ms",
+                        self.perf_telemetry.sim_stage_a_ms_last,
+                        self.perf_telemetry.sim_stage_a_ms_smooth,
+                        self.perf_telemetry.sim_stage_b_ms_last,
+                        self.perf_telemetry.sim_stage_b_ms_smooth,
+                        self.perf_telemetry.sim_stage_c_ms_last,
+                        self.perf_telemetry.sim_stage_c_ms_smooth,
+                        self.perf_telemetry.sim_events_generated_smooth,
+                        self.perf_telemetry.sim_worker_threads_last,
+                        self.sim_dispatch_cap,
+                        self.adaptive_rebuild_interval_ms,
+                    ));
+                    ui.checkbox(
+                        &mut self.debug_show_ai_home_positions,
+                        "Show AI home spawn points on galaxy map",
+                    );
                     if gpu_runtime.renderer_initialized && gpu_runtime.likely_software_adapter {
                         ui.colored_label(
                             egui::Color32::YELLOW,
@@ -4589,7 +5057,7 @@ impl GalaxyApp {
                         (rotated[0] - center3d[0] + self.pan.x) * self.zoom,
                         (rotated[1] - center3d[1] + self.pan.y) * self.zoom,
                     );
-                let marker_color = egui::Color32::from_rgb(226, 160, 82);
+                let marker_color = Self::faction_marker_color(&colony.owner_faction);
                 let marker_radius = 4.2;
                 painter.circle_stroke(
                     colony_screen,
@@ -4610,6 +5078,23 @@ impl GalaxyApp {
                     ],
                     egui::Stroke::new(1.0, marker_color),
                 );
+            }
+            if self.debug_show_ai_home_positions {
+                for (faction_id, home_pos) in &self.ai_home_positions {
+                    let rotated = rotate_point(*home_pos, self.yaw, self.pitch, center3d);
+                    let home_screen = center2d
+                        + egui::Vec2::new(
+                            (rotated[0] - center3d[0] + self.pan.x) * self.zoom,
+                            (rotated[1] - center3d[1] + self.pan.y) * self.zoom,
+                        );
+                    let marker_color = Self::faction_marker_color(faction_id);
+                    painter.circle_filled(home_screen, 2.4, marker_color);
+                    painter.circle_stroke(
+                        home_screen,
+                        6.6,
+                        egui::Stroke::new(1.2, marker_color.gamma_multiply(0.9)),
+                    );
+                }
             }
             painter.text(
                 black_hole_draw_pos + egui::Vec2::new(black_hole_radius_px + 6.0, -8.0),
