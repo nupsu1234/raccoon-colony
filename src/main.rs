@@ -2468,14 +2468,26 @@ impl GalaxyApp {
 
     fn faction_marker_color(faction_id: &str) -> egui::Color32 {
         match faction_id {
-            "Flood of Raccoons" => return egui::Color32::from_rgb(160, 96, 220),       // purple
-            "Hypercapitalist Foundation" => return egui::Color32::from_rgb(140, 140, 140), // grey
-            "Brewer Corporation" => return egui::Color32::from_rgb(90, 150, 255),       // blue
-            "Drifters" => return egui::Color32::from_rgb(20, 20, 20),                   // black
-            "Wanderer's Library" => return egui::Color32::from_rgb(64, 176, 176),       // teal
-            "Greater Armenia" => return egui::Color32::from_rgb(92, 176, 96),           // green
-            "Battle Pilgrims" => return egui::Color32::from_rgb(138, 96, 58),           // brown
-            "New Providence" => return egui::Color32::from_rgb(220, 72, 72),            // red
+            "raccoon-flood" | "Flood of Raccoons" => {
+                return egui::Color32::from_rgb(160, 96, 220)
+            } // purple
+            "hypercapitalist-foundation" | "Hypercapitalist Foundation" => {
+                return egui::Color32::from_rgb(140, 140, 140)
+            } // grey
+            "brewer-corporation" | "Brewer Corporation" => {
+                return egui::Color32::from_rgb(90, 150, 255)
+            } // blue
+            "drifters" | "Drifters" => return egui::Color32::from_rgb(245, 245, 245), // white
+            "wanderers-library" | "Wanderer's Library" => {
+                return egui::Color32::from_rgb(64, 176, 176)
+            } // teal
+            "greater-armenia" | "Greater Armenia" => {
+                return egui::Color32::from_rgb(92, 176, 96)
+            } // green
+            "battle-pilgrims" | "Battle Pilgrims" => {
+                return egui::Color32::from_rgb(138, 96, 58)
+            } // brown
+            "new-providence" | "New Providence" => return egui::Color32::from_rgb(220, 72, 72), // red
             _ => {}
         }
 
