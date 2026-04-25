@@ -3320,6 +3320,7 @@ impl GalaxyApp {
 
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut app = Self::default();
+        cc.egui_ctx.set_visuals(egui::Visuals::dark());
         app.gpu_renderer_ready = gpu_stars::initialize(cc);
         app
     }
@@ -5847,6 +5848,8 @@ impl GalaxyApp {
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
+        follow_system_theme: false,
+        default_theme: eframe::Theme::Dark,
         renderer: eframe::Renderer::Wgpu,
         vsync: true,
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
