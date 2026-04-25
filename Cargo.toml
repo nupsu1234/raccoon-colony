@@ -14,3 +14,7 @@ rand_distr = "0.4"
 bytemuck = { version = "1.16", features = ["derive"] }
 rodio = "0.19"
 rayon = "1.10"
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"
