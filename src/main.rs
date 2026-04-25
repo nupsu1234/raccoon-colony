@@ -1,6 +1,7 @@
 use eframe::egui;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::f32::consts::PI;
 use std::fs;
@@ -18,7 +19,7 @@ use crate::procedural_galaxy::{
     DeltaStore, GalaxyGenerator, GeneratorConfig, LuminosityClass, PlanetAtmosphereComponent,
     PlanetKind,
     SectorCoord, SectorLruCache, SpectralClass, StarBody, StellarClassification,
-    SystemDetail, SystemDelta, SystemId, SystemSummary,
+    StellarPopulationBand, SystemArchitecture, SystemDetail, SystemDelta, SystemId, SystemSummary,
 };
 use crate::sim_tick::StrategicClock;
 
@@ -54,9 +55,9 @@ const TARGET_SYSTEM_COUNT: usize = 400_000_000_000;
 const SECTOR_SIZE: f32 = 2_000.0;
 const MAX_CACHED_SECTORS: usize = 900;
 const CACHE_SECTOR_MARGIN: usize = 128;
-const RENDER_BUDGET: usize = 220_000;
+const RENDER_BUDGET: usize = 320_000;
 const RENDER_BUDGET_MIN: usize = 20_000;
-const RENDER_BUDGET_MAX: usize = 2_000_000;
+const RENDER_BUDGET_MAX: usize = 8_000_000;
 const MAX_PENDING_REQUESTS: usize = 512;
 const MAX_REQUESTS_PER_FRAME: usize = 64;
 const MAX_RESULTS_PER_FRAME: usize = 96;
@@ -64,12 +65,14 @@ const MAX_WORKER_THREADS: usize = 8;
 const UI_CACHE_REFRESH_INTERVAL_MS: f64 = 250.0;
 const MIN_REBUILD_INTERVAL_MS: f64 = 45.0;
 const LOD_SWITCH_COOLDOWN_MS: f64 = 200.0;
-const MAX_VISIBLE_BUILD_SECTORS: usize = 300;
-const MAX_VISIBLE_CHUNK_POINTS: usize = 90_000;
-const SYSTEM_VIEW_POINT_SOFT_LIMIT: usize = 90_000;
-const SYSTEM_VIEW_POINT_HARD_LIMIT: usize = 160_000;
-const SYSTEM_VIEW_READINESS_MIN: f32 = 0.98;
-const SYSTEM_VIEW_MAX_MISSING_SECTORS: usize = 6;
+// Cap on sectors fed into the visible-build stage per rebuild.
+// Must be high enough to represent the full zoomed-out galaxy footprint.
+const MAX_VISIBLE_BUILD_SECTORS: usize = 5_000;
+const MAX_VISIBLE_CHUNK_POINTS: usize = 180_000;
+const SYSTEM_VIEW_POINT_SOFT_LIMIT: usize = 180_000;
+const SYSTEM_VIEW_POINT_HARD_LIMIT: usize = 320_000;
+const SYSTEM_VIEW_READINESS_MIN: f32 = 0.96;
+const SYSTEM_VIEW_MAX_MISSING_SECTORS: usize = 10;
 
 const DRAW_DENSITY_REF_VISIBLE: f32 = 14_000.0;
 const STAR_DRAW_RADIUS_MIN_PX: f32 = 0.35;
@@ -253,6 +256,14 @@ struct CameraFocusTween {
     target_zoom: f32,
 }
 
+#[derive(Clone, Debug)]
+struct SystemSearchResult {
+    id: SystemId,
+    name: String,
+    pos: [f32; 3],
+    spectral: SpectralClass,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TravelBodySelection {
     Star(usize),
@@ -271,6 +282,7 @@ struct VisibleBuildRequest {
     desired_chunk_budget: usize,
     sectors: Vec<Arc<Vec<SolarSystem>>>,
     build_chunk_uploads: bool,
+    spectral_filter_mask: u64,
 }
 
 struct VisibleBuildResult {
@@ -282,6 +294,18 @@ struct VisibleBuildResult {
     render_points: Vec<RenderPoint>,
     chunk_uploads: Vec<gpu_stars::ChunkUpload>,
     build_ms: f32,
+}
+
+struct SystemSearchRequest {
+    request_id: u64,
+    query: String,
+    generator: Arc<GalaxyGenerator>,
+}
+
+struct SystemSearchResponse {
+    request_id: u64,
+    results: Vec<SystemSearchResult>,
+    status: Option<String>,
 }
 
 enum SimCommand {
@@ -365,6 +389,7 @@ enum LodPreset {
     Balanced,
     Quality,
     Ultra,
+    Extreme,
     Max,
 }
 
@@ -375,16 +400,18 @@ impl LodPreset {
             LodPreset::Balanced => "Balanced",
             LodPreset::Quality => "Quality",
             LodPreset::Ultra => "Ultra",
+            LodPreset::Extreme => "Extreme",
             LodPreset::Max => "Max",
         }
     }
 
-    fn all() -> [Self; 5] {
+    fn all() -> [Self; 6] {
         [
             Self::Compatibility,
             Self::Balanced,
             Self::Quality,
             Self::Ultra,
+            Self::Extreme,
             Self::Max,
         ]
     }
@@ -455,6 +482,11 @@ pub struct GalaxyApp {
     visible_build_result_rx: mpsc::Receiver<VisibleBuildResult>,
     visible_build_inflight: bool,
     visible_build_requested_signature: u64,
+    system_search_request_tx: mpsc::Sender<SystemSearchRequest>,
+    system_search_result_rx: mpsc::Receiver<SystemSearchResponse>,
+    system_search_next_request_id: u64,
+    system_search_latest_requested_id: u64,
+    system_search_last_submitted_query: String,
     pending_sectors: HashSet<SectorCoord>,
     last_view_center: Option<egui::Vec2>,
     worker_count: usize,
@@ -519,6 +551,10 @@ pub struct GalaxyApp {
     galactic_situation_open: bool,
     mission_board_open: bool,
     favorites_window_open: bool,
+    system_search_query: String,
+    system_search_results: Vec<SystemSearchResult>,
+    system_search_status: Option<String>,
+    spectral_filter_mask: u64,
     debug_show_ai_home_positions: bool,
     ai_home_positions: Vec<(String, [f32; 3])>,
     travel_system: Option<SystemDetail>,
@@ -552,7 +588,7 @@ impl Default for GalaxyApp {
         let worker_count = GalaxyApp::worker_thread_count();
         let target_system_count = TARGET_SYSTEM_COUNT.max(1);
         let galaxy_seed = DEFAULT_GALAXY_SEED;
-        let lod_preset = LodPreset::Max;
+        let lod_preset = LodPreset::Quality;
         let lod_profile = Self::lod_profile(lod_preset);
         let generator_config = Self::generator_config(galaxy_seed, target_system_count, SECTOR_SIZE);
         let procedural_generator = Arc::new(GalaxyGenerator::new(generator_config));
@@ -567,6 +603,8 @@ impl Default for GalaxyApp {
         let (save_request_tx, save_result_rx) = GalaxyApp::spawn_save_worker();
         let (visible_build_request_tx, visible_build_result_rx) =
             GalaxyApp::spawn_visible_build_worker();
+        let (system_search_request_tx, system_search_result_rx) =
+            GalaxyApp::spawn_system_search_worker();
         let (mut game_state, game_events, game_save_error) =
             match save::load_game_save(GAME_SAVE_PATH) {
                 Ok((state, events)) => (state, events, None),
@@ -646,6 +684,11 @@ impl Default for GalaxyApp {
             visible_build_result_rx,
             visible_build_inflight: false,
             visible_build_requested_signature: 0,
+            system_search_request_tx,
+            system_search_result_rx,
+            system_search_next_request_id: 1,
+            system_search_latest_requested_id: 0,
+            system_search_last_submitted_query: String::new(),
             pending_sectors: HashSet::new(),
             last_view_center: None,
             worker_count,
@@ -691,7 +734,7 @@ impl Default for GalaxyApp {
             settings_window_open: false,
             settings_seed_input: galaxy_seed.to_string(),
             settings_render_budget: lod_profile.render_budget,
-            settings_ai_cluster_radius_world: ai_home_spawn_config.cluster_radius_world,
+            settings_ai_cluster_radius_world: ai_home_spawn_config.bubble_radius_world,
             settings_sim_cpu_mode: SimCpuMode::Adaptive,
             settings_max_sim_threads: max_sim_threads,
             lod_preset,
@@ -710,6 +753,10 @@ impl Default for GalaxyApp {
             galactic_situation_open: false,
             mission_board_open: false,
             favorites_window_open: false,
+            system_search_query: String::new(),
+            system_search_results: Vec::new(),
+            system_search_status: None,
+            spectral_filter_mask: Self::default_spectral_filter_mask(),
             debug_show_ai_home_positions: false,
             ai_home_positions: Vec::new(),
             travel_system: None,
@@ -783,31 +830,40 @@ impl GalaxyApp {
                 system_view_max_missing_sectors: SYSTEM_VIEW_MAX_MISSING_SECTORS,
             },
             LodPreset::Quality => LodProfile {
-                render_budget: 420_000,
-                chunk_point_min_budget: 210_000,
-                transition_zoom_scale: 1.18,
-                system_view_soft_limit: 140_000,
-                system_view_hard_limit: 260_000,
-                system_view_readiness_min: 0.97,
-                system_view_max_missing_sectors: 8,
+                render_budget: 700_000,
+                chunk_point_min_budget: 320_000,
+                transition_zoom_scale: 1.25,
+                system_view_soft_limit: 280_000,
+                system_view_hard_limit: 520_000,
+                system_view_readiness_min: 0.95,
+                system_view_max_missing_sectors: 12,
             },
             LodPreset::Ultra => LodProfile {
-                render_budget: 800_000,
-                chunk_point_min_budget: 360_000,
-                transition_zoom_scale: 1.35,
-                system_view_soft_limit: 210_000,
-                system_view_hard_limit: 420_000,
-                system_view_readiness_min: 0.94,
-                system_view_max_missing_sectors: 14,
+                render_budget: 1_500_000,
+                chunk_point_min_budget: 700_000,
+                transition_zoom_scale: 1.55,
+                system_view_soft_limit: 550_000,
+                system_view_hard_limit: 1_100_000,
+                system_view_readiness_min: 0.92,
+                system_view_max_missing_sectors: 16,
+            },
+            LodPreset::Extreme => LodProfile {
+                render_budget: 5_000_000,
+                chunk_point_min_budget: 2_500_000,
+                transition_zoom_scale: 2.4,
+                system_view_soft_limit: 2_500_000,
+                system_view_hard_limit: 5_000_000,
+                system_view_readiness_min: 0.88,
+                system_view_max_missing_sectors: 24,
             },
             LodPreset::Max => LodProfile {
-                render_budget: 2_000_000,
-                chunk_point_min_budget: 1_000_000,
-                transition_zoom_scale: 2.0,
-                system_view_soft_limit: 1_000_000,
-                system_view_hard_limit: 2_000_000,
-                system_view_readiness_min: 0.90,
-                system_view_max_missing_sectors: 18,
+                render_budget: 8_000_000,
+                chunk_point_min_budget: 4_000_000,
+                transition_zoom_scale: 2.8,
+                system_view_soft_limit: 4_000_000,
+                system_view_hard_limit: 8_000_000,
+                system_view_readiness_min: 0.84,
+                system_view_max_missing_sectors: 30,
             },
         }
     }
@@ -896,6 +952,8 @@ impl GalaxyApp {
         self.result_rx = result_rx;
 
         self.pending_sectors.clear();
+        self.system_search_results.clear();
+        self.system_search_status = None;
         self.last_view_center = None;
         self.visible_build_inflight = false;
         self.visible_build_requested_signature = 0;
@@ -917,7 +975,7 @@ impl GalaxyApp {
         self.ui_cache_dirty = true;
         self.restart_sim_worker();
     }
-
+    
     fn restart_simulation_with_seed(&mut self, galaxy_seed: u64) {
         self.galaxy_seed = galaxy_seed;
         self.settings_seed_input = galaxy_seed.to_string();
@@ -1770,6 +1828,8 @@ impl GalaxyApp {
 
         self.strategic_clock.reset_timebase();
         self.restart_sim_worker();
+        self.system_search_results.clear();
+        self.system_search_status = None;
 
         let mut remove_errors = Vec::new();
         for path in [GAME_SAVE_PATH, DELTA_SAVE_PATH] {
@@ -1907,6 +1967,48 @@ impl GalaxyApp {
         detail.explored = self.game_state.is_system_explored(id);
         Some(detail)
     }
+
+    fn maybe_refresh_system_search_results(&mut self) {
+        let query = self.system_search_query.trim();
+        if query.is_empty() {
+            self.system_search_last_submitted_query.clear();
+            self.system_search_results.clear();
+            self.system_search_status = None;
+            return;
+        }
+        if self.system_search_last_submitted_query == query {
+            return;
+        }
+        self.system_search_last_submitted_query = query.to_owned();
+        self.system_search_results.clear();
+        self.system_search_status = Some("Searching...".to_owned());
+
+        let request_id = self.system_search_next_request_id;
+        self.system_search_next_request_id = self.system_search_next_request_id.wrapping_add(1);
+        self.system_search_latest_requested_id = request_id;
+        if self
+            .system_search_request_tx
+            .send(SystemSearchRequest {
+                request_id,
+                query: query.to_owned(),
+                generator: Arc::clone(&self.procedural_generator),
+            })
+            .is_err()
+        {
+            self.system_search_status = Some("Search worker unavailable.".to_owned());
+        }
+    }
+
+    fn drain_system_search_results(&mut self) {
+        while let Ok(response) = self.system_search_result_rx.try_recv() {
+            if response.request_id != self.system_search_latest_requested_id {
+                continue;
+            }
+            self.system_search_results = response.results;
+            self.system_search_status = response.status;
+        }
+    }
+
 
     fn show_favorites_window(&mut self, ctx: &egui::Context, center3d: [f32; 3]) {
         if !self.favorites_window_open {
@@ -2197,18 +2299,18 @@ impl GalaxyApp {
                 self.adaptive_rebuild_interval_ms =
                     (self.adaptive_rebuild_interval_ms + 6.0).clamp(MIN_REBUILD_INTERVAL_MS, 140.0);
             } else if gpu_ms < 11.0 {
-                self.sim_dispatch_cap = (self.sim_dispatch_cap + 1).min(20);
+                self.sim_dispatch_cap = (self.sim_dispatch_cap + 1).min(24);
                 self.adaptive_rebuild_interval_ms =
                     (self.adaptive_rebuild_interval_ms - 4.0).clamp(MIN_REBUILD_INTERVAL_MS, 140.0);
             }
         }
         let sim_cmd_ms = self.perf_telemetry.sim_command_total_ms_smooth;
         if sim_cmd_ms > 140.0 {
-            self.sim_dispatch_cap = self.sim_dispatch_cap.saturating_sub(3).max(2);
+            self.sim_dispatch_cap = self.sim_dispatch_cap.saturating_sub(2).max(2);
         } else if sim_cmd_ms > 80.0 {
             self.sim_dispatch_cap = self.sim_dispatch_cap.saturating_sub(1).max(2);
         } else if sim_cmd_ms < 18.0 {
-            self.sim_dispatch_cap = (self.sim_dispatch_cap + 1).min(20);
+            self.sim_dispatch_cap = (self.sim_dispatch_cap + 1).min(24);
         }
     }
 
@@ -2240,6 +2342,10 @@ impl GalaxyApp {
                 luminosity_solar: 0.000_03,
             }],
             planets: Vec::new(),
+            population_band: StellarPopulationBand::BulgeBar,
+            stellar_age_gyr: 11.8,
+            metallicity: 0.9,
+            architecture: SystemArchitecture::Solitary,
             explored: false,
             favorite: false,
             note: Some("Supermassive black hole at the galactic center.".to_owned()),
@@ -3225,6 +3331,84 @@ impl GalaxyApp {
             .min(MAX_WORKER_THREADS)
     }
 
+    const SPECTRAL_FILTER_CLASSES: [SpectralClass; 22] = [
+        SpectralClass::BH,
+        SpectralClass::NS,
+        SpectralClass::O,
+        SpectralClass::B,
+        SpectralClass::A,
+        SpectralClass::F,
+        SpectralClass::G,
+        SpectralClass::K,
+        SpectralClass::M,
+        SpectralClass::W,
+        SpectralClass::WN,
+        SpectralClass::WC,
+        SpectralClass::WO,
+        SpectralClass::L,
+        SpectralClass::T,
+        SpectralClass::Y,
+        SpectralClass::C,
+        SpectralClass::S,
+        SpectralClass::D,
+        SpectralClass::DA,
+        SpectralClass::DB,
+        SpectralClass::DC,
+    ];
+
+    fn spectral_class_bit(class: SpectralClass) -> u64 {
+        match class {
+            SpectralClass::BH => 1 << 0,
+            SpectralClass::NS => 1 << 1,
+            SpectralClass::O => 1 << 2,
+            SpectralClass::B => 1 << 3,
+            SpectralClass::A => 1 << 4,
+            SpectralClass::F => 1 << 5,
+            SpectralClass::G => 1 << 6,
+            SpectralClass::K => 1 << 7,
+            SpectralClass::M => 1 << 8,
+            SpectralClass::W => 1 << 9,
+            SpectralClass::WN => 1 << 10,
+            SpectralClass::WC => 1 << 11,
+            SpectralClass::WO => 1 << 12,
+            SpectralClass::L => 1 << 13,
+            SpectralClass::T => 1 << 14,
+            SpectralClass::Y => 1 << 15,
+            SpectralClass::C => 1 << 16,
+            SpectralClass::S => 1 << 17,
+            SpectralClass::D => 1 << 18,
+            SpectralClass::DA => 1 << 19,
+            SpectralClass::DB => 1 << 20,
+            SpectralClass::DC => 1 << 21,
+        }
+    }
+
+    fn default_spectral_filter_mask() -> u64 {
+        Self::SPECTRAL_FILTER_CLASSES
+            .iter()
+            .fold(0u64, |mask, class| mask | Self::spectral_class_bit(*class))
+    }
+
+    fn spectral_class_enabled(mask: u64, class: SpectralClass) -> bool {
+        mask & Self::spectral_class_bit(class) != 0
+    }
+
+    fn passes_spectral_filter(mask: u64, summary: &SolarSystem) -> bool {
+        Self::spectral_class_enabled(mask, summary.primary_star.spectral)
+    }
+
+    fn resolved_name_for_system_id(&self, id: SystemId) -> String {
+        if let Some(delta) = self.delta_store.get(id) {
+            if let Some(rename) = delta.rename_to.as_ref() {
+                let trimmed = rename.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_owned();
+                }
+            }
+        }
+        self.procedural_generator.canonical_system_name(id)
+    }
+
     fn gpu_chunk_key(ix: i32, iy: i32, iz: i32, lod_bucket: i32, galaxy_seed: u64) -> u64 {
         let mut h = galaxy_seed
             ^ (ix as i64 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -3243,11 +3427,13 @@ impl GalaxyApp {
         required_ready_hash: u64,
         lod_label: &'static str,
         galaxy_seed: u64,
+        spectral_filter_mask: u64,
     ) -> u64 {
         let mut h = galaxy_seed
             ^ required_hash.wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ required_ready_hash.wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
-            ^ (lod_label.as_ptr() as usize as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+            ^ (lod_label.as_ptr() as usize as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93)
+            ^ spectral_filter_mask.wrapping_mul(0xA24B_AED4_963E_E407);
         h ^= h >> 30;
         h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
         h ^= h >> 27;
@@ -3357,6 +3543,7 @@ impl GalaxyApp {
                             chunk_budget,
                             sample_seed,
                             request.galaxy_seed,
+                            request.spectral_filter_mask,
                         )
                     } else {
                         let mut visible_system_count = 0usize;
@@ -3365,10 +3552,26 @@ impl GalaxyApp {
                             visible_system_count = visible_system_count.saturating_add(
                                 systems
                                     .iter()
+                                    .filter(|system| {
+                                        GalaxyApp::passes_spectral_filter(
+                                            request.spectral_filter_mask,
+                                            system,
+                                        )
+                                    })
                                     .map(|system| system.represented_systems as usize)
                                     .sum::<usize>(),
                             );
-                            visible.extend_from_slice(systems.as_ref());
+                            visible.extend(
+                                systems
+                                    .iter()
+                                    .copied()
+                                    .filter(|system| {
+                                        GalaxyApp::passes_spectral_filter(
+                                            request.spectral_filter_mask,
+                                            system,
+                                        )
+                                    }),
+                            );
                         }
 
                         let systems =
@@ -3416,6 +3619,59 @@ impl GalaxyApp {
         (request_tx, result_rx)
     }
 
+    fn spawn_system_search_worker() -> (
+        mpsc::Sender<SystemSearchRequest>,
+        mpsc::Receiver<SystemSearchResponse>,
+    ) {
+        let (request_tx, request_rx) = mpsc::channel::<SystemSearchRequest>();
+        let (result_tx, result_rx) = mpsc::channel::<SystemSearchResponse>();
+        thread::spawn(move || {
+            while let Ok(request) = request_rx.recv() {
+                let query = request.query.trim().to_owned();
+                let generator = request.generator;
+                let response = if query.is_empty() {
+                    SystemSearchResponse {
+                        request_id: request.request_id,
+                        results: Vec::new(),
+                        status: None,
+                    }
+                } else if GalaxyGenerator::parse_system_name_exact(&query).is_none() {
+                    SystemSearchResponse {
+                        request_id: request.request_id,
+                        results: Vec::new(),
+                        status: Some(
+                            "Invalid format. Use exactly: Prefix-Middle-Suffix X Y Z (example: Ion-on-il -17 -4 42)"
+                                .to_owned(),
+                        ),
+                    }
+                } else if let Some(summary) = generator.find_system_by_exact_name(&query) {
+                    let name = generator.canonical_system_name(summary.id);
+                    SystemSearchResponse {
+                        request_id: request.request_id,
+                        results: vec![SystemSearchResult {
+                            id: summary.id,
+                            name,
+                            pos: summary.pos,
+                            spectral: summary.primary_star.spectral,
+                        }],
+                        status: Some("System resolved successfully.".to_owned()),
+                    }
+                } else {
+                    SystemSearchResponse {
+                        request_id: request.request_id,
+                        results: Vec::new(),
+                        status: Some("Valid format but no system resolves from this name.".to_owned()),
+                    }
+                };
+
+                if result_tx.send(response).is_err() {
+                    break;
+                }
+            }
+        });
+        (request_tx, result_rx)
+    }
+
     fn spawn_save_worker(
     ) -> (
         mpsc::Sender<SaveWorkerPayload>,
@@ -3445,6 +3701,12 @@ impl GalaxyApp {
         spawn_config: ai_factions::AiHomeSpawnConfig,
         initial_threads: usize,
     ) -> (mpsc::Sender<SimCommand>, mpsc::Receiver<SimSnapshot>) {
+        fn build_sim_pool(threads: usize) -> Option<ThreadPool> {
+            ThreadPoolBuilder::new()
+                .num_threads(threads.max(1))
+                .build()
+                .ok()
+        }
         let (command_tx, command_rx) = mpsc::channel::<SimCommand>();
         let (result_tx, result_rx) = mpsc::channel::<SimSnapshot>();
         thread::spawn(move || {
@@ -3453,10 +3715,12 @@ impl GalaxyApp {
             let mut last_full_snapshot_at = Instant::now()
                 - Duration::from_millis(SIM_SNAPSHOT_MIN_INTERVAL_MS);
             let mut worker_threads = initial_threads.max(1);
+            let mut sim_pool = build_sim_pool(worker_threads);
             while let Ok(command) = command_rx.recv() {
                 let command_started = Instant::now();
                 if let SimCommand::UpdateThreadBudget { threads } = &command {
                     worker_threads = (*threads).max(1);
+                    sim_pool = build_sim_pool(worker_threads);
                     let _ = result_tx.send(SimSnapshot {
                         state: None,
                         events: None,
@@ -3481,29 +3745,33 @@ impl GalaxyApp {
                     SimCommand::Advance { ticks, tick_years } => {
                         let mut stage_a_total = 0.0f32;
                         let mut stage_c_total = 0.0f32;
-                        let mut run_batch = || {
-                            for _ in 0..ticks {
-                                let stage_a_started = Instant::now();
+                        for _ in 0..ticks {
+                            let stage_a_started = Instant::now();
+                            let (generated_events, ai_events) = if let Some(pool) = &sim_pool {
+                                pool.install(|| {
+                                    let generated_events = state.advance_strategic_tick(tick_years);
+                                    let ai_events = ai_controller.tick(&mut state, &generator);
+                                    (generated_events, ai_events)
+                                })
+                            } else {
                                 let generated_events = state.advance_strategic_tick(tick_years);
                                 let ai_events = ai_controller.tick(&mut state, &generator);
-                                stage_a_total +=
-                                    stage_a_started.elapsed().as_secs_f64() as f32 * 1000.0;
-                                events_generated += generated_events.len() + ai_events.len();
+                                (generated_events, ai_events)
+                            };
+                            stage_a_total += stage_a_started.elapsed().as_secs_f64() as f32 * 1000.0;
+                            events_generated += generated_events.len() + ai_events.len();
 
-                                let stage_c_started = Instant::now();
-                                for event in generated_events {
-                                    state.apply_event(&event);
-                                    events.push_back(event);
-                                }
-                                for event in ai_events {
-                                    state.apply_event(&event);
-                                    events.push_back(event);
-                                }
-                                stage_c_total +=
-                                    stage_c_started.elapsed().as_secs_f64() as f32 * 1000.0;
+                            let stage_c_started = Instant::now();
+                            for event in generated_events {
+                                state.apply_event(&event);
+                                events.push_back(event);
                             }
-                        };
-                        run_batch();
+                            for event in ai_events {
+                                state.apply_event(&event);
+                                events.push_back(event);
+                            }
+                            stage_c_total += stage_c_started.elapsed().as_secs_f64() as f32 * 1000.0;
+                        }
                         stage_a_ms = stage_a_total;
                         stage_b_ms = 0.0;
                         stage_c_ms = stage_c_total;
@@ -3894,8 +4162,17 @@ impl GalaxyApp {
         target_points: usize,
         sample_seed: u64,
         galaxy_seed: u64,
+        spectral_filter_mask: u64,
     ) -> (usize, Vec<RenderPoint>) {
-        let total_input_systems = sectors.iter().map(|systems| systems.len()).sum::<usize>();
+        let total_input_systems = sectors
+            .iter()
+            .map(|systems| {
+                systems
+                    .iter()
+                    .filter(|system| Self::passes_spectral_filter(spectral_filter_mask, system))
+                    .count()
+            })
+            .sum::<usize>();
         if total_input_systems == 0 {
             return (0, Vec::new());
         }
@@ -3911,6 +4188,9 @@ impl GalaxyApp {
 
             if stride <= 1 {
                 for system in systems.iter() {
+                    if !Self::passes_spectral_filter(spectral_filter_mask, system) {
+                        continue;
+                    }
                     let represented = system.represented_systems.max(1) as u64;
                     visible_system_count = visible_system_count.saturating_add(
                         represented.min(usize::MAX as u64) as usize,
@@ -3939,6 +4219,10 @@ impl GalaxyApp {
 
             while idx < systems.len() {
                 let system = systems[idx];
+                if !Self::passes_spectral_filter(spectral_filter_mask, &system) {
+                    idx += stride;
+                    continue;
+                }
                 let represented = (system.represented_systems.max(1) as u64)
                     .saturating_mul(stride as u64)
                     .max(1);
@@ -4085,7 +4369,6 @@ impl GalaxyApp {
                 required.push(SectorCoord { x: sx, y: sy });
             }
         }
-
         let mut missing = required
             .iter()
             .copied()
@@ -4120,6 +4403,7 @@ impl GalaxyApp {
             h ^ (c.x as i64 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
               ^ (c.y as i64 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
         });
+        self.maybe_refresh_system_search_results();
 
         let lod_changed = self.lod_tier.label() != new_lod_tier.label();
         if lod_changed && now_ms - self.last_lod_switch_ms < LOD_SWITCH_COOLDOWN_MS {
@@ -4157,6 +4441,7 @@ impl GalaxyApp {
                 required_ready_hash,
                 self.lod_tier.label(),
                 self.galaxy_seed,
+                self.spectral_filter_mask,
             );
 
             let rebuild_throttled =
@@ -4197,6 +4482,7 @@ impl GalaxyApp {
                     desired_chunk_budget: self.desired_chunk_point_budget(),
                     sectors,
                     build_chunk_uploads: self.gpu_renderer_ready,
+                    spectral_filter_mask: self.spectral_filter_mask,
                 };
 
                 match self.visible_build_request_tx.try_send(request) {
@@ -4319,13 +4605,13 @@ impl GalaxyApp {
                         &mut self.settings_ai_cluster_radius_world,
                         AI_CLUSTER_RADIUS_MIN..=AI_CLUSTER_RADIUS_MAX,
                     )
-                    .text("Faction cluster radius")
+                    .text("Faction population bubble radius")
                     .logarithmic(true),
                 );
-                self.ai_home_spawn_config.cluster_radius_world = self
+                self.ai_home_spawn_config.bubble_radius_world = self
                     .settings_ai_cluster_radius_world
                     .clamp(AI_CLUSTER_RADIUS_MIN, AI_CLUSTER_RADIUS_MAX);
-                ui.small("Lower = factions start closer together (used for new games).");
+                ui.small("AI faction homes are randomized inside one seeded population bubble for new games.");
                 ui.add_space(4.0);
                 let new_game_btn = ui.add_sized(
                     [button_width, 36.0],
@@ -4359,6 +4645,7 @@ impl GalaxyApp {
     fn update_game(&mut self, ctx: &egui::Context) {
         self.poll_save_results();
         self.poll_sim_results();
+        self.drain_system_search_results();
         let gpu_timing_snapshot = gpu_stars::latest_timing_snapshot();
         self.autotune_runtime(ctx, gpu_timing_snapshot.total_ms);
         let sim_advance = self
@@ -4384,9 +4671,9 @@ impl GalaxyApp {
                 effective_dispatch_cap = effective_dispatch_cap.min(2);
             }
             if self.pending_sim_ticks >= MAX_PENDING_SIM_TICKS.saturating_sub(1) {
-                effective_dispatch_cap = effective_dispatch_cap.min(4);
+                effective_dispatch_cap = effective_dispatch_cap.min(6);
             } else if self.pending_sim_ticks >= 200 {
-                effective_dispatch_cap = effective_dispatch_cap.min(8);
+                effective_dispatch_cap = effective_dispatch_cap.min(10);
             }
             let dispatch_ticks = self.pending_sim_ticks.min(effective_dispatch_cap);
             if self
@@ -4469,7 +4756,7 @@ impl GalaxyApp {
                     self.settings_window_open = true;
                     self.settings_seed_input = self.galaxy_seed.to_string();
                     self.settings_render_budget = self.render_budget;
-                    self.settings_ai_cluster_radius_world = self.ai_home_spawn_config.cluster_radius_world;
+                    self.settings_ai_cluster_radius_world = self.ai_home_spawn_config.bubble_radius_world;
                     self.settings_lod_preset = self.lod_preset;
                     self.settings_sim_cpu_mode = self.sim_cpu_mode;
                     self.settings_max_sim_threads = self.max_sim_threads;
@@ -4541,6 +4828,83 @@ impl GalaxyApp {
                     }
                 }
             });
+            let mut filter_changed = false;
+            ui.horizontal_wrapped(|ui| {
+                ui.label("System search:");
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.system_search_query)
+                        .hint_text("Prefix-Middle-Suffix X Y Z")
+                        .desired_width(220.0),
+                );
+                if response.changed() {
+                    self.maybe_refresh_system_search_results();
+                }
+                if ui.button("Clear").clicked() {
+                    self.system_search_query.clear();
+                    self.system_search_results.clear();
+                    self.system_search_status = None;
+                }
+                ui.separator();
+                ui.label("Spectral filter:");
+                if ui.button("All").clicked() {
+                    self.spectral_filter_mask = Self::default_spectral_filter_mask();
+                    filter_changed = true;
+                }
+                if ui.button("None").clicked() {
+                    self.spectral_filter_mask = 0;
+                    filter_changed = true;
+                }
+                if ui.button("Core").clicked() {
+                    self.spectral_filter_mask = 0;
+                    for class in [
+                        SpectralClass::O,
+                        SpectralClass::B,
+                        SpectralClass::A,
+                        SpectralClass::F,
+                        SpectralClass::G,
+                        SpectralClass::K,
+                        SpectralClass::M,
+                    ] {
+                        self.spectral_filter_mask |= Self::spectral_class_bit(class);
+                    }
+                    filter_changed = true;
+                }
+                if ui.button("Exotics").clicked() {
+                    self.spectral_filter_mask = Self::default_spectral_filter_mask();
+                    for class in [
+                        SpectralClass::O,
+                        SpectralClass::B,
+                        SpectralClass::A,
+                        SpectralClass::F,
+                        SpectralClass::G,
+                        SpectralClass::K,
+                        SpectralClass::M,
+                    ] {
+                        self.spectral_filter_mask &= !Self::spectral_class_bit(class);
+                    }
+                    filter_changed = true;
+                }
+            });
+            ui.collapsing("Spectral classes", |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for class in Self::SPECTRAL_FILTER_CLASSES {
+                        let bit = Self::spectral_class_bit(class);
+                        let mut enabled = Self::spectral_class_enabled(self.spectral_filter_mask, class);
+                        if ui.checkbox(&mut enabled, class.code()).changed() {
+                            if enabled {
+                                self.spectral_filter_mask |= bit;
+                            } else {
+                                self.spectral_filter_mask &= !bit;
+                            }
+                            filter_changed = true;
+                        }
+                    }
+                });
+            });
+            if filter_changed {
+                self.last_required_ready_hash = u64::MAX;
+                self.visible_build_inflight = false;
+            }
             ui.label(format!(
                 "Year: {:.2} | Known systems: {} | Fully assessed: {} | Colonies: {} | Factions: {} | Game events: {}",
                 self.game_state.current_year,
@@ -4550,6 +4914,58 @@ impl GalaxyApp {
                 self.game_state.factions.len(),
                 self.game_events.len(),
             ));
+            if let Some(status) = &self.system_search_status {
+                ui.small(status);
+            }
+            if !self.system_search_query.trim().is_empty() {
+                let rows = self.system_search_results.clone();
+                let mut focus_target: Option<[f32; 3]> = None;
+                let mut select_target: Option<SystemId> = None;
+                egui::CollapsingHeader::new(format!("Search results ({})", rows.len()))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        if rows.is_empty() {
+                            if let Some(status) = &self.system_search_status {
+                                ui.small(status);
+                            } else {
+                                ui.small("No matching systems.");
+                            }
+                            return;
+                        }
+                        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                            egui::Grid::new("search_results_grid")
+                                .striped(true)
+                                .spacing([8.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.label(egui::RichText::new("Name").underline());
+                                    ui.label(egui::RichText::new("Class").underline());
+                                    ui.label(egui::RichText::new("Actions").underline());
+                                    ui.end_row();
+                                    for row in &rows {
+                                        ui.label(row.name.as_str());
+                                        ui.label(row.spectral.code());
+                                        ui.horizontal(|ui| {
+                                            if ui.button("Focus").clicked() {
+                                                focus_target = Some(row.pos);
+                                            }
+                                            if ui.button("Select").clicked() {
+                                                select_target = Some(row.id);
+                                            }
+                                        });
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                    });
+                if let Some(pos) = focus_target {
+                    self.start_camera_focus_tween(pos, center3d, self.zoom_for_system_lod());
+                }
+                if let Some(system_id) = select_target {
+                    if let Some(detail) = self.load_system_detail_by_id(system_id) {
+                        self.selected_system = Some(detail);
+                    }
+                }
+            }
 
             if let Some(err) = &self.game_save_error {
                 ui.colored_label(egui::Color32::YELLOW, err);
@@ -5367,14 +5783,24 @@ impl GalaxyApp {
                     };
                     self.delta_store.upsert(detail.id, delta);
                     let _ = self.delta_store.save_json(DELTA_SAVE_PATH);
+                    let resolved_name = self.resolved_name_for_system_id(detail.id);
+                    if let Some(row) = self
+                        .system_search_results
+                        .iter_mut()
+                        .find(|row| row.id == detail.id)
+                    {
+                        row.name = resolved_name;
+                    }
                 }
             }
             if window_travel {
                 if let Some(detail) = &self.selected_system {
                     let sim_allows = self.game_state.survey_stage(detail.id) >= SurveyStage::ColonyAssessment;
                     // With async simulation snapshots, the strategic state can briefly lag behind
-                    // the selected detail. If full detail is already available, allow travel.
-                    let detail_allows = detail.explored || !detail.planets.is_empty();
+                    // the selected detail. If detail is already materialized, allow travel,
+                    // including star-only systems (e.g. BH systems with no planets).
+                    let detail_allows =
+                        detail.explored || !detail.planets.is_empty() || !detail.stars.is_empty();
                     if !(sim_allows || detail_allows) {
                         self.game_notice = Some(
                             "Travel unavailable: complete all scans for this system first.".to_owned(),

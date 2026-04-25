@@ -19,14 +19,40 @@ const MIX2: u64 = 0x94D0_49BB_1331_11EB;
 const SECTOR_DOMAIN_TAG: u64 = 0x19E6_52C3_FCAB_4A1D;
 const SPAWN_CELL_DOMAIN_TAG: u64 = 0x4C7A_91F2_6DB8_3E05;
 const SYSTEM_DOMAIN_TAG: u64 = 0x6F18_BB6E_2A11_91C3;
-const GENERATION_VERSION: u64 = 1;
+const GENERATION_VERSION: u64 = 2;
+pub const GALAXY_GENERATION_SCHEMA_VERSION: u64 = GENERATION_VERSION;
 const POSITION_REJECTION_TRIES: usize = 6;
 const SECTOR_DENSITY_SAMPLES_PER_AXIS: usize = 12;
 const POSITION_FALLBACK_SAMPLES_PER_AXIS: usize = 4;
 const POSITION_SUBCELLS_PER_AXIS: usize = 8;
 const ARM_DENSITY_SHARPNESS: f32 = 6.0;
+const RADIAL_FALLOFF_STEEPNESS: f32 = 3.0;
+const POSITION_BULGE_WEIGHT: f32 = 0.45;
+const SECTOR_BULGE_WEIGHT: f32 = 0.40;
+const REGION_DOMAIN_TAG: u64 = 0xA27C_43FE_18D9_2BB1;
 const TARGET_REPRESENTED_SYSTEMS_PER_POINT: u64 = 50_000;
 const SPAWN_CELL_SIZE: f32 = 320.0;
+const SECTOR_NAME_PREFIXES: &[&str] = &[
+    "Al", "Bel", "Cor", "Dar", "El", "Fal", "Gal", "Hel", "Ion", "Jar", "Kel", "Lor", "Mor",
+    "Nor", "Or", "Pra", "Quar", "Rin", "Sol", "Tor", "Ul", "Var", "Wen", "Xan", "Yor", "Zel",
+];
+const SECTOR_NAME_MIDDLES: &[&str] = &[
+    "an", "ar", "el", "en", "es", "ia", "il", "in", "ir", "on", "or", "ul", "ur", "ys",
+];
+const SECTOR_NAME_SUFFIXES: &[&str] = &[
+    "a", "ac", "ae", "al", "an", "ar", "as", "ea", "ek", "el", "en", "er", "es", "ia", "ik",
+    "il", "in", "is", "on", "or", "os", "um", "us", "yx",
+];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedSystemName {
+    pub prefix: String,
+    pub middle: String,
+    pub suffix: String,
+    pub grid_x: i32,
+    pub grid_y: i32,
+    pub grid_z: u32,
+}
 
 #[inline]
 fn mix64(mut z: u64) -> u64 {
@@ -36,6 +62,7 @@ fn mix64(mut z: u64) -> u64 {
     z = z.wrapping_mul(MIX2);
     z ^ (z >> 31)
 }
+
 
 #[inline]
 fn wrap_angle_radians(radians: f32) -> f32 {
@@ -366,6 +393,49 @@ pub struct SystemSummary {
     pub pos: [f32; 3],
     pub represented_systems: u32,
     pub primary_star: StellarClassification,
+    #[serde(default)]
+    pub population_band: StellarPopulationBand,
+    #[serde(default)]
+    pub stellar_age_gyr: f32,
+    #[serde(default = "default_metallicity")]
+    pub metallicity: f32,
+    #[serde(default)]
+    pub architecture: SystemArchitecture,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum StellarPopulationBand {
+    #[default]
+    ThinDisk,
+    ThickDisk,
+    BulgeBar,
+    Spur,
+    Halo,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SystemArchitecture {
+    #[default]
+    Solitary,
+    BinaryWide,
+    BinaryClose,
+    TripleHierarchical,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RegionProfile {
+    macro_density: f32,
+    metallicity: f32,
+    stellar_age_gyr: f32,
+    thin_disk_weight: f32,
+    thick_disk_weight: f32,
+    bulge_bar_weight: f32,
+    spur_weight: f32,
+    halo_weight: f32,
+}
+
+const fn default_metallicity() -> f32 {
+    1.0
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -874,6 +944,14 @@ pub struct SystemDetail {
     pub represented_systems: u32,
     pub stars: Vec<StarBody>,
     pub planets: Vec<PlanetBody>,
+    #[serde(default)]
+    pub population_band: StellarPopulationBand,
+    #[serde(default)]
+    pub stellar_age_gyr: f32,
+    #[serde(default = "default_metallicity")]
+    pub metallicity: f32,
+    #[serde(default)]
+    pub architecture: SystemArchitecture,
     pub explored: bool,
     pub favorite: bool,
     pub note: Option<String>,
@@ -1012,6 +1090,87 @@ impl GalaxyGenerator {
         )
     }
 
+    fn sector_name_parts_from_coord(&self, coord: SectorCoord) -> (&'static str, &'static str, &'static str) {
+        let seed = mix64(
+            self.cfg.galaxy_seed
+                ^ REGION_DOMAIN_TAG
+                ^ (coord.x as i64 as u64).wrapping_mul(SECTOR_HASH_X)
+                ^ (coord.y as i64 as u64).wrapping_mul(SECTOR_HASH_Y),
+        );
+        let p = ((seed >> 0) as usize) % SECTOR_NAME_PREFIXES.len();
+        let m = ((seed >> 10) as usize) % SECTOR_NAME_MIDDLES.len();
+        let s = ((seed >> 20) as usize) % SECTOR_NAME_SUFFIXES.len();
+        (SECTOR_NAME_PREFIXES[p], SECTOR_NAME_MIDDLES[m], SECTOR_NAME_SUFFIXES[s])
+    }
+
+    fn sector_name_from_coord(&self, coord: SectorCoord) -> String {
+        let (prefix, middle, suffix) = self.sector_name_parts_from_coord(coord);
+        format!("{prefix}-{middle}-{suffix}")
+    }
+
+    fn format_system_name_from_parts(
+        prefix: &str,
+        middle: &str,
+        suffix: &str,
+        x: i32,
+        y: i32,
+        z: u32,
+    ) -> String {
+        format!("{prefix}-{middle}-{suffix} {x} {y} {z}")
+    }
+
+    pub fn parse_system_name_exact(input: &str) -> Option<ParsedSystemName> {
+        let tokens = input.split_whitespace().collect::<Vec<_>>();
+        if tokens.len() != 4 {
+            return None;
+        }
+        let sector_parts = tokens[0].split('-').collect::<Vec<_>>();
+        if sector_parts.len() != 3
+            || sector_parts.iter().any(|part| part.is_empty())
+        {
+            return None;
+        }
+        let grid_x = tokens[1].parse::<i32>().ok()?;
+        let grid_y = tokens[2].parse::<i32>().ok()?;
+        let grid_z = tokens[3].parse::<u32>().ok()?;
+        Some(ParsedSystemName {
+            prefix: sector_parts[0].to_owned(),
+            middle: sector_parts[1].to_owned(),
+            suffix: sector_parts[2].to_owned(),
+            grid_x,
+            grid_y,
+            grid_z,
+        })
+    }
+
+    pub fn canonical_system_name(&self, id: SystemId) -> String {
+        let (prefix, middle, suffix) = self.sector_name_parts_from_coord(id.sector);
+        Self::format_system_name_from_parts(
+            prefix,
+            middle,
+            suffix,
+            id.sector.x,
+            id.sector.y,
+            id.local_index,
+        )
+    }
+
+    pub fn find_system_by_exact_name(&self, input: &str) -> Option<SystemSummary> {
+        let parsed = Self::parse_system_name_exact(input)?;
+        let sector = SectorCoord {
+            x: parsed.grid_x,
+            y: parsed.grid_y,
+        };
+        let expected = self.sector_name_parts_from_coord(sector);
+        if parsed.prefix != expected.0 || parsed.middle != expected.1 || parsed.suffix != expected.2 {
+            return None;
+        }
+        let systems = self.generate_sector(sector);
+        systems
+            .into_iter()
+            .find(|summary| summary.id.local_index == parsed.grid_z)
+    }
+
     fn sector_bounds(&self, coord: SectorCoord) -> (f32, f32, f32, f32) {
         let x0 = self.cfg.center[0] + coord.x as f32 * self.cfg.sector_size;
         let y0 = self.cfg.center[1] + coord.y as f32 * self.cfg.sector_size;
@@ -1055,43 +1214,85 @@ impl GalaxyGenerator {
         strongest.clamp(0.0, 1.0)
     }
 
-    fn position_density_weight(&self, x: f32, y: f32) -> f32 {
+    fn region_profile(&self, x: f32, y: f32) -> RegionProfile {
         let dx = x - self.cfg.center[0];
         let dy = y - self.cfg.center[1];
         let radial = self.radial_from_center(x, y);
-        if radial > self.cfg.playfield_radius {
+        let radial01 = (radial / self.cfg.playfield_radius).clamp(0.0, 1.0);
+        let theta = dy.atan2(dx);
+        let arm = self.arm_signal(theta, radial).powf(2.4);
+
+        let bar_angle: f32 = 0.52;
+        let cos_a = bar_angle.cos();
+        let sin_a = bar_angle.sin();
+        let bar_x = dx * cos_a + dy * sin_a;
+        let bar_y = -dx * sin_a + dy * cos_a;
+        let bar_major = (self.cfg.bulge_radius * 1.35).max(1.0);
+        let bar_minor = (self.cfg.bulge_radius * 0.48).max(1.0);
+        let bar_ell = (bar_x / bar_major).powi(2) + (bar_y / bar_minor).powi(2);
+        let bar = (-0.5 * bar_ell).exp();
+
+        let bulge_sigma = (self.cfg.bulge_radius * 0.75).max(1.0);
+        let bulge = (-0.5 * (radial / bulge_sigma).powi(2)).exp();
+        let spur = (arm * (1.0 - radial01).powf(0.55)).clamp(0.0, 1.0);
+        let halo = radial01.powf(2.4);
+
+        let disk_term = (1.0 - radial01)
+            .powf((self.cfg.radial_falloff_exp * RADIAL_FALLOFF_STEEPNESS).max(0.05));
+        let macro_density = (disk_term * ((1.0 - self.cfg.arm_contrast) + self.cfg.arm_contrast * arm)
+            + 0.36 * bulge
+            + 0.24 * bar)
+            .clamp(0.0, 1.0);
+
+        let metallicity = (1.55
+            - 0.88 * radial01
+            + 0.22 * arm
+            + 0.20 * bulge
+            + 0.09 * bar
+            - 0.28 * halo)
+            .clamp(0.06, 2.3);
+        let stellar_age_gyr = (12.2
+            - 7.0 * metallicity
+            + 2.1 * radial01
+            + 0.9 * (1.0 - arm)
+            + 1.1 * halo)
+            .clamp(0.3, 13.4);
+
+        let thin_disk_weight = (0.58 * arm + 0.25 * (1.0 - radial01)).max(0.0);
+        let thick_disk_weight = (0.18 + 0.32 * radial01 * (1.0 - bulge)).max(0.0);
+        let bulge_bar_weight = (0.72 * bulge + 0.55 * bar).max(0.0);
+        let spur_weight = (0.46 * spur * (1.0 - bulge)).max(0.0);
+        let halo_weight = (0.09 + 0.32 * halo * (1.0 - arm)).max(0.0);
+
+        RegionProfile {
+            macro_density,
+            metallicity,
+            stellar_age_gyr,
+            thin_disk_weight,
+            thick_disk_weight,
+            bulge_bar_weight,
+            spur_weight,
+            halo_weight,
+        }
+    }
+
+    fn position_density_weight(&self, x: f32, y: f32) -> f32 {
+        if self.radial_from_center(x, y) > self.cfg.playfield_radius {
             return 0.0;
         }
-
-        let radial01 = (radial / self.cfg.playfield_radius).clamp(0.0, 1.0);
-        let disk_term = (1.0 - radial01).powf(self.cfg.radial_falloff_exp);
-        let theta = dy.atan2(dx);
-        let arm = self.arm_signal(theta, radial).powf(ARM_DENSITY_SHARPNESS);
-        let arm_term = (1.0 - self.cfg.arm_contrast) + self.cfg.arm_contrast * arm;
-
-        let bulge_sigma = (self.cfg.bulge_radius * 0.55).max(1.0);
-        let bulge = (-0.5 * (radial / bulge_sigma).powi(2)).exp();
-
-        (disk_term * arm_term + 0.28 * bulge).clamp(0.0, 1.0)
+        let profile = self.region_profile(x, y);
+        (profile.macro_density + POSITION_BULGE_WEIGHT * profile.bulge_bar_weight).clamp(0.0, 1.0)
     }
 
     fn sector_density_factor(&self, x: f32, y: f32) -> f32 {
-        let dx = x - self.cfg.center[0];
-        let dy = y - self.cfg.center[1];
-        let radial = self.radial_from_center(x, y);
-        if radial > self.cfg.playfield_radius {
+        if self.radial_from_center(x, y) > self.cfg.playfield_radius {
             return 0.0;
         }
-
-        let radial01 = (radial / self.cfg.playfield_radius).clamp(0.0, 1.0);
-        let disk_term = (1.0 - radial01).powf(self.cfg.radial_falloff_exp);
-        let theta = dy.atan2(dx);
-        let arm_term = self.arm_signal(theta, radial).powf(ARM_DENSITY_SHARPNESS);
-        let bulge_term = (-0.5 * (radial / self.cfg.bulge_radius.max(1.0)).powi(2)).exp();
-
-        (disk_term * ((1.0 - self.cfg.arm_contrast) + self.cfg.arm_contrast * arm_term)
-            + 0.24 * bulge_term)
-            .max(0.0)
+        let profile = self.region_profile(x, y);
+        (profile.macro_density
+            + SECTOR_BULGE_WEIGHT * profile.bulge_bar_weight
+            + 0.06 * profile.spur_weight)
+            .clamp(0.0, 1.0)
     }
 
     fn best_sector_position_sample(
@@ -1377,8 +1578,70 @@ impl GalaxyGenerator {
         class.definition().generation_scales
     }
 
-    fn sample_stellar_class(rng: &mut StdRng) -> StellarClassification {
-        let spectral = Self::sample_spectral_class_from_roll(rng.r#gen::<f32>());
+    fn sample_population_band_from_profile(
+        rng: &mut StdRng,
+        profile: RegionProfile,
+    ) -> StellarPopulationBand {
+        let total = profile.thin_disk_weight
+            + profile.thick_disk_weight
+            + profile.bulge_bar_weight
+            + profile.spur_weight
+            + profile.halo_weight;
+        if total <= 0.0 {
+            return StellarPopulationBand::ThinDisk;
+        }
+        let mut pick = rng.r#gen::<f32>() * total;
+        let weights = [
+            (StellarPopulationBand::ThinDisk, profile.thin_disk_weight),
+            (StellarPopulationBand::ThickDisk, profile.thick_disk_weight),
+            (StellarPopulationBand::BulgeBar, profile.bulge_bar_weight),
+            (StellarPopulationBand::Spur, profile.spur_weight),
+            (StellarPopulationBand::Halo, profile.halo_weight),
+        ];
+        for (band, weight) in weights {
+            if pick <= weight {
+                return band;
+            }
+            pick -= weight;
+        }
+        StellarPopulationBand::ThinDisk
+    }
+
+    fn sample_spectral_class_from_profile(
+        rng: &mut StdRng,
+        profile: RegionProfile,
+        band: StellarPopulationBand,
+    ) -> SpectralClass {
+        let young_boost = ((6.5 - profile.stellar_age_gyr) / 6.5).clamp(0.0, 1.0);
+        let metal_boost = (profile.metallicity - 1.0).clamp(-0.7, 0.9);
+        let evolved_boost = ((profile.stellar_age_gyr - 8.0) / 5.0).clamp(0.0, 1.0);
+        let halo_boost = if band == StellarPopulationBand::Halo { 0.35 } else { 0.0 };
+        let remnant_boost = (evolved_boost + halo_boost * 0.7).clamp(0.0, 0.85);
+
+        let mut roll = rng.r#gen::<f32>();
+        roll = (roll * (1.0 - 0.22 * remnant_boost) + 0.08 * remnant_boost).clamp(0.0, 1.0);
+
+        let remnant_roll = rng.r#gen::<f32>();
+        if remnant_roll < 0.0008 + remnant_boost * 0.0055 {
+            return SpectralClass::BH;
+        }
+        if remnant_roll < 0.0026 + remnant_boost * 0.012 {
+            return SpectralClass::NS;
+        }
+
+        // Bias towards hot stars in young metal-rich regions, and cool stars in old populations.
+        if young_boost > 0.0 && metal_boost > -0.2 {
+            roll *= 1.0 - 0.15 * young_boost;
+        } else if evolved_boost > 0.0 {
+            roll = (roll + 0.18 * evolved_boost).clamp(0.0, 1.0);
+        }
+
+        Self::sample_spectral_class_from_roll(roll)
+    }
+
+    fn sample_stellar_class(rng: &mut StdRng, profile: RegionProfile) -> StellarClassification {
+        let band = Self::sample_population_band_from_profile(rng, profile);
+        let spectral = Self::sample_spectral_class_from_profile(rng, profile, band);
         if spectral == SpectralClass::BH {
             return StellarClassification::new(SpectralClass::BH, 0, LuminosityClass::VII);
         }
@@ -1396,12 +1659,10 @@ impl GalaxyGenerator {
         StellarClassification::new(spectral, subclass, luminosity)
     }
 
-    fn sample_stellar_class_from_seed(seed: u64) -> StellarClassification {
-        let spectral_roll = unit_f32_from_u64(mix64(seed ^ 0xA6B0_14D7_2FD1_8A43));
-        let subclass_roll = unit_f32_from_u64(mix64(seed ^ 0x53B2_04E7_7C39_4F9A));
-        let luminosity_roll = unit_f32_from_u64(mix64(seed ^ 0x9FA7_1CE5_DA03_B56C));
-
-        let spectral = Self::sample_spectral_class_from_roll(spectral_roll);
+    fn sample_stellar_class_from_seed(seed: u64, profile: RegionProfile) -> StellarClassification {
+        let mut rng = StdRng::seed_from_u64(seed ^ 0xA6B0_14D7_2FD1_8A43);
+        let band = Self::sample_population_band_from_profile(&mut rng, profile);
+        let spectral = Self::sample_spectral_class_from_profile(&mut rng, profile, band);
         if spectral == SpectralClass::BH {
             return StellarClassification::new(SpectralClass::BH, 0, LuminosityClass::VII);
         }
@@ -1409,15 +1670,36 @@ impl GalaxyGenerator {
             return StellarClassification::new(
                 SpectralClass::NS,
                 0,
-                Self::sample_luminosity_class_for_spectral(spectral, luminosity_roll),
+                Self::sample_luminosity_class_for_spectral(spectral, rng.r#gen::<f32>()),
             );
         }
 
-        let subclass = Self::sample_spectral_subclass_from_roll(subclass_roll);
-        let luminosity =
-            Self::sample_luminosity_class_for_spectral(spectral, luminosity_roll);
+        let subclass = Self::sample_spectral_subclass_from_roll(rng.r#gen::<f32>());
+        let luminosity = Self::sample_luminosity_class_for_spectral(spectral, rng.r#gen::<f32>());
 
         StellarClassification::new(spectral, subclass, luminosity)
+    }
+
+    fn sample_system_architecture(
+        rng: &mut StdRng,
+        primary_mass_solar: f32,
+        profile: RegionProfile,
+    ) -> SystemArchitecture {
+        let multiplicity_base = (0.18
+            + 0.22 * (primary_mass_solar / 1.7).clamp(0.0, 1.0)
+            + 0.11 * (profile.metallicity - 0.8).clamp(0.0, 0.9)
+            + 0.08 * ((5.0 - profile.stellar_age_gyr) / 5.0).clamp(0.0, 1.0))
+            .clamp(0.05, 0.88);
+        let roll = rng.r#gen::<f32>();
+        if roll < multiplicity_base * 0.55 {
+            SystemArchitecture::BinaryWide
+        } else if roll < multiplicity_base * 0.85 {
+            SystemArchitecture::BinaryClose
+        } else if roll < multiplicity_base {
+            SystemArchitecture::TripleHierarchical
+        } else {
+            SystemArchitecture::Solitary
+        }
     }
 
     fn sample_star_body(rng: &mut StdRng, class: StellarClassification) -> StarBody {
@@ -2742,7 +3024,11 @@ impl GalaxyGenerator {
         Self::enforce_thermal_kind_constraints(kind, equilibrium_temp)
     }
 
-    fn sample_planets(rng: &mut StdRng, stars: &[StarBody]) -> Vec<PlanetBody> {
+    fn sample_planets_v2(
+        rng: &mut StdRng,
+        stars: &[StarBody],
+        profile: RegionProfile,
+    ) -> Vec<PlanetBody> {
         let avg_luminosity = if stars.is_empty() {
             1.0
         } else {
@@ -2754,13 +3040,19 @@ impl GalaxyGenerator {
             .map(|s| s.mass_solar.max(0.02))
             .sum::<f32>()
             .max(0.08);
+        let snow_line_au = (2.7 * avg_luminosity.sqrt()).clamp(0.6, 24.0);
+        let planet_budget_factor =
+            (0.75 + 0.7 * profile.metallicity + 0.16 * (5.0 - profile.stellar_age_gyr).max(0.0))
+                .clamp(0.45, 2.2);
 
-        let body_count = match rng.r#gen::<f32>() {
+        let mut body_count = match rng.r#gen::<f32>() {
             roll if roll < 0.10 => 0,
             roll if roll < 0.30 => rng.gen_range(1..=3),
             roll if roll < 0.75 => rng.gen_range(4..=8),
             _ => rng.gen_range(9..=14),
         };
+        body_count = ((body_count as f32) * planet_budget_factor).round() as usize;
+        body_count = body_count.min(18);
 
         if body_count == 0 {
             return Vec::new();
@@ -2771,12 +3063,27 @@ impl GalaxyGenerator {
         primary_count = primary_count.clamp(1, body_count);
 
         let mut planets = Vec::with_capacity(body_count);
-        let mut orbit: f32 = rng.gen_range(0.20..0.70);
+        let mut orbit: f32 = rng.gen_range(0.12..0.55);
 
         for _ in 0..primary_count {
-            orbit += rng.gen_range(0.12..2.30);
+            let orbit_step = if orbit < snow_line_au * 0.7 {
+                rng.gen_range(0.10..0.55)
+            } else if orbit < snow_line_au * 1.8 {
+                rng.gen_range(0.28..1.60)
+            } else {
+                rng.gen_range(0.60..2.80)
+            };
+            orbit += orbit_step;
             let equilibrium_temp = Self::equilibrium_temperature_k(avg_luminosity, orbit);
-            let kind = Self::classify_primary_kind(rng, equilibrium_temp);
+            let mut kind = Self::classify_primary_kind(rng, equilibrium_temp);
+            if orbit >= snow_line_au && rng.r#gen::<f32>() < (0.24 * profile.metallicity).clamp(0.05, 0.40)
+            {
+                kind = Self::classify_gas_giant_kind(rng, equilibrium_temp);
+            } else if orbit < snow_line_au * 0.75
+                && rng.r#gen::<f32>() < (0.20 + 0.22 * profile.metallicity).clamp(0.08, 0.45)
+            {
+                kind = PlanetKind::MetalRich;
+            }
 
             let (radius_earth, mass_earth) =
                 Self::sample_planet_size_and_mass(rng, kind, false);
@@ -2835,9 +3142,20 @@ impl GalaxyGenerator {
             // If no suitable host exists (or by chance), create another primary body.
             let add_primary = host_candidates.is_empty() || rng.r#gen::<f32>() < 0.24;
             if add_primary {
-                orbit += rng.gen_range(0.08..1.70);
+                let orbit_step = if orbit < snow_line_au * 0.65 {
+                    rng.gen_range(0.08..0.50)
+                } else if orbit < snow_line_au * 2.0 {
+                    rng.gen_range(0.28..1.25)
+                } else {
+                    rng.gen_range(0.55..2.15)
+                };
+                orbit += orbit_step;
                 let equilibrium_temp = Self::equilibrium_temperature_k(avg_luminosity, orbit);
-                let kind = Self::classify_primary_kind(rng, equilibrium_temp);
+                let mut kind = Self::classify_primary_kind(rng, equilibrium_temp);
+                if orbit >= snow_line_au && rng.r#gen::<f32>() < (0.20 * profile.metallicity).clamp(0.05, 0.35)
+                {
+                    kind = Self::classify_gas_giant_kind(rng, equilibrium_temp);
+                }
 
                 let (radius_earth, mass_earth) =
                     Self::sample_planet_size_and_mass(rng, kind, false);
@@ -3077,12 +3395,22 @@ impl GalaxyGenerator {
                     let represented = represented_base
                         + usize::from(point_index < represented_remainder) as u64;
                     let star_seed = self.system_seed(id);
+                    let region_profile = self.region_profile(sampled_x, sampled_y);
+                    let mut region_rng = StdRng::seed_from_u64(star_seed ^ REGION_DOMAIN_TAG);
+                    let population_band =
+                        Self::sample_population_band_from_profile(&mut region_rng, region_profile);
+                    let architecture =
+                        Self::sample_system_architecture(&mut region_rng, 1.0, region_profile);
 
                     systems.push(SystemSummary {
                         id,
                         pos: [sampled_x, sampled_y, z],
                         represented_systems: represented.min(u32::MAX as u64) as u32,
-                        primary_star: Self::sample_stellar_class_from_seed(star_seed),
+                        primary_star: Self::sample_stellar_class_from_seed(star_seed, region_profile),
+                        population_band,
+                        stellar_age_gyr: region_profile.stellar_age_gyr,
+                        metallicity: region_profile.metallicity,
+                        architecture,
                     });
                 }
             }
@@ -3134,35 +3462,32 @@ impl GalaxyGenerator {
         let mut rng = StdRng::seed_from_u64(seed);
         let is_black_hole_system = summary.primary_star.spectral == SpectralClass::BH;
 
-        let star_count = if is_black_hole_system {
-            1
+        let region_profile = self.region_profile(summary.pos[0], summary.pos[1]);
+        let primary_star = Self::sample_star_body(&mut rng, summary.primary_star);
+        let architecture = if is_black_hole_system {
+            SystemArchitecture::Solitary
         } else {
-            match rng.r#gen::<f32>() {
-                roll if roll < 0.73 => 1,
-                roll if roll < 0.95 => 2,
-                _ => 3,
-            }
+            Self::sample_system_architecture(&mut rng, primary_star.mass_solar, region_profile)
+        };
+        let companion_count = match architecture {
+            SystemArchitecture::Solitary => 0usize,
+            SystemArchitecture::BinaryWide | SystemArchitecture::BinaryClose => 1usize,
+            SystemArchitecture::TripleHierarchical => 2usize,
         };
 
-        let mut stars = Vec::with_capacity(star_count);
-        for idx in 0..star_count {
-            let class = if idx == 0 {
-                summary.primary_star
-            } else {
-                Self::sample_stellar_class(&mut rng)
-            };
+        let mut stars = Vec::with_capacity(1 + companion_count);
+        stars.push(primary_star);
+        for _ in 0..companion_count {
+            let class = Self::sample_stellar_class(&mut rng, region_profile);
             stars.push(Self::sample_star_body(&mut rng, class));
         }
 
-        let planets = if is_black_hole_system {
+        let planets = if is_black_hole_system || architecture == SystemArchitecture::BinaryClose {
             Vec::new()
         } else {
-            Self::sample_planets(&mut rng, &stars)
+            Self::sample_planets_v2(&mut rng, &stars, region_profile)
         };
-        let canonical_name = format!(
-            "SYS-{}-{}-{:05}",
-            summary.id.sector.x, summary.id.sector.y, summary.id.local_index
-        );
+        let canonical_name = self.canonical_system_name(summary.id);
 
         SystemDetail {
             id: summary.id,
@@ -3172,6 +3497,10 @@ impl GalaxyGenerator {
             represented_systems: summary.represented_systems.max(1),
             stars,
             planets,
+            population_band: summary.population_band,
+            stellar_age_gyr: summary.stellar_age_gyr,
+            metallicity: summary.metallicity,
+            architecture: summary.architecture,
             explored: false,
             favorite: false,
             note: None,
@@ -3486,6 +3815,144 @@ mod tests {
         let b = generator.generate_system_detail(&summary);
 
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn canonical_system_name_is_deterministic_and_structured() {
+        let generator = GalaxyGenerator::new(GeneratorConfig::default());
+        let id = SystemId {
+            sector: SectorCoord { x: -14, y: 27 },
+            local_index: 842,
+        };
+        let a = generator.canonical_system_name(id);
+        let b = generator.canonical_system_name(id);
+        assert_eq!(a, b);
+
+        let parts: Vec<&str> = a.split_whitespace().collect();
+        assert_eq!(parts.len(), 4);
+        let sector_parts = parts[0].split('-').collect::<Vec<_>>();
+        assert_eq!(sector_parts.len(), 3);
+        assert_eq!(parts[1], "-14");
+        assert_eq!(parts[2], "27");
+        assert_eq!(parts[3], "842");
+    }
+
+    #[test]
+    fn parse_system_name_exact_accepts_only_strict_contract() {
+        let parsed = GalaxyGenerator::parse_system_name_exact("Lora-Nel-A 12 -4 83")
+            .expect("valid exact format should parse");
+        assert_eq!(parsed.prefix, "Lora");
+        assert_eq!(parsed.middle, "Nel");
+        assert_eq!(parsed.suffix, "A");
+        assert_eq!(parsed.grid_x, 12);
+        assert_eq!(parsed.grid_y, -4);
+        assert_eq!(parsed.grid_z, 83);
+
+        assert!(GalaxyGenerator::parse_system_name_exact("LoraNelA 12 -4 83").is_none());
+        assert!(GalaxyGenerator::parse_system_name_exact("Lora-Nel-A 12 -4").is_none());
+        assert!(GalaxyGenerator::parse_system_name_exact("Lora-Nel-A 12 -4 83 extra").is_none());
+        assert!(GalaxyGenerator::parse_system_name_exact("Lora-Nel-A 12.2 -4 83").is_none());
+    }
+
+    #[test]
+    fn exact_name_mapping_is_stable_and_resolvable() {
+        let generator = GalaxyGenerator::new(GeneratorConfig::default());
+        let id = SystemId {
+            sector: SectorCoord { x: 5, y: -11 },
+            local_index: 23,
+        };
+        let canonical = generator.canonical_system_name(id);
+        let resolved = generator
+            .find_system_by_exact_name(&canonical)
+            .expect("canonical name must resolve");
+        assert_eq!(resolved.id, id);
+
+        let parsed = GalaxyGenerator::parse_system_name_exact(&canonical).expect("must parse");
+        let reconstructed = SystemId {
+            sector: SectorCoord {
+                x: parsed.grid_x,
+                y: parsed.grid_y,
+            },
+            local_index: parsed.grid_z,
+        };
+        assert_eq!(reconstructed, id);
+        assert_eq!(generator.canonical_system_name(reconstructed), canonical);
+
+        let wrong_sector = canonical.replacen('-', "_", 1);
+        assert!(generator.find_system_by_exact_name(&wrong_sector).is_none());
+    }
+
+    #[test]
+    fn exact_name_lookup_uses_local_index_not_vector_position() {
+        let generator = GalaxyGenerator::new(GeneratorConfig::default());
+        let systems = (-24..=24)
+            .flat_map(|x| (-24..=24).map(move |y| SectorCoord { x, y }))
+            .find_map(|coord| {
+                let systems = generator.generate_sector(coord);
+                if systems.is_empty() {
+                    None
+                } else {
+                    Some(systems)
+                }
+            })
+            .expect("at least one non-empty sector should exist");
+        let target = systems
+            .iter()
+            .enumerate()
+            .find_map(|(idx, summary)| {
+                (summary.id.local_index as usize != idx).then_some(*summary)
+            })
+            .or_else(|| systems.first().copied())
+            .expect("sector must contain at least one system");
+
+        let canonical = generator.canonical_system_name(target.id);
+        let resolved = generator
+            .find_system_by_exact_name(&canonical)
+            .expect("canonical name should resolve by local_index");
+        assert_eq!(resolved.id, target.id);
+    }
+
+    #[test]
+    fn summary_context_fields_are_deterministic() {
+        let generator = GalaxyGenerator::new(GeneratorConfig {
+            target_system_count: 35_000_000,
+            min_materialized_per_sector: 48,
+            max_materialized_per_sector: 256,
+            ..Default::default()
+        });
+
+        let coord = SectorCoord { x: 8, y: -6 };
+        let systems = generator.generate_sector(coord);
+        let chosen = systems
+            .iter()
+            .find(|s| s.id.local_index % 5 == 0)
+            .copied()
+            .expect("sector should contain sampled systems");
+        let again = generator
+            .generate_sector(coord)
+            .into_iter()
+            .find(|s| s.id == chosen.id)
+            .expect("same system id should reappear deterministically");
+
+        assert_eq!(chosen.population_band, again.population_band);
+        assert_eq!(chosen.architecture, again.architecture);
+        assert_eq!(chosen.stellar_age_gyr, again.stellar_age_gyr);
+        assert_eq!(chosen.metallicity, again.metallicity);
+        assert!(chosen.stellar_age_gyr >= 0.3 && chosen.stellar_age_gyr <= 13.4);
+        assert!(chosen.metallicity >= 0.06 && chosen.metallicity <= 2.3);
+    }
+
+    #[test]
+    fn center_sector_is_denser_than_outer_sector() {
+        let generator = GalaxyGenerator::new(GeneratorConfig {
+            target_system_count: 50_000_000,
+            min_materialized_per_sector: 64,
+            max_materialized_per_sector: 512,
+            ..Default::default()
+        });
+        let center = generator.generate_sector(SectorCoord { x: 0, y: 0 }).len();
+        let outer = generator.generate_sector(SectorCoord { x: 20, y: 20 }).len();
+        assert!(center > outer);
     }
 
     #[test]

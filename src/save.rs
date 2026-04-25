@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use crate::events::GameEvent;
 use crate::game_state::{ColonyBuildingKind, ColonyBuildingSite, ColonyBuildingState, ColonyState, GameState};
+use crate::procedural_galaxy::GALAXY_GENERATION_SCHEMA_VERSION;
 
 const SAVE_VERSION_V1: u32 = 1;
 const SAVE_VERSION_V2: u32 = 2;
@@ -23,8 +24,14 @@ const V1_TO_V2_COLONIZATION_RANGE_SCALE: f32 = 0.05;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct GameSaveFile {
     version: u32,
+    #[serde(default = "default_generation_schema_version")]
+    galaxy_generation: u64,
     state: GameState,
     events: Vec<GameEvent>,
+}
+
+const fn default_generation_schema_version() -> u64 {
+    GALAXY_GENERATION_SCHEMA_VERSION
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -291,6 +298,7 @@ fn migrate_legacy_v0(raw: Value) -> io::Result<GameSaveFile> {
     if let Ok(v0) = serde_json::from_value::<GameSaveFileV0>(raw.clone()) {
         let file = GameSaveFile {
             version: SAVE_VERSION_V2,
+            galaxy_generation: GALAXY_GENERATION_SCHEMA_VERSION,
             state: v0.state,
             events: v0.events,
         };
@@ -304,6 +312,7 @@ fn migrate_legacy_v0(raw: Value) -> io::Result<GameSaveFile> {
     if let Ok(state_only) = serde_json::from_value::<GameState>(raw) {
         let file = GameSaveFile {
             version: SAVE_VERSION_V2,
+            galaxy_generation: GALAXY_GENERATION_SCHEMA_VERSION,
             state: state_only,
             events: Vec::new(),
         };
@@ -331,6 +340,9 @@ pub fn load_game_save(path: impl AsRef<Path>) -> io::Result<(GameState, Vec<Game
     };
 
     let mut parsed = parse_game_save_file(&content)?;
+    if parsed.galaxy_generation != GALAXY_GENERATION_SCHEMA_VERSION {
+        return Ok((GameState::default(), Vec::new()));
+    }
     for colony in parsed.state.colonies.values_mut() {
         seed_element_stockpiles(colony);
     }
@@ -351,6 +363,7 @@ pub fn save_game_save(
 
     let file = GameSaveFile {
         version: CURRENT_SAVE_VERSION,
+        galaxy_generation: GALAXY_GENERATION_SCHEMA_VERSION,
         state: state.clone(),
         events: events.to_vec(),
     };
@@ -377,6 +390,7 @@ pub fn save_game_save_compact_owned(
 
     let file = GameSaveFile {
         version: CURRENT_SAVE_VERSION,
+        galaxy_generation: GALAXY_GENERATION_SCHEMA_VERSION,
         state,
         events,
     };
@@ -612,5 +626,29 @@ mod tests {
             "unexpected error message: {}",
             err
         );
+    }
+
+    #[test]
+    fn load_resets_when_galaxy_generation_mismatches() {
+        let mut path = std::env::temp_dir();
+        path.push("galaxy_save_generation_mismatch_test.json");
+        let raw = json!({
+            "version": CURRENT_SAVE_VERSION,
+            "galaxy_generation": GALAXY_GENERATION_SCHEMA_VERSION + 999,
+            "state": GameState::default(),
+            "events": [],
+        });
+        fs::write(
+            &path,
+            serde_json::to_string(&raw).expect("save fixture should serialize"),
+        )
+        .expect("test save should write");
+
+        let (state, events) = load_game_save(&path).expect("load should not fail");
+        assert!(state.colonies.is_empty());
+        assert!(state.explored_systems.is_empty());
+        assert!(events.is_empty());
+
+        let _ = fs::remove_file(path);
     }
 }

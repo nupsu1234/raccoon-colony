@@ -68,14 +68,14 @@ const HOME_MIN_SEPARATION_FACTOR: f32 = 0.24;
 
 #[derive(Clone, Copy, Debug)]
 pub struct AiHomeSpawnConfig {
-    /// Maximum radius from galaxy center where AI home positions are placed.
-    pub cluster_radius_world: f32,
+    /// Radius of the randomized population bubble where AI homes are placed.
+    pub bubble_radius_world: f32,
 }
 
 impl Default for AiHomeSpawnConfig {
     fn default() -> Self {
         Self {
-            cluster_radius_world: 5_200.0,
+            bubble_radius_world: 5_200.0,
         }
     }
 }
@@ -87,20 +87,29 @@ fn generate_home_positions(
 ) -> Vec<[f32; 3]> {
     let cfg = generator.config();
     let mut rng = StdRng::seed_from_u64(cfg.galaxy_seed.wrapping_add(0xA1_FA_C7_10));
-    let center = cfg.center;
+    let galaxy_center = cfg.center;
     let z_mid = (cfg.z_min + cfg.z_max) * 0.5;
-    let max_radius = spawn_config.cluster_radius_world.clamp(900.0, 30_000.0);
+    let max_radius = spawn_config.bubble_radius_world.clamp(900.0, 30_000.0);
     let min_radius = (max_radius * 0.20).max(220.0);
     let min_separation = (max_radius * HOME_MIN_SEPARATION_FACTOR).max(520.0);
     let target_count = AI_FACTION_IDS.len();
+    let bubble_center_max_radius = (cfg.playfield_radius - max_radius - cfg.sector_size * 1.5).max(0.0);
+    let bubble_angle = rng.gen_range(0.0..std::f32::consts::TAU);
+    let bubble_radius_t: f32 = rng.gen_range(0.0..1.0);
+    let bubble_center_radius = bubble_radius_t.sqrt() * bubble_center_max_radius;
+    let bubble_center = [
+        galaxy_center[0] + bubble_angle.cos() * bubble_center_radius,
+        galaxy_center[1] + bubble_angle.sin() * bubble_center_radius,
+        z_mid,
+    ];
 
     let sample_point = |rng: &mut StdRng| -> [f32; 3] {
         let angle: f32 = rng.gen_range(0.0..std::f32::consts::TAU);
         let radius_t: f32 = rng.gen_range(0.0..1.0);
         let radius = min_radius + radius_t.sqrt() * (max_radius - min_radius);
         [
-            center[0] + angle.cos() * radius,
-            center[1] + angle.sin() * radius,
+            bubble_center[0] + angle.cos() * radius,
+            bubble_center[1] + angle.sin() * radius,
             z_mid + rng.gen_range(-1800.0..1800.0),
         ]
     };
@@ -144,12 +153,21 @@ fn generate_home_positions(
                 }
             }
             // Clamp back into spawn annulus.
-            let ox = picked[0] - center[0];
-            let oy = picked[1] - center[1];
+            let ox = picked[0] - bubble_center[0];
+            let oy = picked[1] - bubble_center[1];
             let radial = (ox * ox + oy * oy).sqrt().max(0.001);
             let clamped_r = radial.clamp(min_radius, max_radius);
-            picked[0] = center[0] + ox / radial * clamped_r;
-            picked[1] = center[1] + oy / radial * clamped_r;
+            picked[0] = bubble_center[0] + ox / radial * clamped_r;
+            picked[1] = bubble_center[1] + oy / radial * clamped_r;
+        }
+        // Keep homes inside the playable galaxy radius.
+        let gx = picked[0] - galaxy_center[0];
+        let gy = picked[1] - galaxy_center[1];
+        let g_radial = (gx * gx + gy * gy).sqrt().max(0.001);
+        let max_allowed = (cfg.playfield_radius - cfg.sector_size * 0.5).max(1.0);
+        if g_radial > max_allowed {
+            picked[0] = galaxy_center[0] + gx / g_radial * max_allowed;
+            picked[1] = galaxy_center[1] + gy / g_radial * max_allowed;
         }
         positions.push(picked);
     }
@@ -415,6 +433,7 @@ fn bootstrap_colony(
 
     let mut strict_best: Option<BootstrapPick> = None;
     let mut relaxed_best: Option<BootstrapPick> = None;
+    let mut candidate_summaries: Vec<SystemSummary> = Vec::new();
     let mut evaluated = 0usize;
     // Search expanding rings of sectors around home_pos.
     'search: for radius in 0i32..=6 {
@@ -428,7 +447,7 @@ fn bootstrap_colony(
                     y: sy + dy,
                 };
                 let systems = generator.generate_sector(coord);
-                for summary in &systems {
+                for summary in systems {
                     if evaluated >= MAX_BOOTSTRAP_EVALUATIONS {
                         break 'search;
                     }
@@ -436,50 +455,53 @@ fn bootstrap_colony(
                     if reserved_systems.contains(&summary.id) {
                         continue;
                     }
-
-                    let detail = generator.generate_system_detail(summary);
+                    candidate_summaries.push(summary);
                     evaluated += 1;
-                    let Some((best_body_idx, score, habitable_count, non_moon_count)) =
-                        score_bootstrap_system(&detail)
-                    else {
-                        continue;
-                    };
-                    let dx = ai.home_pos[0] - summary.pos[0];
-                    let dy = ai.home_pos[1] - summary.pos[1];
-                    let dz = ai.home_pos[2] - summary.pos[2];
-                    let distance_penalty = (dx * dx + dy * dy + dz * dz).sqrt() / 20_000.0;
-                    let adjusted_score = score - distance_penalty;
-                    let planet = &detail.planets[best_body_idx];
-                    let pick = BootstrapPick {
-                        score: adjusted_score,
-                        summary: summary.clone(),
-                        body_index: best_body_idx,
-                        earth_like_world: planet.kind == PlanetKind::EarthLikeWorld,
-                        atmosphere_pressure_atm: planet.atmosphere_pressure_atm,
-                        element_resource_profile: normalized_composition_profile(&planet.composition),
-                        atmosphere_resource_profile: normalized_atmosphere_profile(&planet.atmosphere),
-                    };
-                    if habitable_count >= BOOTSTRAP_MIN_HABITABLE_PLANETS
-                        && non_moon_count >= BOOTSTRAP_MIN_NON_MOON_PLANETS
-                    {
-                        if strict_best
-                            .as_ref()
-                            .map(|best| pick.score > best.score)
-                            .unwrap_or(true)
-                        {
-                            strict_best = Some(pick);
-                        }
-                    } else {
-                        if relaxed_best
-                            .as_ref()
-                            .map(|best| pick.score > best.score)
-                            .unwrap_or(true)
-                        {
-                            relaxed_best = Some(pick);
-                        }
-                    }
                 }
             }
+        }
+    }
+    let evaluated_picks: Vec<(BootstrapPick, bool)> = candidate_summaries
+        .into_par_iter()
+        .filter_map(|summary| {
+            let detail = generator.generate_system_detail(&summary);
+            let (best_body_idx, score, habitable_count, non_moon_count) =
+                score_bootstrap_system(&detail)?;
+            let dx = ai.home_pos[0] - summary.pos[0];
+            let dy = ai.home_pos[1] - summary.pos[1];
+            let dz = ai.home_pos[2] - summary.pos[2];
+            let distance_penalty = (dx * dx + dy * dy + dz * dz).sqrt() / 20_000.0;
+            let adjusted_score = score - distance_penalty;
+            let planet = &detail.planets[best_body_idx];
+            let pick = BootstrapPick {
+                score: adjusted_score,
+                summary,
+                body_index: best_body_idx,
+                earth_like_world: planet.kind == PlanetKind::EarthLikeWorld,
+                atmosphere_pressure_atm: planet.atmosphere_pressure_atm,
+                element_resource_profile: normalized_composition_profile(&planet.composition),
+                atmosphere_resource_profile: normalized_atmosphere_profile(&planet.atmosphere),
+            };
+            let is_strict = habitable_count >= BOOTSTRAP_MIN_HABITABLE_PLANETS
+                && non_moon_count >= BOOTSTRAP_MIN_NON_MOON_PLANETS;
+            Some((pick, is_strict))
+        })
+        .collect();
+    for (pick, is_strict) in evaluated_picks {
+        if is_strict {
+            if strict_best
+                .as_ref()
+                .map(|best| pick.score > best.score)
+                .unwrap_or(true)
+            {
+                strict_best = Some(pick);
+            }
+        } else if relaxed_best
+            .as_ref()
+            .map(|best| pick.score > best.score)
+            .unwrap_or(true)
+        {
+            relaxed_best = Some(pick);
         }
     }
     let picked = strict_best.or(relaxed_best);
@@ -705,24 +727,32 @@ fn run_survey_decisions(
         .map(|c| c.system_pos)
         .collect();
 
-    let mut candidates: Vec<(f32, SystemSummary)> = Vec::new();
-    for i in 0..sectors_to_scan {
-        let idx = (start + i) % total;
-        let coord = discovery_sectors[idx];
-        let systems = generator.generate_sector(coord);
-        for sys in systems {
+    let sector_batch: Vec<SectorCoord> = (0..sectors_to_scan)
+        .map(|i| discovery_sectors[(start + i) % total])
+        .collect();
+    let mut candidates: Vec<(f32, SystemSummary)> = sector_batch
+        .into_par_iter()
+        .flat_map_iter(|coord| generator.generate_sector(coord))
+        .filter_map(|sys| {
             if game_state.survey_stage(sys.id) == SurveyStage::Unknown
                 && !pending_scan_systems.contains(&sys.id)
             {
                 let distance_key = min_distance_to_positions(&colony_positions, sys.pos);
-                candidates.push((distance_key, sys));
+                Some((distance_key, sys))
+            } else {
+                None
             }
-        }
-    }
+        })
+        .collect();
     ai.discovery_sector_cursor = (start + sectors_to_scan) % total;
 
     // Sort by distance to the nearest colony, closest first.
-    candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
+    candidates.sort_by(|a, b| {
+        a.0.total_cmp(&b.0).then_with(|| {
+            (a.1.id.sector.x, a.1.id.sector.y, a.1.id.local_index)
+                .cmp(&(b.1.id.sector.x, b.1.id.sector.y, b.1.id.local_index))
+        })
+    });
     candidates.truncate(MAX_SURVEY_CANDIDATES_PER_CYCLE);
 
     for (_, sys) in candidates {
@@ -844,30 +874,34 @@ fn run_colonize_decisions(
         return;
     }
 
-    // Score each candidate by generating its detail (budgeted: one sector gen each).
+    // Score each candidate by generating its detail (budgeted and parallelized).
     // Only evaluate up to MAX_COLONIZE_EVALUATIONS to cap cost.
     const MAX_COLONIZE_EVALUATIONS: usize = 6;
-
-    let mut best_score = f32::NEG_INFINITY;
-    let mut best_pick: Option<ColonizationPick> = None;
-
-    for system_id in candidate_ids.into_iter().take(MAX_COLONIZE_EVALUATIONS) {
-        let Some(summary) = generator.find_system_summary(system_id) else {
-            continue;
-        };
-        let detail = generator.generate_system_detail(&summary);
-        let (score, body_index) =
-            score_system_for_colonization(&ai.faction_id, game_state, system_id, &detail);
-        if score > best_score {
-            best_score = score;
-            best_pick = Some(ColonizationPick {
-                system_id,
-                summary,
-                detail,
-                body_index,
-            });
-        }
-    }
+    let scored_picks: Vec<(f32, ColonizationPick)> = candidate_ids
+        .into_iter()
+        .take(MAX_COLONIZE_EVALUATIONS)
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .filter_map(|system_id| {
+            let summary = generator.find_system_summary(system_id)?;
+            let detail = generator.generate_system_detail(&summary);
+            let (score, body_index) =
+                score_system_for_colonization(&ai.faction_id, game_state, system_id, &detail);
+            Some((
+                score,
+                ColonizationPick {
+                    system_id,
+                    summary,
+                    detail,
+                    body_index,
+                },
+            ))
+        })
+        .collect();
+    let best_pick = scored_picks
+        .into_iter()
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, pick)| pick);
 
     let Some(pick) = best_pick else {
         return;
@@ -955,6 +989,19 @@ fn score_system_for_colonization(
         }
         // Brighter stars tend to have wider habitable zones.
         system_score += (star.luminosity_solar.ln() * 3.0).clamp(-5.0, 10.0);
+    }
+    // Favor chemically rich, younger systems for faster industrial ramp.
+    system_score += (detail.metallicity - 1.0).clamp(-0.8, 1.2) * 24.0;
+    system_score += ((6.0 - detail.stellar_age_gyr) / 6.0).clamp(-0.6, 1.0) * 12.0;
+    system_score += match detail.population_band {
+        crate::procedural_galaxy::StellarPopulationBand::ThinDisk => 8.0,
+        crate::procedural_galaxy::StellarPopulationBand::Spur => 6.0,
+        crate::procedural_galaxy::StellarPopulationBand::BulgeBar => 4.0,
+        crate::procedural_galaxy::StellarPopulationBand::ThickDisk => 1.0,
+        crate::procedural_galaxy::StellarPopulationBand::Halo => -10.0,
+    };
+    if detail.architecture == crate::procedural_galaxy::SystemArchitecture::BinaryClose {
+        system_score -= 18.0;
     }
 
     // ── Planet scoring ──

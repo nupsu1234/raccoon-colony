@@ -3741,22 +3741,46 @@ impl GameState {
             })
             .collect();
         let mut metrics_by_system: HashMap<SystemId, (HashMap<String, f32>, f32, f32, f32)> =
-            HashMap::new();
-        for (system_id, owner_faction, influence, stress, trade_potential, unrest) in colony_metric_rows {
-            let entry = metrics_by_system
-                .entry(system_id)
-                .or_insert_with(|| (HashMap::new(), 0.0, 0.0, 0.0));
-            *entry.0.entry(owner_faction).or_insert(0.0) += influence;
-            entry.1 += stress;
-            entry.2 += trade_potential;
-            entry.3 += unrest;
-        }
+            colony_metric_rows
+                .into_par_iter()
+                .fold(
+                    HashMap::new,
+                    |mut local, (system_id, owner_faction, influence, stress, trade_potential, unrest)| {
+                        let entry = local
+                            .entry(system_id)
+                            .or_insert_with(|| (HashMap::new(), 0.0, 0.0, 0.0));
+                        *entry.0.entry(owner_faction).or_insert(0.0) += influence;
+                        entry.1 += stress;
+                        entry.2 += trade_potential;
+                        entry.3 += unrest;
+                        local
+                    },
+                )
+                .reduce(
+                    HashMap::new,
+                    |mut acc, local| {
+                        for (system_id, (influence_map, stress, trade, unrest)) in local {
+                            let entry = acc
+                                .entry(system_id)
+                                .or_insert_with(|| (HashMap::new(), 0.0, 0.0, 0.0));
+                            for (faction_id, influence) in influence_map {
+                                *entry.0.entry(faction_id).or_insert(0.0) += influence;
+                            }
+                            entry.1 += stress;
+                            entry.2 += trade;
+                            entry.3 += unrest;
+                        }
+                        acc
+                    },
+                );
         let current_year = self.current_year;
         const MAX_RELATION_EVENTS_PER_TICK: usize = 8;
         const MAX_DIPLOMACY_EVENTS_PER_TICK: usize = 5;
         let mut emitted_relation_pairs: HashSet<(String, String)> = HashSet::new();
         let mut pending_diplomacy_events: Vec<GameEvent> = Vec::new();
-        for (system_id, (influence_raw, stress, trade, unrest)) in metrics_by_system {
+        let mut system_metric_entries: Vec<_> = metrics_by_system.drain().collect();
+        system_metric_entries.sort_by_key(|(system_id, _)| *system_id);
+        for (system_id, (influence_raw, stress, trade, unrest)) in system_metric_entries {
             let sim = self.ensure_system_sim_state(system_id);
             let sum = influence_raw.values().copied().sum::<f32>().max(0.001);
             for (faction_id, value) in influence_raw {

@@ -1,1 +1,3 @@
 target/
+galaxy_game_state.json
+.cursor/
