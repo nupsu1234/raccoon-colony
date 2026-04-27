@@ -2,9 +2,11 @@ use eframe::egui;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::{ThreadPool, ThreadPoolBuilder};
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::f32::consts::PI;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -44,6 +46,7 @@ const SAGITTARIUS_A_NAME: &str = "Sagittarius A*";
 const STAR_DRAW_RADIUS_PX: f32 = 1.5;
 const GAME_SAVE_PATH: &str = "galaxy_game_state.json";
 const DELTA_SAVE_PATH: &str = "galaxy_deltas.json";
+const TYPE_DESCRIPTIONS_PATH: &str = "assets/type_descriptions.json";
 const MAX_SAVED_GAME_EVENTS: usize = 10_000;
 const SIM_SNAPSHOT_MIN_INTERVAL_MS: u64 = 120;
 const MAX_PENDING_SIM_TICKS: u32 = 240;
@@ -308,6 +311,26 @@ struct SystemSearchResponse {
     status: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Default)]
+struct TypeDescriptionsFile {
+    #[serde(default)]
+    stars: HashMap<String, String>,
+    #[serde(default)]
+    planets: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TypeDescriptionCatalog {
+    stars: HashMap<String, String>,
+    planets: HashMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DescriptionTarget {
+    Star(SpectralClass),
+    Planet(PlanetKind),
+}
+
 enum SimCommand {
     Advance { ticks: u32, tick_years: f32 },
     CompleteMission { mission_id: u64 },
@@ -554,6 +577,8 @@ pub struct GalaxyApp {
     system_search_query: String,
     system_search_results: Vec<SystemSearchResult>,
     system_search_status: Option<String>,
+    type_description_catalog: TypeDescriptionCatalog,
+    description_target: Option<DescriptionTarget>,
     spectral_filter_mask: u64,
     debug_show_ai_home_positions: bool,
     ai_home_positions: Vec<(String, [f32; 3])>,
@@ -756,6 +781,8 @@ impl Default for GalaxyApp {
             system_search_query: String::new(),
             system_search_results: Vec::new(),
             system_search_status: None,
+            type_description_catalog: Self::load_type_description_catalog(),
+            description_target: None,
             spectral_filter_mask: Self::default_spectral_filter_mask(),
             debug_show_ai_home_positions: false,
             ai_home_positions: Vec::new(),
@@ -788,6 +815,138 @@ impl Default for GalaxyApp {
 }
 
 impl GalaxyApp {
+    fn default_type_description_catalog() -> TypeDescriptionCatalog {
+        let mut stars = HashMap::new();
+        for class in SpectralClass::ALL {
+            stars.insert(
+                class.code().to_owned(),
+                format!(
+                    "{}: a procedurally generated stellar class. Properties vary by luminosity and galactic region.",
+                    class.code()
+                ),
+            );
+        }
+
+        let mut planets = HashMap::new();
+        for kind in PlanetKind::ALL {
+            planets.insert(
+                kind.key().to_owned(),
+                format!(
+                    "{}: a procedurally generated planet archetype with distinct atmosphere, composition, and habitability tendencies.",
+                    kind.label()
+                ),
+            );
+        }
+
+        TypeDescriptionCatalog { stars, planets }
+    }
+
+    fn merge_description_file_into_catalog(
+        file: TypeDescriptionsFile,
+        mut catalog: TypeDescriptionCatalog,
+    ) -> TypeDescriptionCatalog {
+        for class in SpectralClass::ALL {
+            if let Some(text) = file.stars.get(class.code()) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    catalog
+                        .stars
+                        .insert(class.code().to_owned(), trimmed.to_owned());
+                }
+            }
+        }
+        for kind in PlanetKind::ALL {
+            if let Some(text) = file.planets.get(kind.key()) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    catalog
+                        .planets
+                        .insert(kind.key().to_owned(), trimmed.to_owned());
+                }
+            }
+        }
+        catalog
+    }
+
+    fn load_type_description_catalog_from_str(content: &str) -> Option<TypeDescriptionCatalog> {
+        let file = serde_json::from_str::<TypeDescriptionsFile>(content).ok()?;
+        Some(Self::merge_description_file_into_catalog(
+            file,
+            Self::default_type_description_catalog(),
+        ))
+    }
+
+    fn type_description_search_paths() -> Vec<PathBuf> {
+        let mut paths = vec![PathBuf::from(TYPE_DESCRIPTIONS_PATH)];
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                paths.push(exe_dir.join(TYPE_DESCRIPTIONS_PATH));
+            }
+        }
+        paths.push(Path::new(env!("CARGO_MANIFEST_DIR")).join(TYPE_DESCRIPTIONS_PATH));
+        paths
+    }
+
+    fn load_type_description_catalog() -> TypeDescriptionCatalog {
+        for path in Self::type_description_search_paths() {
+            if let Ok(content) = fs::read_to_string(path) {
+                if let Some(catalog) = Self::load_type_description_catalog_from_str(&content) {
+                    return catalog;
+                }
+            }
+        }
+        Self::default_type_description_catalog()
+    }
+
+    fn open_star_description(&mut self, class: SpectralClass) {
+        self.description_target = Some(DescriptionTarget::Star(class));
+    }
+
+    fn open_planet_description(&mut self, kind: PlanetKind) {
+        self.description_target = Some(DescriptionTarget::Planet(kind));
+    }
+
+    fn show_description_window(&mut self, ctx: &egui::Context) {
+        let Some(target) = self.description_target else {
+            return;
+        };
+
+        let (title, body) = match target {
+            DescriptionTarget::Star(class) => {
+                let key = class.code();
+                let text = self
+                    .type_description_catalog
+                    .stars
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| "No description available.".to_owned());
+                (format!("Star Type: {key}"), text)
+            }
+            DescriptionTarget::Planet(kind) => {
+                let key = kind.key();
+                let text = self
+                    .type_description_catalog
+                    .planets
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| "No description available.".to_owned());
+                (format!("Planet Type: {}", kind.label()), text)
+            }
+        };
+
+        let mut open = true;
+        egui::Window::new(title)
+            .open(&mut open)
+            .resizable(true)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.label(body);
+            });
+        if !open {
+            self.description_target = None;
+        }
+    }
+
     fn wall_time_ms() -> f64 {
         match SystemTime::now().duration_since(UNIX_EPOCH) {
             Ok(duration) => duration.as_secs_f64() * 1000.0,
@@ -2371,6 +2530,18 @@ impl GalaxyApp {
             let mass_term = ((star.mass_solar - 1.0) / 1.3).clamp(0.0, 1.0);
             return (2.0 + mass_term * 1.8).clamp(2.0, 4.4);
         }
+        if star.class.spectral == SpectralClass::MG {
+            let mass_term = ((star.mass_solar - 1.0) / 1.6).clamp(0.0, 1.0);
+            return (2.1 + mass_term * 1.9).clamp(2.1, 4.7);
+        }
+        if star.class.spectral == SpectralClass::QS {
+            let mass_term = ((star.mass_solar - 1.2) / 1.1).clamp(0.0, 1.0);
+            return (1.8 + mass_term * 1.4).clamp(1.8, 3.8);
+        }
+        if star.class.spectral == SpectralClass::BS {
+            let mass_term = ((star.mass_solar - 1.0) / 4.8).clamp(0.0, 1.0);
+            return (1.6 + mass_term * 1.1).clamp(1.6, 3.2);
+        }
 
         let mass = star.mass_solar.max(0.005);
         let lum = star.luminosity_solar.max(0.000_000_1);
@@ -2655,6 +2826,9 @@ impl GalaxyApp {
                                     star.mass_solar,
                                     star.luminosity_solar,
                                 ));
+                                if ui.small_button("Description").clicked() {
+                                    self.open_star_description(star.class.spectral);
+                                }
                             } else {
                                 self.travel_selected_body = None;
                             }
@@ -2693,6 +2867,9 @@ impl GalaxyApp {
                                     atmosphere_desc,
                                 ));
                                 ui.horizontal(|ui| {
+                                    if ui.small_button("Description").clicked() {
+                                        self.open_planet_description(planet.kind);
+                                    }
                                     if ui.button("Composition info").clicked() {
                                         self.travel_composition_info_open = true;
                                     }
@@ -3356,9 +3533,12 @@ impl GalaxyApp {
             .min(MAX_WORKER_THREADS)
     }
 
-    const SPECTRAL_FILTER_CLASSES: [SpectralClass; 22] = [
+    const SPECTRAL_FILTER_CLASSES: [SpectralClass; 25] = [
         SpectralClass::BH,
         SpectralClass::NS,
+        SpectralClass::MG,
+        SpectralClass::QS,
+        SpectralClass::BS,
         SpectralClass::O,
         SpectralClass::B,
         SpectralClass::A,
@@ -3385,26 +3565,29 @@ impl GalaxyApp {
         match class {
             SpectralClass::BH => 1 << 0,
             SpectralClass::NS => 1 << 1,
-            SpectralClass::O => 1 << 2,
-            SpectralClass::B => 1 << 3,
-            SpectralClass::A => 1 << 4,
-            SpectralClass::F => 1 << 5,
-            SpectralClass::G => 1 << 6,
-            SpectralClass::K => 1 << 7,
-            SpectralClass::M => 1 << 8,
-            SpectralClass::W => 1 << 9,
-            SpectralClass::WN => 1 << 10,
-            SpectralClass::WC => 1 << 11,
-            SpectralClass::WO => 1 << 12,
-            SpectralClass::L => 1 << 13,
-            SpectralClass::T => 1 << 14,
-            SpectralClass::Y => 1 << 15,
-            SpectralClass::C => 1 << 16,
-            SpectralClass::S => 1 << 17,
-            SpectralClass::D => 1 << 18,
-            SpectralClass::DA => 1 << 19,
-            SpectralClass::DB => 1 << 20,
-            SpectralClass::DC => 1 << 21,
+            SpectralClass::MG => 1 << 2,
+            SpectralClass::QS => 1 << 3,
+            SpectralClass::BS => 1 << 4,
+            SpectralClass::O => 1 << 5,
+            SpectralClass::B => 1 << 6,
+            SpectralClass::A => 1 << 7,
+            SpectralClass::F => 1 << 8,
+            SpectralClass::G => 1 << 9,
+            SpectralClass::K => 1 << 10,
+            SpectralClass::M => 1 << 11,
+            SpectralClass::W => 1 << 12,
+            SpectralClass::WN => 1 << 13,
+            SpectralClass::WC => 1 << 14,
+            SpectralClass::WO => 1 << 15,
+            SpectralClass::L => 1 << 16,
+            SpectralClass::T => 1 << 17,
+            SpectralClass::Y => 1 << 18,
+            SpectralClass::C => 1 << 19,
+            SpectralClass::S => 1 << 20,
+            SpectralClass::D => 1 << 21,
+            SpectralClass::DA => 1 << 22,
+            SpectralClass::DB => 1 << 23,
+            SpectralClass::DC => 1 << 24,
         }
     }
 
@@ -5583,6 +5766,7 @@ impl GalaxyApp {
             let mut window_close = false;
             let mut window_save = false;
             let mut window_travel = false;
+            let mut window_description_target: Option<DescriptionTarget> = None;
             if let Some(detail) = self.selected_system.as_mut() {
                 let (survey_stage, survey_record, pending_scan, pending_progress, pending_colony_founding, current_year) = selected_survey_snapshot
                     .clone()
@@ -5673,10 +5857,16 @@ impl GalaxyApp {
                             ui.label(egui::RichText::new("Stars").strong());
                             for star in &detail.stars {
                                 let class = star.class.notation();
-                                ui.label(format!(
-                                    "  {class} — {:.2} M☉   {:.1} L☉",
-                                    star.mass_solar, star.luminosity_solar
-                                ));
+                                ui.horizontal(|ui| {
+                                    ui.label(format!(
+                                        "  {class} — {:.2} M☉   {:.1} L☉",
+                                        star.mass_solar, star.luminosity_solar
+                                    ));
+                                    if ui.small_button("Description").clicked() {
+                                        window_description_target =
+                                            Some(DescriptionTarget::Star(star.class.spectral));
+                                    }
+                                });
                             }
                         }
 
@@ -5688,7 +5878,7 @@ impl GalaxyApp {
                             ui.label("  No planets detected");
                         } else {
                             egui::Grid::new("planets")
-                                .num_columns(5)
+                                .num_columns(6)
                                 .spacing([6.0, 2.0])
                                 .show(ui, |ui| {
                                     ui.label(egui::RichText::new("Type").underline());
@@ -5696,6 +5886,7 @@ impl GalaxyApp {
                                     ui.label(egui::RichText::new("Orbit (AU)").underline());
                                     ui.label(egui::RichText::new("Temp (K)").underline());
                                     ui.label(egui::RichText::new("Habitable").underline());
+                                    ui.label(egui::RichText::new("Info").underline());
                                     ui.end_row();
                                     for planet in &detail.planets {
                                         let kind = planet.kind.label();
@@ -5722,6 +5913,10 @@ impl GalaxyApp {
                                         } else {
                                             ""
                                         });
+                                        if ui.small_button("Description").clicked() {
+                                            window_description_target =
+                                                Some(DescriptionTarget::Planet(planet.kind));
+                                        }
                                         ui.end_row();
                                     }
                                 });
@@ -5792,6 +5987,9 @@ impl GalaxyApp {
                         });
                     });
             }
+            if let Some(target) = window_description_target {
+                self.description_target = Some(target);
+            }
 
             // Apply deferred window actions.
             if window_save {
@@ -5855,6 +6053,7 @@ impl GalaxyApp {
         self.show_favorites_window(ctx, center3d);
         self.show_settings_window(ctx);
         self.show_music_window(ctx);
+        self.show_description_window(ctx);
 
         // Keep simulation and rendering advancing even when there is no input.
         // eframe/egui is otherwise event-driven and may sleep between interactions.
@@ -5903,4 +6102,51 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Box::new(GalaxyApp::new(cc))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn description_loader_applies_overrides_from_json() {
+        let json = r#"
+        {
+          "stars": { "BH": "Custom black hole text" },
+          "planets": { "earth_like_world": "Custom ELW text" }
+        }
+        "#;
+        let catalog = GalaxyApp::load_type_description_catalog_from_str(json)
+            .expect("valid json should load");
+        assert_eq!(
+            catalog.stars.get("BH").map(String::as_str),
+            Some("Custom black hole text")
+        );
+        assert_eq!(
+            catalog.planets.get("earth_like_world").map(String::as_str),
+            Some("Custom ELW text")
+        );
+    }
+
+    #[test]
+    fn description_loader_keeps_defaults_for_missing_keys() {
+        let defaults = GalaxyApp::default_type_description_catalog();
+        let json = r#"{ "stars": { "BH": "Only one override" }, "planets": {} }"#;
+        let catalog = GalaxyApp::load_type_description_catalog_from_str(json)
+            .expect("valid json should load");
+        assert_eq!(
+            catalog.stars.get("BH").map(String::as_str),
+            Some("Only one override")
+        );
+        assert_eq!(
+            catalog.stars.get("NS"),
+            defaults.stars.get("NS"),
+            "missing star key should keep default text"
+        );
+        assert_eq!(
+            catalog.planets.get("rocky"),
+            defaults.planets.get("rocky"),
+            "missing planet key should keep default text"
+        );
+    }
 }

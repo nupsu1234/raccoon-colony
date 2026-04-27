@@ -555,6 +555,9 @@ fn score_bootstrap_system(
         let kind_score = match planet.kind {
             PlanetKind::EarthLikeWorld => 120.0,
             PlanetKind::WaterWorld => 78.0,
+            PlanetKind::CrystalWorld => 66.0,
+            PlanetKind::ChthonianWorld => 22.0,
+            PlanetKind::RogueWorld => 16.0,
             PlanetKind::Rocky | PlanetKind::MetalRich | PlanetKind::Metal => 54.0,
             PlanetKind::AmmoniaWorld => 36.0,
             _ => 24.0,
@@ -1016,6 +1019,9 @@ fn score_system_for_colonization(
             PlanetKind::EarthLikeWorld => body_score += 110.0,
             PlanetKind::WaterWorld => body_score += 68.0,
             PlanetKind::AmmoniaWorld => body_score += 34.0,
+            PlanetKind::CrystalWorld => body_score += 56.0,
+            PlanetKind::ChthonianWorld => body_score += 12.0,
+            PlanetKind::RogueWorld => body_score += 8.0,
             PlanetKind::Rocky | PlanetKind::MetalRich | PlanetKind::Metal => {
                 body_score += if planet.habitable { 50.0 } else { 5.0 };
             }

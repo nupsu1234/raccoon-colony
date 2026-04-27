@@ -19,7 +19,7 @@ const MIX2: u64 = 0x94D0_49BB_1331_11EB;
 const SECTOR_DOMAIN_TAG: u64 = 0x19E6_52C3_FCAB_4A1D;
 const SPAWN_CELL_DOMAIN_TAG: u64 = 0x4C7A_91F2_6DB8_3E05;
 const SYSTEM_DOMAIN_TAG: u64 = 0x6F18_BB6E_2A11_91C3;
-const GENERATION_VERSION: u64 = 2;
+const GENERATION_VERSION: u64 = 3;
 pub const GALAXY_GENERATION_SCHEMA_VERSION: u64 = GENERATION_VERSION;
 const POSITION_REJECTION_TRIES: usize = 6;
 const SECTOR_DENSITY_SAMPLES_PER_AXIS: usize = 12;
@@ -98,6 +98,9 @@ struct SpawnCellCoord {
 pub enum SpectralClass {
     BH,
     NS,
+    MG,
+    QS,
+    BS,
     O,
     B,
     A,
@@ -121,10 +124,41 @@ pub enum SpectralClass {
 }
 
 impl SpectralClass {
+    pub const ALL: [SpectralClass; 25] = [
+        SpectralClass::BH,
+        SpectralClass::NS,
+        SpectralClass::MG,
+        SpectralClass::QS,
+        SpectralClass::BS,
+        SpectralClass::O,
+        SpectralClass::B,
+        SpectralClass::A,
+        SpectralClass::F,
+        SpectralClass::G,
+        SpectralClass::K,
+        SpectralClass::M,
+        SpectralClass::W,
+        SpectralClass::WN,
+        SpectralClass::WC,
+        SpectralClass::WO,
+        SpectralClass::L,
+        SpectralClass::T,
+        SpectralClass::Y,
+        SpectralClass::C,
+        SpectralClass::S,
+        SpectralClass::D,
+        SpectralClass::DA,
+        SpectralClass::DB,
+        SpectralClass::DC,
+    ];
+
     pub fn definition(self) -> &'static SpectralClassDefinition {
         match self {
             SpectralClass::BH => &SPECTRAL_DEF_BH,
             SpectralClass::NS => &SPECTRAL_DEF_NS,
+            SpectralClass::MG => &SPECTRAL_DEF_MG,
+            SpectralClass::QS => &SPECTRAL_DEF_QS,
+            SpectralClass::BS => &SPECTRAL_DEF_BS,
             SpectralClass::O => &SPECTRAL_DEF_O,
             SpectralClass::B => &SPECTRAL_DEF_B,
             SpectralClass::A => &SPECTRAL_DEF_A,
@@ -177,6 +211,18 @@ const SPECTRAL_DEF_BH: SpectralClassDefinition = SpectralClassDefinition {
 };
 const SPECTRAL_DEF_NS: SpectralClassDefinition = SpectralClassDefinition {
     code: "NS", visual_color: [198, 226, 255], is_scoopable: false,
+    mass_range: None, luminosity_range: None,
+};
+const SPECTRAL_DEF_MG: SpectralClassDefinition = SpectralClassDefinition {
+    code: "MG", visual_color: [176, 210, 255], is_scoopable: false,
+    mass_range: None, luminosity_range: None,
+};
+const SPECTRAL_DEF_QS: SpectralClassDefinition = SpectralClassDefinition {
+    code: "QS", visual_color: [198, 170, 255], is_scoopable: false,
+    mass_range: None, luminosity_range: None,
+};
+const SPECTRAL_DEF_BS: SpectralClassDefinition = SpectralClassDefinition {
+    code: "BS", visual_color: [170, 246, 222], is_scoopable: false,
     mass_range: None, luminosity_range: None,
 };
 const SPECTRAL_DEF_O: SpectralClassDefinition = SpectralClassDefinition {
@@ -449,6 +495,9 @@ pub struct StarBody {
 pub enum PlanetKind {
     EarthLikeWorld,
     Rocky,
+    CrystalWorld,
+    ChthonianWorld,
+    RogueWorld,
     RockyIceWorld,
     Icy,
     WaterWorld,
@@ -499,6 +548,27 @@ const PLANET_DEF_ROCKY: PlanetKindDefinition = PlanetKindDefinition {
     base_visual_radius_px: 1.9,
     visual_color_cold: [124, 132, 145],
     visual_color_hot: [184, 104, 76],
+};
+const PLANET_DEF_CRYSTAL_WORLD: PlanetKindDefinition = PlanetKindDefinition {
+    label: "Crystal world",
+    is_gas_giant: false,
+    base_visual_radius_px: 2.15,
+    visual_color_cold: [160, 206, 246],
+    visual_color_hot: [242, 166, 242],
+};
+const PLANET_DEF_CHTHONIAN_WORLD: PlanetKindDefinition = PlanetKindDefinition {
+    label: "Chthonian world",
+    is_gas_giant: false,
+    base_visual_radius_px: 2.45,
+    visual_color_cold: [116, 102, 124],
+    visual_color_hot: [246, 124, 88],
+};
+const PLANET_DEF_ROGUE_WORLD: PlanetKindDefinition = PlanetKindDefinition {
+    label: "Rogue freezer world",
+    is_gas_giant: false,
+    base_visual_radius_px: 2.2,
+    visual_color_cold: [120, 142, 176],
+    visual_color_hot: [146, 160, 190],
 };
 const PLANET_DEF_ROCKY_ICE_WORLD: PlanetKindDefinition = PlanetKindDefinition {
     label: "Rocky ice world",
@@ -621,11 +691,39 @@ const PLANET_DEF_GAS_GIANT: PlanetKindDefinition = PlanetKindDefinition {
 };
 
 impl PlanetKind {
+    pub const ALL: [PlanetKind; 22] = [
+        PlanetKind::EarthLikeWorld,
+        PlanetKind::Rocky,
+        PlanetKind::CrystalWorld,
+        PlanetKind::ChthonianWorld,
+        PlanetKind::RogueWorld,
+        PlanetKind::RockyIceWorld,
+        PlanetKind::Icy,
+        PlanetKind::WaterWorld,
+        PlanetKind::AmmoniaWorld,
+        PlanetKind::MetalRich,
+        PlanetKind::Metal,
+        PlanetKind::GasGiantClassI,
+        PlanetKind::GasGiantClassII,
+        PlanetKind::GasGiantClassIII,
+        PlanetKind::GasGiantClassIV,
+        PlanetKind::GasGiantClassV,
+        PlanetKind::HeliumRichGasGiant,
+        PlanetKind::HeliumGasGiant,
+        PlanetKind::GasGiantAmmoniaLife,
+        PlanetKind::GasGiantWaterLife,
+        PlanetKind::WaterGiant,
+        PlanetKind::GasGiant,
+    ];
+
     /// Returns the full static definition for this planet kind.
     pub fn definition(self) -> &'static PlanetKindDefinition {
         match self {
             Self::EarthLikeWorld => &PLANET_DEF_EARTH_LIKE_WORLD,
             Self::Rocky => &PLANET_DEF_ROCKY,
+            Self::CrystalWorld => &PLANET_DEF_CRYSTAL_WORLD,
+            Self::ChthonianWorld => &PLANET_DEF_CHTHONIAN_WORLD,
+            Self::RogueWorld => &PLANET_DEF_ROGUE_WORLD,
             Self::RockyIceWorld => &PLANET_DEF_ROCKY_ICE_WORLD,
             Self::Icy => &PLANET_DEF_ICY,
             Self::WaterWorld => &PLANET_DEF_WATER_WORLD,
@@ -649,6 +747,33 @@ impl PlanetKind {
     pub fn label(self) -> &'static str { self.definition().label }
 
     pub fn is_gas_giant(self) -> bool { self.definition().is_gas_giant }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::EarthLikeWorld => "earth_like_world",
+            Self::Rocky => "rocky",
+            Self::CrystalWorld => "crystal_world",
+            Self::ChthonianWorld => "chthonian_world",
+            Self::RogueWorld => "rogue_world",
+            Self::RockyIceWorld => "rocky_ice_world",
+            Self::Icy => "icy",
+            Self::WaterWorld => "water_world",
+            Self::AmmoniaWorld => "ammonia_world",
+            Self::MetalRich => "metal_rich",
+            Self::Metal => "metal",
+            Self::GasGiantClassI => "gas_giant_class_i",
+            Self::GasGiantClassII => "gas_giant_class_ii",
+            Self::GasGiantClassIII => "gas_giant_class_iii",
+            Self::GasGiantClassIV => "gas_giant_class_iv",
+            Self::GasGiantClassV => "gas_giant_class_v",
+            Self::HeliumRichGasGiant => "helium_rich_gas_giant",
+            Self::HeliumGasGiant => "helium_gas_giant",
+            Self::GasGiantAmmoniaLife => "gas_giant_ammonia_life",
+            Self::GasGiantWaterLife => "gas_giant_water_life",
+            Self::WaterGiant => "water_giant",
+            Self::GasGiant => "gas_giant",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1418,10 +1543,16 @@ impl GalaxyGenerator {
 
     fn sample_spectral_class_from_roll(roll: f32) -> SpectralClass {
         // Weighted to keep broad plausibility while including rare classes.
-        if roll < 0.0010 {
+        if roll < 0.00045 {
             SpectralClass::BH
-        } else if roll < 0.0018 {
+        } else if roll < 0.00090 {
             SpectralClass::NS
+        } else if roll < 0.00120 {
+            SpectralClass::MG
+        } else if roll < 0.00145 {
+            SpectralClass::QS
+        } else if roll < 0.00170 {
+            SpectralClass::BS
         } else if roll < 0.0025 {
             SpectralClass::O
         } else if roll < 0.0115 {
@@ -1488,6 +1619,13 @@ impl GalaxyGenerator {
                     LuminosityClass::VI
                 } else {
                     LuminosityClass::Vz
+                }
+            }
+            SpectralClass::MG | SpectralClass::QS | SpectralClass::BS => {
+                if roll < 0.97 {
+                    LuminosityClass::VII
+                } else {
+                    LuminosityClass::VI
                 }
             }
             SpectralClass::D | SpectralClass::DA | SpectralClass::DB | SpectralClass::DC => {
@@ -1622,11 +1760,20 @@ impl GalaxyGenerator {
         roll = (roll * (1.0 - 0.22 * remnant_boost) + 0.08 * remnant_boost).clamp(0.0, 1.0);
 
         let remnant_roll = rng.r#gen::<f32>();
-        if remnant_roll < 0.0008 + remnant_boost * 0.0055 {
+        if remnant_roll < 0.0007 + remnant_boost * 0.0055 {
             return SpectralClass::BH;
         }
-        if remnant_roll < 0.0026 + remnant_boost * 0.012 {
+        if remnant_roll < 0.0022 + remnant_boost * 0.011 {
             return SpectralClass::NS;
+        }
+        if remnant_roll < 0.0030 + remnant_boost * 0.0118 {
+            return SpectralClass::MG;
+        }
+        if remnant_roll < 0.0036 + remnant_boost * 0.0125 {
+            return SpectralClass::QS;
+        }
+        if remnant_roll < 0.0042 + remnant_boost * 0.013 {
+            return SpectralClass::BS;
         }
 
         // Bias towards hot stars in young metal-rich regions, and cool stars in old populations.
@@ -1645,9 +1792,13 @@ impl GalaxyGenerator {
         if spectral == SpectralClass::BH {
             return StellarClassification::new(SpectralClass::BH, 0, LuminosityClass::VII);
         }
-        if spectral == SpectralClass::NS {
+        if spectral == SpectralClass::NS
+            || spectral == SpectralClass::MG
+            || spectral == SpectralClass::QS
+            || spectral == SpectralClass::BS
+        {
             return StellarClassification::new(
-                SpectralClass::NS,
+                spectral,
                 0,
                 Self::sample_luminosity_class_for_spectral(spectral, rng.r#gen::<f32>()),
             );
@@ -1666,9 +1817,13 @@ impl GalaxyGenerator {
         if spectral == SpectralClass::BH {
             return StellarClassification::new(SpectralClass::BH, 0, LuminosityClass::VII);
         }
-        if spectral == SpectralClass::NS {
+        if spectral == SpectralClass::NS
+            || spectral == SpectralClass::MG
+            || spectral == SpectralClass::QS
+            || spectral == SpectralClass::BS
+        {
             return StellarClassification::new(
-                SpectralClass::NS,
+                spectral,
                 0,
                 Self::sample_luminosity_class_for_spectral(spectral, rng.r#gen::<f32>()),
             );
@@ -1715,6 +1870,27 @@ impl GalaxyGenerator {
                 class,
                 mass_solar: rng.gen_range(1.1..2.3),
                 luminosity_solar: rng.gen_range(0.000_000_1..0.05),
+            };
+        }
+        if class.spectral == SpectralClass::MG {
+            return StarBody {
+                class,
+                mass_solar: rng.gen_range(1.2..2.6),
+                luminosity_solar: rng.gen_range(0.000_000_8..0.09),
+            };
+        }
+        if class.spectral == SpectralClass::QS {
+            return StarBody {
+                class,
+                mass_solar: rng.gen_range(1.4..2.2),
+                luminosity_solar: rng.gen_range(0.000_000_05..0.03),
+            };
+        }
+        if class.spectral == SpectralClass::BS {
+            return StarBody {
+                class,
+                mass_solar: rng.gen_range(1.0..5.8),
+                luminosity_solar: rng.gen_range(0.000_000_02..0.008),
             };
         }
 
@@ -1963,6 +2139,9 @@ impl GalaxyGenerator {
         match kind {
             PlanetKind::EarthLikeWorld => (&EARTH_LIKE_MAJOR, &TERRESTRIAL_TRACE),
             PlanetKind::Rocky => (&ROCKY_MAJOR, &TERRESTRIAL_TRACE),
+            PlanetKind::CrystalWorld => (&ROCKY_ICE_MAJOR, &METAL_TRACE),
+            PlanetKind::ChthonianWorld => (&METAL_RICH_MAJOR, &METAL_TRACE),
+            PlanetKind::RogueWorld => (&ICY_MAJOR, &ICY_TRACE),
             PlanetKind::RockyIceWorld => (&ROCKY_ICE_MAJOR, &ICY_TRACE),
             PlanetKind::Icy => (&ICY_MAJOR, &ICY_TRACE),
             PlanetKind::WaterWorld => (&WATER_MAJOR, &ICY_TRACE),
@@ -2010,6 +2189,7 @@ impl GalaxyGenerator {
             kind,
             PlanetKind::Icy
                 | PlanetKind::RockyIceWorld
+                | PlanetKind::RogueWorld
                 | PlanetKind::WaterWorld
                 | PlanetKind::AmmoniaWorld
                 | PlanetKind::WaterGiant
@@ -2025,6 +2205,12 @@ impl GalaxyGenerator {
             && symbol == "He"
         {
             weight *= 1.0 + 0.25 * hot_factor;
+        }
+        if matches!(kind, PlanetKind::CrystalWorld) && matches!(symbol, "Si" | "C" | "O") {
+            weight *= 1.0 + 0.30;
+        }
+        if matches!(kind, PlanetKind::ChthonianWorld) && matches!(symbol, "Fe" | "Ni" | "Si") {
+            weight *= 1.0 + 0.34;
         }
 
         weight.max(0.0001)
@@ -2315,6 +2501,9 @@ impl GalaxyGenerator {
         match kind {
             PlanetKind::EarthLikeWorld => (&EARTH_LIKE_GASES, &TERRAN_TRACE),
             PlanetKind::Rocky => (&ROCKY_GASES, &TERRAN_TRACE),
+            PlanetKind::CrystalWorld => (&ROCKY_ICE_GASES, &METAL_TRACE),
+            PlanetKind::ChthonianWorld => (&METAL_WORLD_GASES, &METAL_TRACE),
+            PlanetKind::RogueWorld => (&ICY_GASES, &TERRAN_TRACE),
             PlanetKind::RockyIceWorld => (&ROCKY_ICE_GASES, &TERRAN_TRACE),
             PlanetKind::Icy => (&ICY_GASES, &TERRAN_TRACE),
             PlanetKind::WaterWorld => (&WATER_WORLD_GASES, &TERRAN_TRACE),
@@ -2349,6 +2538,9 @@ impl GalaxyGenerator {
         let mut probability: f32 = match kind {
             PlanetKind::EarthLikeWorld => 0.98,
             PlanetKind::Rocky => 0.55,
+            PlanetKind::CrystalWorld => 0.74,
+            PlanetKind::ChthonianWorld => 0.18,
+            PlanetKind::RogueWorld => 0.42,
             PlanetKind::RockyIceWorld => 0.70,
             PlanetKind::Icy => 0.62,
             PlanetKind::WaterWorld => 0.92,
@@ -2386,6 +2578,9 @@ impl GalaxyGenerator {
         match kind {
             PlanetKind::EarthLikeWorld => (0.65, 2.8),
             PlanetKind::Rocky => (0.03, 4.2),
+            PlanetKind::CrystalWorld => (0.22, 3.8),
+            PlanetKind::ChthonianWorld => (0.0, 0.28),
+            PlanetKind::RogueWorld => (0.0, 0.90),
             PlanetKind::RockyIceWorld => (0.06, 3.1),
             PlanetKind::Icy => (0.01, 1.4),
             PlanetKind::WaterWorld => (0.80, 9.5),
@@ -2434,6 +2629,7 @@ impl GalaxyGenerator {
             kind,
             PlanetKind::Icy
                 | PlanetKind::RockyIceWorld
+                | PlanetKind::RogueWorld
                 | PlanetKind::WaterWorld
                 | PlanetKind::AmmoniaWorld
                 | PlanetKind::WaterGiant
@@ -2585,6 +2781,12 @@ impl GalaxyGenerator {
             (PlanetKind::EarthLikeWorld, true) => (0.45, 0.95, 0.88, 1.18),
             (PlanetKind::Rocky, false) => (0.35, 1.85, 0.75, 1.45),
             (PlanetKind::Rocky, true) => (0.08, 0.95, 0.70, 1.35),
+            (PlanetKind::CrystalWorld, false) => (0.40, 2.25, 0.90, 1.70),
+            (PlanetKind::CrystalWorld, true) => (0.08, 1.10, 0.85, 1.55),
+            (PlanetKind::ChthonianWorld, false) => (0.70, 1.70, 1.15, 2.35),
+            (PlanetKind::ChthonianWorld, true) => (0.10, 0.78, 1.05, 2.10),
+            (PlanetKind::RogueWorld, false) => (0.20, 1.80, 0.20, 0.72),
+            (PlanetKind::RogueWorld, true) => (0.06, 0.92, 0.18, 0.60),
             (PlanetKind::RockyIceWorld, false) => (0.32, 1.70, 0.42, 1.05),
             (PlanetKind::RockyIceWorld, true) => (0.06, 0.90, 0.30, 0.95),
             (PlanetKind::Icy, false) => (0.25, 1.55, 0.30, 0.82),
@@ -2831,7 +3033,7 @@ impl GalaxyGenerator {
         }
 
         // Safety belt against implausible combinations from future probability tuning.
-        if matches!(kind, PlanetKind::Icy | PlanetKind::RockyIceWorld)
+        if matches!(kind, PlanetKind::Icy | PlanetKind::RockyIceWorld | PlanetKind::RogueWorld)
             && equilibrium_temp >= 260.0
         {
             if equilibrium_temp >= 1_600.0 {
@@ -3029,6 +3231,12 @@ impl GalaxyGenerator {
         stars: &[StarBody],
         profile: RegionProfile,
     ) -> Vec<PlanetBody> {
+        let has_compact_exotic = stars.iter().any(|star| {
+            matches!(
+                star.class.spectral,
+                SpectralClass::MG | SpectralClass::QS | SpectralClass::BS
+            )
+        });
         let avg_luminosity = if stars.is_empty() {
             1.0
         } else {
@@ -3083,6 +3291,18 @@ impl GalaxyGenerator {
                 && rng.r#gen::<f32>() < (0.20 + 0.22 * profile.metallicity).clamp(0.08, 0.45)
             {
                 kind = PlanetKind::MetalRich;
+            }
+            if equilibrium_temp >= 1050.0 && rng.r#gen::<f32>() < 0.025 {
+                kind = PlanetKind::ChthonianWorld;
+            } else if equilibrium_temp <= 95.0 && rng.r#gen::<f32>() < 0.012 {
+                kind = PlanetKind::RogueWorld;
+            } else if (180.0..=520.0).contains(&equilibrium_temp)
+                && profile.metallicity >= 1.15
+                && rng.r#gen::<f32>() < 0.018
+            {
+                kind = PlanetKind::CrystalWorld;
+            } else if has_compact_exotic && rng.r#gen::<f32>() < 0.022 {
+                kind = PlanetKind::CrystalWorld;
             }
 
             let (radius_earth, mass_earth) =
@@ -3155,6 +3375,18 @@ impl GalaxyGenerator {
                 if orbit >= snow_line_au && rng.r#gen::<f32>() < (0.20 * profile.metallicity).clamp(0.05, 0.35)
                 {
                     kind = Self::classify_gas_giant_kind(rng, equilibrium_temp);
+                }
+                if equilibrium_temp >= 1050.0 && rng.r#gen::<f32>() < 0.023 {
+                    kind = PlanetKind::ChthonianWorld;
+                } else if equilibrium_temp <= 95.0 && rng.r#gen::<f32>() < 0.010 {
+                    kind = PlanetKind::RogueWorld;
+                } else if (180.0..=520.0).contains(&equilibrium_temp)
+                    && profile.metallicity >= 1.12
+                    && rng.r#gen::<f32>() < 0.016
+                {
+                    kind = PlanetKind::CrystalWorld;
+                } else if has_compact_exotic && rng.r#gen::<f32>() < 0.018 {
+                    kind = PlanetKind::CrystalWorld;
                 }
 
                 let (radius_earth, mass_earth) =
@@ -3235,7 +3467,14 @@ impl GalaxyGenerator {
             .max(0.0004);
 
             let equilibrium_temp = Self::equilibrium_temperature_k(avg_luminosity, host_orbit_au);
-            let kind = Self::classify_moon_kind(rng, equilibrium_temp);
+            let mut kind = Self::classify_moon_kind(rng, equilibrium_temp);
+            if equilibrium_temp <= 80.0 && rng.r#gen::<f32>() < 0.010 {
+                kind = PlanetKind::RogueWorld;
+            } else if equilibrium_temp >= 1150.0 && rng.r#gen::<f32>() < 0.010 {
+                kind = PlanetKind::ChthonianWorld;
+            } else if has_compact_exotic && rng.r#gen::<f32>() < 0.008 {
+                kind = PlanetKind::CrystalWorld;
+            }
 
             let (mut radius_earth, mut mass_earth) =
                 Self::sample_planet_size_and_mass(rng, kind, true);
@@ -3956,10 +4195,22 @@ mod tests {
     }
 
     #[test]
-    fn spectral_roll_includes_neutron_stars() {
+    fn spectral_roll_includes_exotic_compact_classes() {
         assert_eq!(
-            GalaxyGenerator::sample_spectral_class_from_roll(0.0015),
+            GalaxyGenerator::sample_spectral_class_from_roll(0.0007),
             SpectralClass::NS
+        );
+        assert_eq!(
+            GalaxyGenerator::sample_spectral_class_from_roll(0.0010),
+            SpectralClass::MG
+        );
+        assert_eq!(
+            GalaxyGenerator::sample_spectral_class_from_roll(0.0013),
+            SpectralClass::QS
+        );
+        assert_eq!(
+            GalaxyGenerator::sample_spectral_class_from_roll(0.0016),
+            SpectralClass::BS
         );
     }
 
@@ -3995,6 +4246,9 @@ mod tests {
 
     #[test]
     fn planet_kind_labels_cover_new_variants() {
+        assert_eq!(PlanetKind::CrystalWorld.label(), "Crystal world");
+        assert_eq!(PlanetKind::ChthonianWorld.label(), "Chthonian world");
+        assert_eq!(PlanetKind::RogueWorld.label(), "Rogue freezer world");
         assert_eq!(PlanetKind::RockyIceWorld.label(), "Rocky ice world");
         assert_eq!(PlanetKind::WaterWorld.label(), "Water world");
         assert_eq!(PlanetKind::AmmoniaWorld.label(), "Ammonia world");
@@ -4011,6 +4265,64 @@ mod tests {
         assert_eq!(PlanetKind::WaterGiant.label(), "Water giant");
         assert_eq!(PlanetKind::MetalRich.label(), "Metal-rich world");
         assert_eq!(PlanetKind::Metal.label(), "Metal world");
+    }
+
+    #[test]
+    fn planet_kind_keys_are_unique_and_non_empty() {
+        let mut seen = std::collections::HashSet::new();
+        for kind in PlanetKind::ALL {
+            let key = kind.key();
+            assert!(!key.trim().is_empty());
+            assert!(seen.insert(key), "duplicate planet key: {key}");
+        }
+    }
+
+    #[test]
+    fn exotic_classes_and_planets_remain_rare() {
+        let generator = GalaxyGenerator::new(GeneratorConfig {
+            target_system_count: 40_000_000,
+            min_materialized_per_sector: 64,
+            max_materialized_per_sector: 384,
+            ..Default::default()
+        });
+
+        let mut total_systems = 0usize;
+        let mut exotic_systems = 0usize;
+        let mut total_planets = 0usize;
+        let mut exotic_planets = 0usize;
+        for x in -6..=6 {
+            for y in -6..=6 {
+                let systems = generator.generate_sector(SectorCoord { x, y });
+                total_systems += systems.len();
+                for summary in systems {
+                    if matches!(
+                        summary.primary_star.spectral,
+                        SpectralClass::MG | SpectralClass::QS | SpectralClass::BS
+                    ) {
+                        exotic_systems += 1;
+                    }
+                    let detail = generator.generate_system_detail(&summary);
+                    total_planets += detail.planets.len();
+                    exotic_planets += detail
+                        .planets
+                        .iter()
+                        .filter(|planet| {
+                            matches!(
+                                planet.kind,
+                                PlanetKind::CrystalWorld
+                                    | PlanetKind::ChthonianWorld
+                                    | PlanetKind::RogueWorld
+                            )
+                        })
+                        .count();
+                }
+            }
+        }
+
+        let system_ratio = exotic_systems as f32 / total_systems.max(1) as f32;
+        let planet_ratio = exotic_planets as f32 / total_planets.max(1) as f32;
+        assert!(system_ratio <= 0.02, "exotic systems too common: {}", system_ratio);
+        assert!(planet_ratio <= 0.04, "exotic planets too common: {}", planet_ratio);
     }
 
     #[test]
