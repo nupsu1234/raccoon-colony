@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -144,6 +144,33 @@ mod diplomacy_treaties_serde {
     }
 }
 
+mod active_sanctions_serde {
+    use super::*;
+    use serde::{Deserializer, Serializer, ser::SerializeSeq};
+
+    pub fn serialize<S>(map: &HashMap<(String, String), f32>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(map.len()))?;
+        for ((a, b), expires_year) in map {
+            seq.serialize_element(&(a, b, expires_year))?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<HashMap<(String, String), f32>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let vec: Vec<(String, String, f32)> = Vec::deserialize(deserializer)?;
+        Ok(vec
+            .into_iter()
+            .map(|(a, b, expires)| ((a, b), expires))
+            .collect())
+    }
+}
+
 pub const PLAYER_FACTION_ID: &str = "raccoon-flood";
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -269,11 +296,13 @@ pub enum ColonyBuildingKind {
     DefenseGrid,
     SystemsAdministration,
     CatalyticRefinery,
+    OrePurifierComplex,
+    StellarIsotopeCondenser,
 }
 
 impl ColonyBuildingKind {
     #[allow(dead_code)]
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 15] = [
         ColonyBuildingKind::SpaceStation,
         ColonyBuildingKind::IndustrialHub,
         ColonyBuildingKind::AgriDome,
@@ -287,10 +316,12 @@ impl ColonyBuildingKind {
         ColonyBuildingKind::DefenseGrid,
         ColonyBuildingKind::SystemsAdministration,
         ColonyBuildingKind::CatalyticRefinery,
+        ColonyBuildingKind::OrePurifierComplex,
+        ColonyBuildingKind::StellarIsotopeCondenser,
     ];
 
     #[allow(dead_code)]
-    pub fn all() -> [Self; 13] {
+    pub fn all() -> [Self; 15] {
         Self::ALL
     }
 
@@ -310,6 +341,8 @@ impl ColonyBuildingKind {
             Self::DefenseGrid => &BUILDING_DEF_DEFENSE_GRID,
             Self::SystemsAdministration => &BUILDING_DEF_SYSTEMS_ADMINISTRATION,
             Self::CatalyticRefinery => &BUILDING_DEF_CATALYTIC_REFINERY,
+            Self::OrePurifierComplex => &BUILDING_DEF_ORE_PURIFIER_COMPLEX,
+            Self::StellarIsotopeCondenser => &BUILDING_DEF_STELLAR_ISOTOPE_CONDENSER,
         }
     }
 
@@ -434,6 +467,147 @@ impl Default for PlayerState {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FactionMilitaryState {
+    #[serde(default)]
+    pub standing_army_units: u32,
+    #[serde(default)]
+    pub readiness: f32,
+    #[serde(default)]
+    pub annual_upkeep_treasury: i64,
+    #[serde(default)]
+    pub annual_population_attrition: f64,
+}
+
+impl Default for FactionMilitaryState {
+    fn default() -> Self {
+        Self {
+            standing_army_units: 0,
+            readiness: 0.0,
+            annual_upkeep_treasury: 0,
+            annual_population_attrition: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub enum TradeResourceKind {
+    HighGradeOre,
+    RareGas,
+    ExoticIsotopes,
+    BioSamples,
+}
+
+impl TradeResourceKind {
+    pub const ALL: [Self; 4] = [
+        Self::HighGradeOre,
+        Self::RareGas,
+        Self::ExoticIsotopes,
+        Self::BioSamples,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::HighGradeOre => "High-Grade Ore",
+            Self::RareGas => "Rare Gas",
+            Self::ExoticIsotopes => "Exotic Isotopes",
+            Self::BioSamples => "Bio Samples",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FactionTradeState {
+    #[serde(default)]
+    pub annual_production: HashMap<TradeResourceKind, f32>,
+    #[serde(default)]
+    pub annual_trade_income: i64,
+    #[serde(default)]
+    pub annual_powerplay_income: i64,
+    #[serde(default)]
+    pub annual_powerplay_spend: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum MilitaryCampaignPhase {
+    Mobilizing,
+    Assault,
+    Occupation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum MilitaryCampaignOutcome {
+    Takeover,
+    Sack,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MilitaryCampaignState {
+    pub id: u64,
+    #[serde(default)]
+    pub army_id: u64,
+    pub attacker_faction: String,
+    pub defender_faction: String,
+    pub target_colony_id: u64,
+    pub target_system: SystemId,
+    #[serde(default)]
+    pub progress: f32,
+    #[serde(default)]
+    pub attacker_strength_snapshot: f32,
+    #[serde(default)]
+    pub defender_strength_snapshot: f32,
+    pub started_year: f32,
+    #[serde(default)]
+    pub phase: MilitaryCampaignPhase,
+    #[serde(default)]
+    pub occupation_ticks_remaining: u16,
+    #[serde(default)]
+    pub outcome: MilitaryCampaignOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ArmyMissionIntent {
+    Intercept,
+    CampaignTakeover,
+    CampaignSack,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ArmyEntityState {
+    pub id: u64,
+    pub owner_faction: String,
+    pub units: u32,
+    pub origin_system: SystemId,
+    pub current_system: SystemId,
+    pub target_system: SystemId,
+    #[serde(default)]
+    pub route_progress: f32,
+    #[serde(default)]
+    pub readiness: f32,
+    #[serde(default)]
+    pub mission: ArmyMissionIntent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign_id: Option<u64>,
+}
+
+impl Default for MilitaryCampaignPhase {
+    fn default() -> Self {
+        Self::Mobilizing
+    }
+}
+
+impl Default for MilitaryCampaignOutcome {
+    fn default() -> Self {
+        Self::Takeover
+    }
+}
+
+impl Default for ArmyMissionIntent {
+    fn default() -> Self {
+        Self::CampaignTakeover
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FactionState {
     pub id: String,
     pub display_name: String,
@@ -442,9 +616,39 @@ pub struct FactionState {
     pub colonization_tech_level: u32,
     #[serde(default)]
     pub colonization_tech_progress: f32,
+    #[serde(default)]
+    pub econ_tech_level: u32,
+    #[serde(default)]
+    pub econ_tech_progress: f32,
+    #[serde(default)]
+    pub military_tech_level: u32,
+    #[serde(default)]
+    pub military_tech_progress: f32,
+    #[serde(default)]
+    pub diplomacy_tech_level: u32,
+    #[serde(default)]
+    pub diplomacy_tech_progress: f32,
     /// The first colony founded by this faction, which receives reduced upkeep.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub starting_colony_id: Option<u64>,
+    #[serde(default)]
+    pub military: FactionMilitaryState,
+    #[serde(default)]
+    pub trade: FactionTradeState,
+    #[serde(default)]
+    pub dominance_score: f32,
+    #[serde(default)]
+    pub threatenedness_score: f32,
+    #[serde(default)]
+    pub last_diplomacy_action_year: f32,
+    #[serde(default)]
+    pub last_powerplay_action_year: f32,
+    #[serde(default)]
+    pub diplomacy_actions_recent: u16,
+    #[serde(default)]
+    pub powerplay_actions_recent: u16,
+    #[serde(default)]
+    pub forced_fallback_actions_recent: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -460,6 +664,7 @@ pub enum ConflictState {
 pub enum DiplomaticTreatyKind {
     Alliance,
     NonAggressionPact,
+    TradePact,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -488,6 +693,10 @@ pub struct PowerplayOperationRecord {
     pub system: SystemId,
     pub operation: PowerplayOperationKind,
     pub success: bool,
+    #[serde(default)]
+    pub internal_operation: bool,
+    #[serde(default)]
+    pub treasury_cost: i64,
 }
 
 impl Default for ConflictState {
@@ -904,10 +1113,20 @@ pub struct GameState {
     pub faction_relations: HashMap<(String, String), i16>,
     #[serde(default, with = "diplomacy_treaties_serde")]
     pub diplomacy_treaties: HashMap<(String, String), DiplomacyTreatyState>,
-    #[serde(default)]
+    #[serde(default, with = "active_sanctions_serde")]
     pub active_sanctions: HashMap<(String, String), f32>,
     #[serde(default)]
     pub recent_powerplay_ops: Vec<PowerplayOperationRecord>,
+    #[serde(default)]
+    pub powerplay_owner_floor_active_systems: u32,
+    #[serde(default)]
+    pub military_campaigns: HashMap<u64, MilitaryCampaignState>,
+    #[serde(default)]
+    pub active_armies: HashMap<u64, ArmyEntityState>,
+    #[serde(default = "GameState::default_next_army_id")]
+    pub next_army_id: u64,
+    #[serde(default = "GameState::default_next_campaign_id")]
+    pub next_campaign_id: u64,
     #[serde(default)]
     pub player_reputation: HashMap<String, i16>,
     #[serde(default)]
@@ -1769,6 +1988,94 @@ const BUILDING_DEF_CATALYTIC_REFINERY: ColonyBuildingDefinition = ColonyBuilding
     ],
 };
 
+const BUILDING_DEF_ORE_PURIFIER_COMPLEX: ColonyBuildingDefinition = ColonyBuildingDefinition {
+    label: "Ore Purifier Complex",
+    queue_button_label: "Ore+",
+    max_level: 4,
+    role_description: "Refines high-quality ore for interstellar export from metal-rich worlds.",
+    site_type: ColonyBuildingSiteType::Planet,
+    requires_solid_surface: true,
+    requires_atmosphere: false,
+    requires_scoopable_star: false,
+    is_player_queueable: true,
+    economy_profile: ColonyBuildingEconomyProfile {
+        treasury_base_cost: 58_000,
+        treasury_level_step: 34_000,
+        food_base_cost: 2.0,
+        food_level_step: 1.0,
+        industry_base_cost: 14.0,
+        industry_level_step: 8.0,
+        energy_base_cost: 10.0,
+        energy_level_step: 4.0,
+        duration_base_years: 0.82,
+        duration_level_step_years: 0.34,
+        per_level_modifiers: ColonyBuildingPerLevelModifiers {
+            food_production_bonus: 0.0,
+            industry_production_bonus: 0.0008,
+            energy_production_bonus: 0.0,
+            food_demand_bonus: 0.0,
+            industry_demand_bonus: 0.00015,
+            energy_demand_bonus: 0.00022,
+            element_extraction_bonus: 0.030,
+            atmosphere_harvest_bonus: 0.0,
+            treasury_production_bonus: 420.0,
+            stability_bonus: 0.0004,
+            growth_bonus: 0.0,
+            annual_upkeep: 2_300,
+        },
+    },
+    element_cost_scales: &[
+        ElementCostScale { symbol: "Fe", base: 7.0, step_per_level: 4.0 },
+        ElementCostScale { symbol: "Ni", base: 6.0, step_per_level: 4.0 },
+        ElementCostScale { symbol: "Ti", base: 4.0, step_per_level: 3.0 },
+        ElementCostScale { symbol: "Mo", base: 2.0, step_per_level: 1.0 },
+    ],
+};
+
+const BUILDING_DEF_STELLAR_ISOTOPE_CONDENSER: ColonyBuildingDefinition = ColonyBuildingDefinition {
+    label: "Stellar Isotope Condenser",
+    queue_button_label: "Iso+",
+    max_level: 3,
+    role_description: "Star-adjacent condenser that harvests rare gases and isotope fractions for trade.",
+    site_type: ColonyBuildingSiteType::Star,
+    requires_solid_surface: false,
+    requires_atmosphere: false,
+    requires_scoopable_star: true,
+    is_player_queueable: true,
+    economy_profile: ColonyBuildingEconomyProfile {
+        treasury_base_cost: 64_000,
+        treasury_level_step: 40_000,
+        food_base_cost: 2.0,
+        food_level_step: 1.0,
+        industry_base_cost: 12.0,
+        industry_level_step: 6.0,
+        energy_base_cost: 14.0,
+        energy_level_step: 7.0,
+        duration_base_years: 0.90,
+        duration_level_step_years: 0.40,
+        per_level_modifiers: ColonyBuildingPerLevelModifiers {
+            food_production_bonus: 0.0,
+            industry_production_bonus: 0.0005,
+            energy_production_bonus: 0.0,
+            food_demand_bonus: 0.0,
+            industry_demand_bonus: 0.0,
+            energy_demand_bonus: 0.00035,
+            element_extraction_bonus: 0.0,
+            atmosphere_harvest_bonus: 0.020,
+            treasury_production_bonus: 520.0,
+            stability_bonus: 0.0,
+            growth_bonus: 0.0,
+            annual_upkeep: 2_800,
+        },
+    },
+    element_cost_scales: &[
+        ElementCostScale { symbol: "Ti", base: 5.0, step_per_level: 3.0 },
+        ElementCostScale { symbol: "W", base: 3.0, step_per_level: 2.0 },
+        ElementCostScale { symbol: "Mo", base: 2.0, step_per_level: 1.0 },
+        ElementCostScale { symbol: "Cu", base: 4.0, step_per_level: 2.0 },
+    ],
+};
+
 impl ColonyBuildingKind {
     fn economy_profile(self) -> ColonyBuildingEconomyProfile {
         self.definition().economy_profile
@@ -1790,7 +2097,22 @@ impl Default for GameState {
                 treasury: 1_250_000,
                 colonization_tech_level: 0,
                 colonization_tech_progress: 0.0,
+                econ_tech_level: 0,
+                econ_tech_progress: 0.0,
+                military_tech_level: 0,
+                military_tech_progress: 0.0,
+                diplomacy_tech_level: 0,
+                diplomacy_tech_progress: 0.0,
                 starting_colony_id: None,
+                military: FactionMilitaryState::default(),
+                trade: FactionTradeState::default(),
+                dominance_score: 0.0,
+                threatenedness_score: 0.0,
+                last_diplomacy_action_year: 0.0,
+                last_powerplay_action_year: 0.0,
+                diplomacy_actions_recent: 0,
+                powerplay_actions_recent: 0,
+                forced_fallback_actions_recent: 0,
             },
         );
         factions.insert(
@@ -1801,7 +2123,22 @@ impl Default for GameState {
                 treasury: 2_800_000,
                 colonization_tech_level: 0,
                 colonization_tech_progress: 0.0,
+                econ_tech_level: 0,
+                econ_tech_progress: 0.0,
+                military_tech_level: 0,
+                military_tech_progress: 0.0,
+                diplomacy_tech_level: 0,
+                diplomacy_tech_progress: 0.0,
                 starting_colony_id: None,
+                military: FactionMilitaryState::default(),
+                trade: FactionTradeState::default(),
+                dominance_score: 0.0,
+                threatenedness_score: 0.0,
+                last_diplomacy_action_year: 0.0,
+                last_powerplay_action_year: 0.0,
+                diplomacy_actions_recent: 0,
+                powerplay_actions_recent: 0,
+                forced_fallback_actions_recent: 0,
             },
         );
         factions.insert(
@@ -1812,7 +2149,22 @@ impl Default for GameState {
                 treasury: 2_100_000,
                 colonization_tech_level: 0,
                 colonization_tech_progress: 0.0,
+                econ_tech_level: 0,
+                econ_tech_progress: 0.0,
+                military_tech_level: 0,
+                military_tech_progress: 0.0,
+                diplomacy_tech_level: 0,
+                diplomacy_tech_progress: 0.0,
                 starting_colony_id: None,
+                military: FactionMilitaryState::default(),
+                trade: FactionTradeState::default(),
+                dominance_score: 0.0,
+                threatenedness_score: 0.0,
+                last_diplomacy_action_year: 0.0,
+                last_powerplay_action_year: 0.0,
+                diplomacy_actions_recent: 0,
+                powerplay_actions_recent: 0,
+                forced_fallback_actions_recent: 0,
             },
         );
         factions.insert(
@@ -1823,7 +2175,22 @@ impl Default for GameState {
                 treasury: 2_000_000,
                 colonization_tech_level: 0,
                 colonization_tech_progress: 0.0,
+                econ_tech_level: 0,
+                econ_tech_progress: 0.0,
+                military_tech_level: 0,
+                military_tech_progress: 0.0,
+                diplomacy_tech_level: 0,
+                diplomacy_tech_progress: 0.0,
                 starting_colony_id: None,
+                military: FactionMilitaryState::default(),
+                trade: FactionTradeState::default(),
+                dominance_score: 0.0,
+                threatenedness_score: 0.0,
+                last_diplomacy_action_year: 0.0,
+                last_powerplay_action_year: 0.0,
+                diplomacy_actions_recent: 0,
+                powerplay_actions_recent: 0,
+                forced_fallback_actions_recent: 0,
             },
         );
         factions.insert(
@@ -1834,7 +2201,22 @@ impl Default for GameState {
                 treasury: 2_250_000,
                 colonization_tech_level: 0,
                 colonization_tech_progress: 0.0,
+                econ_tech_level: 0,
+                econ_tech_progress: 0.0,
+                military_tech_level: 0,
+                military_tech_progress: 0.0,
+                diplomacy_tech_level: 0,
+                diplomacy_tech_progress: 0.0,
                 starting_colony_id: None,
+                military: FactionMilitaryState::default(),
+                trade: FactionTradeState::default(),
+                dominance_score: 0.0,
+                threatenedness_score: 0.0,
+                last_diplomacy_action_year: 0.0,
+                last_powerplay_action_year: 0.0,
+                diplomacy_actions_recent: 0,
+                powerplay_actions_recent: 0,
+                forced_fallback_actions_recent: 0,
             },
         );
         factions.insert(
@@ -1845,7 +2227,22 @@ impl Default for GameState {
                 treasury: 3_000_000,
                 colonization_tech_level: 0,
                 colonization_tech_progress: 0.0,
+                econ_tech_level: 0,
+                econ_tech_progress: 0.0,
+                military_tech_level: 0,
+                military_tech_progress: 0.0,
+                diplomacy_tech_level: 0,
+                diplomacy_tech_progress: 0.0,
                 starting_colony_id: None,
+                military: FactionMilitaryState::default(),
+                trade: FactionTradeState::default(),
+                dominance_score: 0.0,
+                threatenedness_score: 0.0,
+                last_diplomacy_action_year: 0.0,
+                last_powerplay_action_year: 0.0,
+                diplomacy_actions_recent: 0,
+                powerplay_actions_recent: 0,
+                forced_fallback_actions_recent: 0,
             },
         );
         factions.insert(
@@ -1856,7 +2253,22 @@ impl Default for GameState {
                 treasury: 2_150_000,
                 colonization_tech_level: 0,
                 colonization_tech_progress: 0.0,
+                econ_tech_level: 0,
+                econ_tech_progress: 0.0,
+                military_tech_level: 0,
+                military_tech_progress: 0.0,
+                diplomacy_tech_level: 0,
+                diplomacy_tech_progress: 0.0,
                 starting_colony_id: None,
+                military: FactionMilitaryState::default(),
+                trade: FactionTradeState::default(),
+                dominance_score: 0.0,
+                threatenedness_score: 0.0,
+                last_diplomacy_action_year: 0.0,
+                last_powerplay_action_year: 0.0,
+                diplomacy_actions_recent: 0,
+                powerplay_actions_recent: 0,
+                forced_fallback_actions_recent: 0,
             },
         );
         factions.insert(
@@ -1867,7 +2279,22 @@ impl Default for GameState {
                 treasury: 2_350_000,
                 colonization_tech_level: 0,
                 colonization_tech_progress: 0.0,
+                econ_tech_level: 0,
+                econ_tech_progress: 0.0,
+                military_tech_level: 0,
+                military_tech_progress: 0.0,
+                diplomacy_tech_level: 0,
+                diplomacy_tech_progress: 0.0,
                 starting_colony_id: None,
+                military: FactionMilitaryState::default(),
+                trade: FactionTradeState::default(),
+                dominance_score: 0.0,
+                threatenedness_score: 0.0,
+                last_diplomacy_action_year: 0.0,
+                last_powerplay_action_year: 0.0,
+                diplomacy_actions_recent: 0,
+                powerplay_actions_recent: 0,
+                forced_fallback_actions_recent: 0,
             },
         );
 
@@ -1887,6 +2314,11 @@ impl Default for GameState {
             diplomacy_treaties: HashMap::new(),
             active_sanctions: HashMap::new(),
             recent_powerplay_ops: Vec::new(),
+            powerplay_owner_floor_active_systems: 0,
+            military_campaigns: HashMap::new(),
+            active_armies: HashMap::new(),
+            next_army_id: Self::default_next_army_id(),
+            next_campaign_id: Self::default_next_campaign_id(),
             player_reputation: HashMap::new(),
             missions: Vec::new(),
             next_mission_id: Self::default_next_mission_id(),
@@ -1911,12 +2343,338 @@ impl GameState {
     const POPULATION_UPKEEP_LINEAR_PER_PERSON: f64 = 0.016;
     const POPULATION_UPKEEP_QUADRATIC_PER_PERSON_SQUARED: f64 = 0.000000004;
     const STARTING_COLONY_MIN_POPULATION: u32 = 10_000;
+    const POWERPLAY_OWNER_INCOME_FLOOR: f32 = 0.35;
+    pub const POWERPLAY_FOREIGN_OP_COST: i64 = 18_000;
+    pub const POWERPLAY_FOREIGN_OP_MIN_TREASURY_RESERVE: i64 = 30_000;
     const MISSION_REFRESH_INTERVAL_YEARS: f32 = 0.65;
     const CONSTRUCTION_UPFRONT_PAYMENT_RATIO: f32 = 0.60;
     const CONSTRUCTION_ANNUAL_UPKEEP_RATIO: f32 = 0.16;
+    pub const MILITARY_RECRUIT_UNITS_PER_BATCH: u32 = 180;
+    pub const MILITARY_RECRUIT_TREASURY_COST_PER_UNIT: i64 = 180;
+    pub const MILITARY_RECRUIT_POPULATION_COST_PER_UNIT: f64 = 6.0;
+    pub const MILITARY_UPKEEP_TREASURY_COST_PER_UNIT: i64 = 28;
+    pub const MILITARY_UPKEEP_POPULATION_ATTRITION_PER_UNIT: f64 = 0.22;
+    pub const MILITARY_MIN_TREASURY_RESERVE: i64 = 120_000;
+    pub const MILITARY_MIN_POPULATION_RESERVE: f64 = 12_000.0;
+    const MILITARY_MAX_CONCURRENT_CAMPAIGNS_PER_FACTION: usize = 2;
+    const SACK_TREASURY_EXTRACT_PCT: f32 = 0.16;
+    const SACK_POPULATION_EXTRACT_PCT: f64 = 0.09;
+    const TRADE_PACT_MIN_PAYOUT_ANNUAL: i64 = 2_000;
+    const TRADE_PACT_MAX_PAYOUT_ANNUAL: i64 = 95_000;
+    const MILITARY_MAX_DEFICIT_TOLERANCE: i64 = 120_000;
+    const DOMAIN_TECH_MAX_LEVEL: u32 = 40;
+    const PRESSURE_BASELINE_FLOOR: f32 = 0.05;
+    const SCARCITY_BASELINE_FLOOR: f32 = 0.03;
+    const DIPLOMACY_ACTION_COOLDOWN_YEARS: f32 = 1.6;
 
     fn default_next_mission_id() -> u64 {
         1
+    }
+
+    fn default_next_campaign_id() -> u64 {
+        1
+    }
+
+    fn default_next_army_id() -> u64 {
+        1
+    }
+
+    pub fn faction_total_population(&self, faction_id: &str) -> f64 {
+        self.colonies
+            .values()
+            .filter(|c| c.owner_faction == faction_id)
+            .map(|c| c.population)
+            .sum()
+    }
+
+    pub fn active_campaign_count_for_faction(&self, faction_id: &str) -> usize {
+        self.military_campaigns
+            .values()
+            .filter(|c| c.attacker_faction == faction_id)
+            .count()
+    }
+
+    pub fn active_military_campaigns(&self) -> Vec<&MilitaryCampaignState> {
+        let mut campaigns: Vec<&MilitaryCampaignState> = self.military_campaigns.values().collect();
+        campaigns.sort_by_key(|c| c.id);
+        campaigns
+    }
+
+    fn advance_domain_progress(progress: &mut f32, level: &mut u32, amount: f32) {
+        if amount <= 0.0 || !amount.is_finite() {
+            return;
+        }
+        *progress += amount;
+        while *progress >= 1.0 && *level < Self::DOMAIN_TECH_MAX_LEVEL {
+            *progress -= 1.0;
+            *level = level.saturating_add(1);
+        }
+        if *level >= Self::DOMAIN_TECH_MAX_LEVEL {
+            *progress = progress.clamp(0.0, 0.999);
+        }
+    }
+
+    pub fn faction_econ_efficiency(&self, faction_id: &str) -> f32 {
+        let lvl = self
+            .factions
+            .get(faction_id)
+            .map(|f| f.econ_tech_level)
+            .unwrap_or(0) as f32;
+        (1.0 + lvl * 0.012).clamp(1.0, 1.36)
+    }
+
+    pub fn faction_upkeep_efficiency(&self, faction_id: &str) -> f32 {
+        let lvl = self
+            .factions
+            .get(faction_id)
+            .map(|f| f.econ_tech_level)
+            .unwrap_or(0) as f32;
+        (1.0 - lvl * 0.0075).clamp(0.72, 1.0)
+    }
+
+    pub fn faction_military_effectiveness(&self, faction_id: &str) -> f32 {
+        let lvl = self
+            .factions
+            .get(faction_id)
+            .map(|f| f.military_tech_level)
+            .unwrap_or(0) as f32;
+        (1.0 + lvl * 0.010).clamp(1.0, 1.32)
+    }
+
+    pub fn faction_powerplay_efficiency(&self, faction_id: &str) -> f32 {
+        let lvl = self
+            .factions
+            .get(faction_id)
+            .map(|f| f.military_tech_level)
+            .unwrap_or(0) as f32;
+        (1.0 + lvl * 0.008).clamp(1.0, 1.24)
+    }
+
+    pub fn faction_diplomacy_modifier(&self, faction_id: &str) -> f32 {
+        let lvl = self
+            .factions
+            .get(faction_id)
+            .map(|f| f.diplomacy_tech_level)
+            .unwrap_or(0) as f32;
+        (lvl * 0.9).clamp(0.0, 22.0)
+    }
+
+    pub fn faction_trade_efficiency(&self, faction_id: &str) -> f32 {
+        let lvl = self
+            .factions
+            .get(faction_id)
+            .map(|f| f.diplomacy_tech_level)
+            .unwrap_or(0) as f32;
+        (1.0 + lvl * 0.010).clamp(1.0, 1.28)
+    }
+
+    pub fn faction_survey_speed_modifier(&self, faction_id: &str) -> f32 {
+        let lvl = self
+            .factions
+            .get(faction_id)
+            .map(|f| f.colonization_tech_level)
+            .unwrap_or(0) as f32;
+        (1.0 - lvl * 0.01).clamp(0.62, 1.0)
+    }
+
+    pub fn faction_colonization_cost_modifier(&self, faction_id: &str) -> f32 {
+        let lvl = self
+            .factions
+            .get(faction_id)
+            .map(|f| f.colonization_tech_level)
+            .unwrap_or(0) as f32;
+        (1.0 - lvl * 0.009).clamp(0.68, 1.0)
+    }
+
+    fn system_distance_sq(a: [f32; 3], b: [f32; 3]) -> f32 {
+        let dx = a[0] - b[0];
+        let dy = a[1] - b[1];
+        let dz = a[2] - b[2];
+        dx * dx + dy * dy + dz * dz
+    }
+
+    fn lane_graph_for_colonized_systems(&self) -> HashMap<SystemId, Vec<SystemId>> {
+        let mut by_system: HashMap<SystemId, [f32; 3]> = HashMap::new();
+        for colony in self.colonies.values() {
+            by_system.entry(colony.system).or_insert(colony.system_pos);
+        }
+        let mut systems: Vec<(SystemId, [f32; 3])> = by_system.into_iter().collect();
+        systems.sort_by_key(|(id, _)| *id);
+        let mut lanes = HashMap::<SystemId, Vec<SystemId>>::new();
+        for (id, pos) in &systems {
+            let mut neighbors: Vec<(SystemId, f32)> = systems
+                .iter()
+                .filter(|(other, _)| other != id)
+                .map(|(other, other_pos)| (*other, Self::system_distance_sq(*pos, *other_pos)))
+                .collect();
+            neighbors.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            let mut picks: Vec<SystemId> = neighbors.into_iter().take(4).map(|(sid, _)| sid).collect();
+            picks.sort_unstable();
+            lanes.insert(*id, picks);
+        }
+        lanes
+    }
+
+    fn next_hop_toward(
+        &self,
+        graph: &HashMap<SystemId, Vec<SystemId>>,
+        current: SystemId,
+        target: SystemId,
+    ) -> Option<SystemId> {
+        if current == target {
+            return Some(target);
+        }
+        let mut queue = VecDeque::new();
+        let mut visited = HashSet::<SystemId>::new();
+        let mut prev = HashMap::<SystemId, SystemId>::new();
+        queue.push_back(current);
+        visited.insert(current);
+        while let Some(node) = queue.pop_front() {
+            let mut neighbors = graph.get(&node)?.clone();
+            neighbors.sort_unstable();
+            for neighbor in neighbors {
+                if !visited.insert(neighbor) {
+                    continue;
+                }
+                prev.insert(neighbor, node);
+                if neighbor == target {
+                    let mut step = target;
+                    while let Some(parent) = prev.get(&step).copied() {
+                        if parent == current {
+                            return Some(step);
+                        }
+                        step = parent;
+                    }
+                }
+                queue.push_back(neighbor);
+            }
+        }
+        None
+    }
+
+    fn resolve_army_battle(
+        &self,
+        attacker: &ArmyEntityState,
+        defender: &ArmyEntityState,
+        system: SystemId,
+    ) -> (u8, u8, u32, u32, bool) {
+        let seed = (attacker.id as u128)
+            .wrapping_mul(1_000_003)
+            .wrapping_add((defender.id as u128).wrapping_mul(97_531))
+            .wrapping_add((system.local_index as u128).wrapping_mul(9_973))
+            .wrapping_add((self.current_year as u128).wrapping_mul(31));
+        let attacker_roll = ((seed % 10) as u8) + 1;
+        let defender_roll = (((seed / 13) % 10) as u8) + 1;
+        let attacker_quality = self.faction_military_effectiveness(&attacker.owner_faction);
+        let defender_quality = self.faction_military_effectiveness(&defender.owner_faction);
+        let attacker_score = attacker_roll as f32
+            + (attacker.units as f32 / 120.0)
+            + attacker.readiness * 2.0
+            + (attacker_quality - 1.0) * 5.0;
+        let defender_score = defender_roll as f32
+            + (defender.units as f32 / 120.0)
+            + defender.readiness * 2.0
+            + (defender_quality - 1.0) * 5.0;
+        let attacker_loss =
+            ((defender_score * 3.1 / attacker_quality.max(0.8)).round() as u32).min(attacker.units);
+        let defender_loss =
+            ((attacker_score * 3.1 / defender_quality.max(0.8)).round() as u32).min(defender.units);
+        (
+            attacker_roll,
+            defender_roll,
+            attacker_loss,
+            defender_loss,
+            attacker_score >= defender_score,
+        )
+    }
+
+    pub fn faction_dominance_score(&self, faction_id: &str) -> f32 {
+        self.factions
+            .get(faction_id)
+            .map(|f| f.dominance_score)
+            .unwrap_or(0.0)
+    }
+
+    pub fn faction_threatenedness_score(&self, faction_id: &str) -> f32 {
+        self.factions
+            .get(faction_id)
+            .map(|f| f.threatenedness_score)
+            .unwrap_or(0.0)
+    }
+
+    pub fn diplomatic_alignment_score(&self, a: &str, b: &str) -> f32 {
+        let relation = self.relation_between(a, b) as f32 / 100.0;
+        let shared_threat = self
+            .faction_threatenedness_score(a)
+            .min(self.faction_threatenedness_score(b));
+        let against_dominant = (1.0 - self.faction_dominance_score(a)).max(0.0)
+            * (1.0 - self.faction_dominance_score(b)).max(0.0);
+        let diplomacy_bonus =
+            (self.faction_diplomacy_modifier(a) + self.faction_diplomacy_modifier(b)) / 200.0;
+        (relation * 0.55 + shared_threat * 0.30 + against_dominant * 0.15 + diplomacy_bonus)
+            .clamp(-1.0, 1.0)
+    }
+
+    fn add_trade_resource_amount(
+        map: &mut HashMap<TradeResourceKind, f32>,
+        kind: TradeResourceKind,
+        amount: f32,
+    ) {
+        if amount <= 0.0 {
+            return;
+        }
+        *map.entry(kind).or_insert(0.0) += amount;
+    }
+
+    fn colony_trade_resource_output(
+        colony: &ColonyState,
+        delta_years: f32,
+        trade_efficiency: f32,
+    ) -> HashMap<TradeResourceKind, f32> {
+        let mut out = HashMap::new();
+        let mut ore_levels = 0u16;
+        let mut isotope_levels = 0u16;
+        for b in &colony.buildings {
+            match b.kind {
+                ColonyBuildingKind::OrePurifierComplex => ore_levels = ore_levels.saturating_add(b.level),
+                ColonyBuildingKind::StellarIsotopeCondenser => {
+                    isotope_levels = isotope_levels.saturating_add(b.level)
+                }
+                _ => {}
+            }
+        }
+        if ore_levels > 0 {
+            let metallicity = colony
+                .element_resource_profile
+                .get("Fe")
+                .copied()
+                .unwrap_or(0.0)
+                + colony.element_resource_profile.get("Ni").copied().unwrap_or(0.0)
+                + colony.element_resource_profile.get("Ti").copied().unwrap_or(0.0);
+            let ore = ore_levels as f32
+                * (18.0 + metallicity * 70.0)
+                * delta_years.max(0.1)
+                * trade_efficiency;
+            Self::add_trade_resource_amount(&mut out, TradeResourceKind::HighGradeOre, ore);
+            let bio = ore_levels as f32
+                * (4.0 + colony.atmosphere_pressure_atm.clamp(0.0, 3.0) * 2.0)
+                * delta_years.max(0.1)
+                * trade_efficiency;
+            Self::add_trade_resource_amount(&mut out, TradeResourceKind::BioSamples, bio);
+        }
+        if isotope_levels > 0 {
+            let isotope = isotope_levels as f32
+                * (20.0 + colony.energy_balance.max(0.0) * 80.0)
+                * delta_years.max(0.1)
+                * trade_efficiency;
+            Self::add_trade_resource_amount(&mut out, TradeResourceKind::ExoticIsotopes, isotope);
+            let gas = isotope_levels as f32
+                * (8.0 + colony.atmosphere_pressure_atm.clamp(0.0, 6.0) * 3.0)
+                * delta_years.max(0.1)
+                * trade_efficiency;
+            Self::add_trade_resource_amount(&mut out, TradeResourceKind::RareGas, gas);
+        }
+        out
     }
 
     fn colony_stage_for_population(population: f64) -> ColonyStage {
@@ -2328,11 +3086,21 @@ impl GameState {
 
         if let Some(faction) = self.factions.get_mut(&faction_id) {
             faction.treasury = faction.treasury.saturating_add(faction_treasury);
-            faction.colonization_tech_progress += tech_progress;
-            while faction.colonization_tech_progress >= 1.0 {
-                faction.colonization_tech_progress -= 1.0;
-                faction.colonization_tech_level = faction.colonization_tech_level.saturating_add(1);
-            }
+            Self::advance_domain_progress(
+                &mut faction.colonization_tech_progress,
+                &mut faction.colonization_tech_level,
+                tech_progress * 0.65,
+            );
+            Self::advance_domain_progress(
+                &mut faction.econ_tech_progress,
+                &mut faction.econ_tech_level,
+                tech_progress * 0.15,
+            );
+            Self::advance_domain_progress(
+                &mut faction.diplomacy_tech_progress,
+                &mut faction.diplomacy_tech_level,
+                tech_progress * 0.20,
+            );
         }
         let rep_entry = self.player_reputation.entry(faction_id).or_insert(0);
         *rep_entry = (*rep_entry + reputation_gain).clamp(-100, 100);
@@ -2384,16 +3152,31 @@ impl GameState {
 
     pub fn hostility_score_between(&self, a: &str, b: &str) -> f32 {
         let mut hostility = -(self.get_relation(a, b) as f32) / 100.0;
+        let threat_mitigation = self
+            .factions
+            .get(a)
+            .map(|f| f.threatenedness_score)
+            .unwrap_or(0.0)
+            .min(
+                self.factions
+                    .get(b)
+                    .map(|f| f.threatenedness_score)
+                    .unwrap_or(0.0),
+            );
         if let Some(treaty) = self.treaty_between(a, b) {
             hostility -= match treaty.kind {
-                DiplomaticTreatyKind::Alliance => 0.55,
-                DiplomaticTreatyKind::NonAggressionPact => 0.30,
+                DiplomaticTreatyKind::Alliance => 0.55 + threat_mitigation * 0.10,
+                DiplomaticTreatyKind::NonAggressionPact => 0.30 + threat_mitigation * 0.06,
+                DiplomaticTreatyKind::TradePact => 0.20 + threat_mitigation * 0.04,
             };
         }
         if self.has_sanction(a, b) || self.has_sanction(b, a) {
             hostility += 0.35;
         }
-        hostility.clamp(-1.0, 1.0)
+        let diplomacy_relief = ((self.faction_diplomacy_modifier(a) + self.faction_diplomacy_modifier(b))
+            * 0.006)
+            .clamp(0.0, 0.22);
+        (hostility - diplomacy_relief).clamp(-1.0, 1.0)
     }
 
     pub fn has_sanction(&self, by_faction: &str, target_faction: &str) -> bool {
@@ -2402,7 +3185,7 @@ impl GameState {
             .is_some_and(|expires| *expires > self.current_year)
     }
 
-    pub fn diplomacy_summary_counts(&self) -> (usize, usize, usize) {
+    pub fn diplomacy_summary_counts(&self) -> (usize, usize, usize, usize) {
         let alliance_count = self
             .diplomacy_treaties
             .values()
@@ -2415,12 +3198,37 @@ impl GameState {
                 t.kind == DiplomaticTreatyKind::NonAggressionPact && t.expires_year > self.current_year
             })
             .count();
+        let trade_pact_count = self
+            .diplomacy_treaties
+            .values()
+            .filter(|t| t.kind == DiplomaticTreatyKind::TradePact && t.expires_year > self.current_year)
+            .count();
         let sanction_count = self
             .active_sanctions
             .values()
             .filter(|expires| **expires > self.current_year)
             .count();
-        (alliance_count, pact_count, sanction_count)
+        (alliance_count, pact_count, trade_pact_count, sanction_count)
+    }
+
+    pub fn forced_activity_summary(&self) -> (usize, usize, usize) {
+        let active_forced = self
+            .factions
+            .values()
+            .filter(|f| self.current_year - f.last_powerplay_action_year <= 1.0)
+            .filter(|f| f.forced_fallback_actions_recent > 0)
+            .count();
+        let diplomacy_actions: usize = self
+            .factions
+            .values()
+            .map(|f| f.diplomacy_actions_recent as usize)
+            .sum();
+        let powerplay_actions: usize = self
+            .factions
+            .values()
+            .map(|f| f.powerplay_actions_recent as usize)
+            .sum();
+        (active_forced, diplomacy_actions, powerplay_actions)
     }
 
     fn ensure_system_sim_state(&mut self, system: SystemId) -> &mut SystemSimState {
@@ -2428,6 +3236,18 @@ impl GameState {
             system,
             ..SystemSimState::default()
         })
+    }
+
+    fn colony_system_owner_weights(&self) -> HashMap<SystemId, HashMap<String, f32>> {
+        let mut owners_by_system: HashMap<SystemId, HashMap<String, f32>> = HashMap::new();
+        for colony in self.colonies.values() {
+            *owners_by_system
+                .entry(colony.system)
+                .or_default()
+                .entry(colony.owner_faction.clone())
+                .or_insert(0.0) += 1.0;
+        }
+        owners_by_system
     }
 
     fn regenerate_missions(&mut self) {
@@ -2577,17 +3397,21 @@ impl GameState {
         (population * saturation) / (population + saturation)
     }
 
-    fn colony_tax_revenue_annual(colony: &ColonyState) -> i64 {
+    fn colony_tax_revenue_annual(colony: &ColonyState, econ_efficiency: f32) -> i64 {
         let base_per_person = 0.64_f64;
         let stability_factor = colony.stability.clamp(0.2, 1.0) as f64;
         let policy_factor = colony.taxation_policy.multiplier();
         let taxable_population = Self::taxable_population(colony.population);
-        (taxable_population * base_per_person * stability_factor * policy_factor)
+        (taxable_population
+            * base_per_person
+            * stability_factor
+            * policy_factor
+            * econ_efficiency as f64)
             .round()
             .max(0.0) as i64
     }
 
-    fn colony_upkeep_cost_annual(colony: &ColonyState) -> i64 {
+    fn colony_upkeep_cost_annual(colony: &ColonyState, upkeep_efficiency: f32) -> i64 {
         let stage_base = match colony.stage {
             ColonyStage::Outpost => 4_500,
             ColonyStage::Settlement => 18_000,
@@ -2603,7 +3427,10 @@ impl GameState {
             * Self::POPULATION_UPKEEP_QUADRATIC_PER_PERSON_SQUARED;
         let population_component = population_component_linear + population_component_quadratic;
 
-        ((stage_base as f64 + population_component) * policy_factor * defense_factor)
+        ((stage_base as f64 + population_component)
+            * policy_factor
+            * defense_factor
+            * upkeep_efficiency as f64)
             .round()
             .max(0.0) as i64
     }
@@ -2833,7 +3660,8 @@ impl GameState {
         }
 
         pending.start_year = current_year;
-        let duration = (pending.complete_year - pending.start_year).max(0.05);
+        let duration = ((pending.complete_year - pending.start_year).max(0.05))
+            * self.faction_survey_speed_modifier(&pending.founder_faction);
         pending.complete_year = pending.start_year + duration;
         pending.element_resource_profile =
             Self::normalized_element_resource_profile(&pending.element_resource_profile);
@@ -2950,8 +3778,10 @@ impl GameState {
             return Err("Survey transition is invalid for this system.");
         }
 
-        let duration = (Self::survey_duration_years(target_stage) * duration_scale.clamp(0.5, 12.0))
-            .max(0.02);
+        let duration = (Self::survey_duration_years(target_stage)
+            * duration_scale.clamp(0.5, 12.0)
+            * self.faction_survey_speed_modifier(&by_faction))
+        .max(0.02);
         self.pending_survey_scans.push(PendingSurveyScan {
             system,
             by_faction,
@@ -3320,6 +4150,11 @@ impl GameState {
                 self.current_year = self.current_year.max(*at_year);
                 let current = self.get_relation(from_faction, to_faction);
                 self.set_relation(from_faction, to_faction, current.saturating_add(*delta));
+                for fid in [from_faction, to_faction] {
+                    if let Some(faction) = self.factions.get_mut(fid) {
+                        faction.last_diplomacy_action_year = *at_year;
+                    }
+                }
             }
             GameEvent::TreatyEstablished {
                 at_year,
@@ -3327,7 +4162,7 @@ impl GameState {
                 faction_b,
                 treaty,
                 expires_year,
-                ..
+                reason,
             } => {
                 self.current_year = self.current_year.max(*at_year);
                 self.diplomacy_treaties.insert(
@@ -3343,9 +4178,24 @@ impl GameState {
                 let relation_boost = match treaty {
                     DiplomaticTreatyKind::Alliance => 10,
                     DiplomaticTreatyKind::NonAggressionPact => 6,
-                };
+                    DiplomaticTreatyKind::TradePact => 7,
+                } + ((self.faction_threatenedness_score(faction_a)
+                    .min(self.faction_threatenedness_score(faction_b))
+                    * 4.0)
+                    .round() as i16);
                 let current = self.get_relation(faction_a, faction_b);
                 self.set_relation(faction_a, faction_b, current.saturating_add(relation_boost));
+                for fid in [faction_a, faction_b] {
+                    if let Some(faction) = self.factions.get_mut(fid) {
+                        faction.last_diplomacy_action_year = *at_year;
+                        faction.diplomacy_actions_recent =
+                            faction.diplomacy_actions_recent.saturating_add(1);
+                        if reason.contains("Forced fallback") {
+                            faction.forced_fallback_actions_recent =
+                                faction.forced_fallback_actions_recent.saturating_add(1);
+                        }
+                    }
+                }
             }
             GameEvent::TreatyDissolved {
                 at_year,
@@ -3356,7 +4206,11 @@ impl GameState {
                 self.current_year = self.current_year.max(*at_year);
                 self.diplomacy_treaties.remove(&Self::relation_key(faction_a, faction_b));
                 let current = self.get_relation(faction_a, faction_b);
-                self.set_relation(faction_a, faction_b, current.saturating_sub(12));
+                let threatened = self
+                    .faction_threatenedness_score(faction_a)
+                    .max(self.faction_threatenedness_score(faction_b));
+                let dissolve_penalty = 10 + ((1.0 - threatened) * 4.0).round() as i16;
+                self.set_relation(faction_a, faction_b, current.saturating_sub(dissolve_penalty));
             }
             GameEvent::SanctionImposed {
                 at_year,
@@ -3391,35 +4245,60 @@ impl GameState {
                 operation,
                 success,
                 strength,
-                ..
+                internal_operation,
+                treasury_cost,
+                reason,
             } => {
                 self.current_year = self.current_year.max(*at_year);
+                let has_colony = self.colonies.values().any(|colony| colony.system == *system);
+                if !has_colony {
+                    return;
+                }
+                let powerplay_eff = self.faction_powerplay_efficiency(actor_faction);
+                let charged_cost = if !*internal_operation { *treasury_cost } else { 0 };
+                if charged_cost > 0 {
+                    if let Some(actor) = self.factions.get_mut(actor_faction) {
+                        let reserve_floor = Self::POWERPLAY_FOREIGN_OP_MIN_TREASURY_RESERVE;
+                        let adjusted_cost = ((charged_cost as f32) / powerplay_eff.max(0.8)).round() as i64;
+                        if actor.treasury <= reserve_floor
+                            || actor.treasury.saturating_sub(adjusted_cost) < -reserve_floor
+                        {
+                            return;
+                        }
+                        actor.treasury = actor.treasury.saturating_sub(adjusted_cost);
+                        actor.trade.annual_powerplay_spend = actor
+                            .trade
+                            .annual_powerplay_spend
+                            .saturating_add(adjusted_cost);
+                    }
+                }
                 let sim = self.ensure_system_sim_state(*system);
+                let scaled_strength = (*strength * powerplay_eff).clamp(0.01, 0.18);
                 if *success {
                     match operation {
                         PowerplayOperationKind::UndermineInfluence => {
                             if let Some(target) = sim.influence_by_faction.get_mut(target_faction) {
-                                *target = (*target - *strength).max(0.0);
+                                *target = (*target - scaled_strength).max(0.0);
                             }
                             *sim
                                 .influence_by_faction
                                 .entry(actor_faction.clone())
-                                .or_insert(0.0) += *strength * 0.55;
-                            sim.econ_pressure = (sim.econ_pressure + strength * 0.45).clamp(0.0, 1.2);
-                            sim.security = (sim.security - strength * 0.25).clamp(0.05, 1.0);
+                                .or_insert(0.0) += scaled_strength * 0.55;
+                            sim.econ_pressure = (sim.econ_pressure + scaled_strength * 0.62).clamp(0.0, 1.2);
+                            sim.security = (sim.security - scaled_strength * 0.30).clamp(0.05, 1.0);
                         }
                         PowerplayOperationKind::SupportAlly => {
                             *sim
                                 .influence_by_faction
                                 .entry(target_faction.clone())
-                                .or_insert(0.0) += *strength * 0.65;
-                            sim.trade_flow = (sim.trade_flow + strength * 0.40).clamp(0.0, 2.0);
-                            sim.stability = (sim.stability + strength * 0.20).clamp(0.05, 1.0);
+                                .or_insert(0.0) += scaled_strength * 0.65;
+                            sim.trade_flow = (sim.trade_flow + scaled_strength * 0.40).clamp(0.0, 2.0);
+                            sim.stability = (sim.stability + scaled_strength * 0.20).clamp(0.05, 1.0);
                         }
                         PowerplayOperationKind::EconomicPressure => {
-                            sim.scarcity = (sim.scarcity + strength * 0.30).clamp(0.0, 1.0);
-                            sim.econ_pressure = (sim.econ_pressure + strength * 0.35).clamp(0.0, 1.2);
-                            sim.trade_flow = (sim.trade_flow - strength * 0.28).clamp(0.0, 2.0);
+                            sim.scarcity = (sim.scarcity + scaled_strength * 0.44).clamp(0.0, 1.0);
+                            sim.econ_pressure = (sim.econ_pressure + scaled_strength * 0.50).clamp(0.0, 1.2);
+                            sim.trade_flow = (sim.trade_flow - scaled_strength * 0.28).clamp(0.0, 2.0);
                         }
                     }
                 }
@@ -3430,11 +4309,329 @@ impl GameState {
                     system: *system,
                     operation: *operation,
                     success: *success,
+                    internal_operation: *internal_operation,
+                    treasury_cost: if *internal_operation { 0 } else { *treasury_cost },
                 });
                 if self.recent_powerplay_ops.len() > 128 {
                     let drop_n = self.recent_powerplay_ops.len() - 128;
                     self.recent_powerplay_ops.drain(0..drop_n);
                 }
+                if let Some(actor) = self.factions.get_mut(actor_faction) {
+                    actor.last_powerplay_action_year = *at_year;
+                    actor.powerplay_actions_recent = actor.powerplay_actions_recent.saturating_add(1);
+                    if reason.contains("Forced fallback") {
+                        actor.forced_fallback_actions_recent =
+                            actor.forced_fallback_actions_recent.saturating_add(1);
+                    }
+                }
+            }
+            GameEvent::ArmyRecruited {
+                at_year,
+                faction_id,
+                recruited_units,
+                treasury_cost,
+                population_cost,
+            } => {
+                self.current_year = self.current_year.max(*at_year);
+                if let Some(faction) = self.factions.get_mut(faction_id) {
+                    faction.treasury = faction.treasury.saturating_sub(*treasury_cost);
+                    faction.military.standing_army_units = faction
+                        .military
+                        .standing_army_units
+                        .saturating_add(*recruited_units);
+                    faction.military.readiness = (faction.military.readiness + 0.10).clamp(0.0, 1.0);
+                }
+                let mut remaining = *population_cost;
+                let mut owned_colonies: Vec<u64> = self
+                    .colonies
+                    .iter()
+                    .filter(|(_, colony)| colony.owner_faction == *faction_id)
+                    .map(|(id, _)| *id)
+                    .collect();
+                owned_colonies.sort_unstable();
+                for colony_id in owned_colonies {
+                    if remaining <= 0.01 {
+                        break;
+                    }
+                    if let Some(colony) = self.colonies.get_mut(&colony_id) {
+                        let draw = remaining.min((colony.population * 0.02).max(0.0));
+                        colony.population = (colony.population - draw).max(50.0);
+                        colony.stability = (colony.stability - 0.004).clamp(0.05, 1.0);
+                        remaining -= draw;
+                    }
+                }
+            }
+            GameEvent::ArmyUpkeepApplied {
+                at_year,
+                faction_id,
+                unit_count,
+                treasury_cost,
+                population_attrition,
+            } => {
+                self.current_year = self.current_year.max(*at_year);
+                if let Some(faction) = self.factions.get_mut(faction_id) {
+                    faction.treasury = faction.treasury.saturating_sub(*treasury_cost);
+                    if faction.treasury < Self::MILITARY_MAX_DEFICIT_TOLERANCE.saturating_neg() {
+                        let deficit_over =
+                            (Self::MILITARY_MAX_DEFICIT_TOLERANCE.saturating_neg() - faction.treasury)
+                                .max(0) as f32;
+                        let base = ((*unit_count as f32) * 0.18).round() as u32;
+                        let extra = (deficit_over / 40_000.0).ceil() as u32;
+                        let shrink = base.saturating_add(extra).max(1);
+                        faction.military.standing_army_units = faction
+                            .military
+                            .standing_army_units
+                            .saturating_sub(shrink);
+                        faction.military.readiness = (faction.military.readiness - 0.14).clamp(0.0, 1.0);
+                    }
+                }
+                let mut remaining = *population_attrition;
+                let mut owned_colonies: Vec<u64> = self
+                    .colonies
+                    .iter()
+                    .filter(|(_, colony)| colony.owner_faction == *faction_id)
+                    .map(|(id, _)| *id)
+                    .collect();
+                owned_colonies.sort_unstable();
+                for colony_id in owned_colonies {
+                    if remaining <= 0.01 {
+                        break;
+                    }
+                    if let Some(colony) = self.colonies.get_mut(&colony_id) {
+                        let draw = remaining.min((colony.population * 0.005).max(0.0));
+                        colony.population = (colony.population - draw).max(40.0);
+                        colony.stability = (colony.stability - 0.002).clamp(0.05, 1.0);
+                        remaining -= draw;
+                    }
+                }
+            }
+            GameEvent::MilitaryCampaignStarted {
+                at_year,
+                campaign_id,
+                attacker_faction,
+                defender_faction,
+                target_colony_id,
+                target_system,
+                outcome,
+            } => {
+                self.current_year = self.current_year.max(*at_year);
+                self.next_campaign_id = self.next_campaign_id.max(campaign_id.saturating_add(1));
+                self.military_campaigns.insert(
+                    *campaign_id,
+                    MilitaryCampaignState {
+                        id: *campaign_id,
+                        army_id: 0,
+                        attacker_faction: attacker_faction.clone(),
+                        defender_faction: defender_faction.clone(),
+                        target_colony_id: *target_colony_id,
+                        target_system: *target_system,
+                        progress: 0.0,
+                        attacker_strength_snapshot: 0.0,
+                        defender_strength_snapshot: 0.0,
+                        started_year: *at_year,
+                        phase: MilitaryCampaignPhase::Mobilizing,
+                        occupation_ticks_remaining: 3,
+                        outcome: *outcome,
+                    },
+                );
+            }
+            GameEvent::MilitaryCampaignProgressed {
+                at_year,
+                campaign_id,
+                progress,
+                attacker_strength,
+                defender_strength,
+                phase,
+            } => {
+                self.current_year = self.current_year.max(*at_year);
+                if let Some(campaign) = self.military_campaigns.get_mut(campaign_id) {
+                    campaign.progress = *progress;
+                    campaign.attacker_strength_snapshot = *attacker_strength;
+                    campaign.defender_strength_snapshot = *defender_strength;
+                    campaign.phase = *phase;
+                }
+            }
+            GameEvent::MilitaryCampaignAborted { at_year, campaign_id, .. } => {
+                self.current_year = self.current_year.max(*at_year);
+                if let Some(campaign) = self.military_campaigns.get(campaign_id) {
+                    if campaign.army_id != 0 {
+                        self.active_armies.remove(&campaign.army_id);
+                    }
+                }
+                self.military_campaigns.remove(campaign_id);
+            }
+            GameEvent::ArmyDispatched {
+                at_year,
+                army_id,
+                faction_id,
+                units,
+                from_system,
+                target_system,
+                campaign_id,
+            } => {
+                self.current_year = self.current_year.max(*at_year);
+                self.next_army_id = self.next_army_id.max(army_id.saturating_add(1));
+                self.active_armies.insert(
+                    *army_id,
+                    ArmyEntityState {
+                        id: *army_id,
+                        owner_faction: faction_id.clone(),
+                        units: *units,
+                        origin_system: *from_system,
+                        current_system: *from_system,
+                        target_system: *target_system,
+                        route_progress: 0.0,
+                        readiness: self
+                            .factions
+                            .get(faction_id)
+                            .map(|f| f.military.readiness)
+                            .unwrap_or(0.4)
+                            .clamp(0.0, 1.0),
+                        mission: if self
+                            .military_campaigns
+                            .get(&campaign_id.unwrap_or(0))
+                            .map(|c| c.outcome == MilitaryCampaignOutcome::Sack)
+                            .unwrap_or(false)
+                        {
+                            ArmyMissionIntent::CampaignSack
+                        } else {
+                            ArmyMissionIntent::CampaignTakeover
+                        },
+                        campaign_id: *campaign_id,
+                    },
+                );
+                if let Some(cid) = campaign_id {
+                    if let Some(campaign) = self.military_campaigns.get_mut(cid) {
+                        campaign.army_id = *army_id;
+                    }
+                }
+            }
+            GameEvent::ArmyAdvanced {
+                at_year,
+                army_id,
+                to_system,
+                progress,
+                ..
+            } => {
+                self.current_year = self.current_year.max(*at_year);
+                if let Some(army) = self.active_armies.get_mut(army_id) {
+                    army.current_system = *to_system;
+                    army.route_progress = *progress;
+                }
+            }
+            GameEvent::ArmiesIntercepted { at_year, .. } => {
+                self.current_year = self.current_year.max(*at_year);
+            }
+            GameEvent::ArmyBattleResolved {
+                at_year,
+                attacker_army_id,
+                defender_army_id,
+                attacker_loss,
+                defender_loss,
+                ..
+            } => {
+                self.current_year = self.current_year.max(*at_year);
+                if let Some(army) = self.active_armies.get_mut(attacker_army_id) {
+                    army.units = army.units.saturating_sub(*attacker_loss);
+                }
+                if let Some(army) = self.active_armies.get_mut(defender_army_id) {
+                    army.units = army.units.saturating_sub(*defender_loss);
+                }
+            }
+            GameEvent::ArmyRetreated {
+                at_year,
+                army_id,
+                to_system,
+                ..
+            } => {
+                self.current_year = self.current_year.max(*at_year);
+                if let Some(army) = self.active_armies.get_mut(army_id) {
+                    army.current_system = *to_system;
+                    army.route_progress = 0.0;
+                }
+            }
+            GameEvent::ArmyDisbanded { at_year, army_id, .. } => {
+                self.current_year = self.current_year.max(*at_year);
+                self.active_armies.remove(army_id);
+            }
+            GameEvent::ColonyCapturedByForce {
+                at_year,
+                campaign_id,
+                attacker_faction,
+                defender_faction,
+                colony_id,
+                system,
+                stability_hit,
+            } => {
+                self.current_year = self.current_year.max(*at_year);
+                if let Some(colony) = self.colonies.get_mut(colony_id) {
+                    colony.owner_faction = attacker_faction.clone();
+                    colony.stability = (colony.stability - *stability_hit).clamp(0.05, 1.0);
+                    colony.defense_balance = (colony.defense_balance - 0.08).clamp(-0.20, 0.50);
+                    colony.food_balance = (colony.food_balance - 0.03).clamp(-0.35, 0.35);
+                    colony.industry_balance = (colony.industry_balance - 0.03).clamp(-0.35, 0.35);
+                    colony.energy_balance = (colony.energy_balance - 0.03).clamp(-0.35, 0.35);
+                }
+                let sim = self.ensure_system_sim_state(*system);
+                sim.stability = (sim.stability - *stability_hit).clamp(0.05, 1.0);
+                sim.security = (sim.security - 0.18).clamp(0.05, 1.0);
+                sim.econ_pressure = (sim.econ_pressure + 0.30).clamp(0.0, 1.2);
+                let relation = self.get_relation(attacker_faction, defender_faction);
+                self.set_relation(
+                    attacker_faction,
+                    defender_faction,
+                    relation.saturating_sub(40),
+                );
+                if let Some(campaign) = self.military_campaigns.get(campaign_id) {
+                    if campaign.army_id != 0 {
+                        self.active_armies.remove(&campaign.army_id);
+                    }
+                }
+                self.military_campaigns.remove(campaign_id);
+            }
+            GameEvent::ColonySackedByForce {
+                at_year,
+                campaign_id,
+                attacker_faction,
+                defender_faction,
+                colony_id,
+                system,
+                treasury_stolen,
+                population_lost,
+                stability_hit,
+            } => {
+                self.current_year = self.current_year.max(*at_year);
+                if let Some(attacker) = self.factions.get_mut(attacker_faction) {
+                    attacker.treasury = attacker.treasury.saturating_add(*treasury_stolen);
+                }
+                if let Some(defender) = self.factions.get_mut(defender_faction) {
+                    defender.treasury = defender.treasury.saturating_sub(*treasury_stolen);
+                }
+                if let Some(colony) = self.colonies.get_mut(colony_id) {
+                    colony.population = (colony.population - *population_lost).max(60.0);
+                    colony.stability = (colony.stability - *stability_hit).clamp(0.03, 1.0);
+                    colony.defense_balance = (colony.defense_balance - 0.11).clamp(-0.20, 0.50);
+                    colony.food_balance = (colony.food_balance - 0.05).clamp(-0.35, 0.35);
+                    colony.industry_balance = (colony.industry_balance - 0.07).clamp(-0.35, 0.35);
+                    colony.energy_balance = (colony.energy_balance - 0.06).clamp(-0.35, 0.35);
+                }
+                let sim = self.ensure_system_sim_state(*system);
+                sim.stability = (sim.stability - *stability_hit).clamp(0.03, 1.0);
+                sim.security = (sim.security - 0.25).clamp(0.03, 1.0);
+                sim.econ_pressure = (sim.econ_pressure + 0.42).clamp(0.0, 1.2);
+                sim.scarcity = (sim.scarcity + 0.18).clamp(0.0, 1.0);
+                let relation = self.get_relation(attacker_faction, defender_faction);
+                self.set_relation(
+                    attacker_faction,
+                    defender_faction,
+                    relation.saturating_sub(50),
+                );
+                if let Some(campaign) = self.military_campaigns.get(campaign_id) {
+                    if campaign.army_id != 0 {
+                        self.active_armies.remove(&campaign.army_id);
+                    }
+                }
+                self.military_campaigns.remove(campaign_id);
             }
             GameEvent::CompletedColonyBuilding {
                 at_year,
@@ -3451,6 +4648,64 @@ impl GameState {
         }
     }
 
+    pub fn try_recruit_army_batch(&mut self, faction_id: &str) -> Option<GameEvent> {
+        let treasury_cost = Self::MILITARY_RECRUIT_UNITS_PER_BATCH as i64
+            * Self::MILITARY_RECRUIT_TREASURY_COST_PER_UNIT;
+        let population_cost = Self::MILITARY_RECRUIT_UNITS_PER_BATCH as f64
+            * Self::MILITARY_RECRUIT_POPULATION_COST_PER_UNIT;
+        let total_pop = self.faction_total_population(faction_id);
+        let faction = self.factions.get(faction_id)?;
+        if faction.treasury < treasury_cost + Self::MILITARY_MIN_TREASURY_RESERVE
+            || total_pop < population_cost + Self::MILITARY_MIN_POPULATION_RESERVE
+        {
+            return None;
+        }
+        Some(GameEvent::ArmyRecruited {
+            at_year: self.current_year,
+            faction_id: faction_id.to_owned(),
+            recruited_units: Self::MILITARY_RECRUIT_UNITS_PER_BATCH,
+            treasury_cost,
+            population_cost,
+        })
+    }
+
+    pub fn try_start_military_campaign(
+        &mut self,
+        attacker_faction: &str,
+        defender_faction: &str,
+        target_colony_id: u64,
+        outcome: MilitaryCampaignOutcome,
+    ) -> Option<GameEvent> {
+        if attacker_faction == defender_faction {
+            return None;
+        }
+        let target = self.colonies.get(&target_colony_id)?;
+        if target.owner_faction != defender_faction {
+            return None;
+        }
+        if self
+            .military_campaigns
+            .values()
+            .any(|c| c.target_colony_id == target_colony_id)
+        {
+            return None;
+        }
+        if self.active_campaign_count_for_faction(attacker_faction)
+            >= Self::MILITARY_MAX_CONCURRENT_CAMPAIGNS_PER_FACTION
+        {
+            return None;
+        }
+        Some(GameEvent::MilitaryCampaignStarted {
+            at_year: self.current_year,
+            campaign_id: self.next_campaign_id,
+            attacker_faction: attacker_faction.to_owned(),
+            defender_faction: defender_faction.to_owned(),
+            target_colony_id,
+            target_system: target.system,
+            outcome,
+        })
+    }
+
     pub fn advance_strategic_tick(&mut self, delta_years: f32) -> Vec<GameEvent> {
         if !delta_years.is_finite() || delta_years <= 0.0 {
             return Vec::new();
@@ -3458,12 +4713,41 @@ impl GameState {
 
         self.current_year += delta_years;
         let mut generated_events = Vec::new();
+        for faction in self.factions.values_mut() {
+            let diplomacy_decay = (1.0 - 0.35 * delta_years).clamp(0.0, 1.0);
+            let fallback_decay = (1.0 - 0.45 * delta_years).clamp(0.0, 1.0);
+            faction.diplomacy_actions_recent =
+                ((faction.diplomacy_actions_recent as f32) * diplomacy_decay).round() as u16;
+            faction.powerplay_actions_recent =
+                ((faction.powerplay_actions_recent as f32) * diplomacy_decay).round() as u16;
+            faction.forced_fallback_actions_recent =
+                ((faction.forced_fallback_actions_recent as f32) * fallback_decay).round() as u16;
+        }
 
         let mut colony_counts_by_faction = HashMap::<String, usize>::new();
+        let mut colonized_systems = HashSet::<SystemId>::new();
+        let mut system_net_income_annual = HashMap::<SystemId, i64>::new();
         for colony in self.colonies.values() {
             *colony_counts_by_faction
                 .entry(colony.owner_faction.clone())
                 .or_insert(0) += 1;
+            colonized_systems.insert(colony.system);
+            *system_net_income_annual.entry(colony.system).or_insert(0) +=
+                colony.last_net_revenue_annual.max(0);
+        }
+        self.system_sim.retain(|system_id, sim| {
+            if colonized_systems.contains(system_id) {
+                true
+            } else {
+                sim.influence_by_faction.clear();
+                false
+            }
+        });
+        let owner_weights_by_system = self.colony_system_owner_weights();
+        let existing_factions: HashSet<String> = self.factions.keys().cloned().collect();
+        for faction in self.factions.values_mut() {
+            faction.trade.annual_powerplay_income = 0;
+            faction.trade.annual_powerplay_spend = 0;
         }
 
         for faction in self.factions.values_mut() {
@@ -3471,17 +4755,69 @@ impl GameState {
                 .get(&faction.id)
                 .copied()
                 .unwrap_or(0) as f32;
-            let research_rate = 0.002 + colony_count * 0.003;
-            faction.colonization_tech_progress += research_rate * delta_years;
-
-            while faction.colonization_tech_progress >= 1.0 {
-                faction.colonization_tech_progress -= 1.0;
-                faction.colonization_tech_level = faction.colonization_tech_level.saturating_add(1);
-            }
+            let military_presence = faction.military.standing_army_units as f32 / 1000.0;
+            let trade_participation = faction.trade.annual_trade_income.max(0) as f32 / 60_000.0;
+            let treaty_footprint = self
+                .diplomacy_treaties
+                .iter()
+                .filter(|((a, b), t)| {
+                    (a == &faction.id || b == &faction.id) && t.expires_year > self.current_year
+                })
+                .count() as f32;
+            let base_rate = 0.0014 + colony_count * 0.0015;
+            Self::advance_domain_progress(
+                &mut faction.colonization_tech_progress,
+                &mut faction.colonization_tech_level,
+                (base_rate + colony_count * 0.0008) * delta_years,
+            );
+            Self::advance_domain_progress(
+                &mut faction.econ_tech_progress,
+                &mut faction.econ_tech_level,
+                (base_rate + colony_count * 0.0011 + trade_participation * 0.0007) * delta_years,
+            );
+            Self::advance_domain_progress(
+                &mut faction.military_tech_progress,
+                &mut faction.military_tech_level,
+                (base_rate * 0.8 + military_presence * 0.0013) * delta_years,
+            );
+            Self::advance_domain_progress(
+                &mut faction.diplomacy_tech_progress,
+                &mut faction.diplomacy_tech_level,
+                (base_rate * 0.75 + treaty_footprint * 0.0009 + trade_participation * 0.0005)
+                    * delta_years,
+            );
         }
 
         let mut treasury_delta_by_faction = HashMap::<String, i64>::new();
+        let mut trade_output_by_faction = HashMap::<String, HashMap<TradeResourceKind, f32>>::new();
+        let econ_eff_by_faction: HashMap<String, f32> = self
+            .factions
+            .keys()
+            .map(|fid| (fid.clone(), self.faction_econ_efficiency(fid)))
+            .collect();
+        let upkeep_eff_by_faction: HashMap<String, f32> = self
+            .factions
+            .keys()
+            .map(|fid| (fid.clone(), self.faction_upkeep_efficiency(fid)))
+            .collect();
+        let trade_eff_by_faction: HashMap<String, f32> = self
+            .factions
+            .keys()
+            .map(|fid| (fid.clone(), self.faction_trade_efficiency(fid)))
+            .collect();
         for colony in self.colonies.values_mut() {
+            let econ_efficiency = econ_eff_by_faction
+                .get(&colony.owner_faction)
+                .copied()
+                .unwrap_or(1.0);
+            let upkeep_efficiency = upkeep_eff_by_faction
+                .get(&colony.owner_faction)
+                .copied()
+                .unwrap_or(1.0);
+            let trade_efficiency = trade_eff_by_faction
+                .get(&colony.owner_faction)
+                .copied()
+                .unwrap_or(1.0);
             let habitability_bonus = if colony.earth_like_world {
                 2.35
             } else if colony.habitable_site {
@@ -3590,7 +4926,8 @@ impl GameState {
                 colony.population,
                 colony.earth_like_world,
             ) * elw_output_multiplier
-                * stability_efficiency;
+                * stability_efficiency
+                * econ_efficiency;
             let population_millions = (colony.population / 1_000_000.0) as f32;
             let food_demand =
                 0.0009 + population_millions * 0.0011 + building_food_demand_bonus;
@@ -3693,7 +5030,7 @@ impl GameState {
                 }
             }
 
-            let tax_revenue_annual = Self::colony_tax_revenue_annual(colony);
+            let tax_revenue_annual = Self::colony_tax_revenue_annual(colony, econ_efficiency);
             let trading_hub_revenue_annual = if building_treasury_prod_bonus > 0.0 {
                 let population_millions = (colony.population / 1_000_000.0) as f32;
                 let pop_factor = 1.0 + (population_millions * 0.12).min(1.8);
@@ -3702,7 +5039,8 @@ impl GameState {
                 0
             };
             let upkeep_cost_annual =
-                Self::colony_upkeep_cost_annual(colony).saturating_add(building_upkeep_bonus_annual);
+                Self::colony_upkeep_cost_annual(colony, upkeep_efficiency)
+                    .saturating_add(building_upkeep_bonus_annual);
             let net_annual = tax_revenue_annual + trading_hub_revenue_annual - upkeep_cost_annual;
 
             colony.last_tax_revenue_annual = tax_revenue_annual;
@@ -3713,12 +5051,106 @@ impl GameState {
             *treasury_delta_by_faction
                 .entry(colony.owner_faction.clone())
                 .or_insert(0) += delta;
+            let trade_output = Self::colony_trade_resource_output(colony, delta_years, trade_efficiency);
+            let faction_trade = trade_output_by_faction
+                .entry(colony.owner_faction.clone())
+                .or_default();
+            for (kind, amount) in trade_output {
+                *faction_trade.entry(kind).or_insert(0.0) += amount;
+            }
         }
 
         for (faction_id, delta) in treasury_delta_by_faction {
             if let Some(faction) = self.factions.get_mut(&faction_id) {
                 faction.treasury = faction.treasury.saturating_add(delta);
             }
+        }
+
+        let mut trade_income_annual_by_faction = HashMap::<String, i64>::new();
+        let mut powerplay_income_annual_by_faction = HashMap::<String, i64>::new();
+        let mut owner_floor_active_systems: u32 = 0;
+        let mut processed_trade_pairs = HashSet::<(String, String)>::new();
+        for ((a, b), treaty) in &self.diplomacy_treaties {
+            if treaty.kind != DiplomaticTreatyKind::TradePact || treaty.expires_year <= self.current_year {
+                continue;
+            }
+            let pair = Self::relation_key(a, b);
+            if !processed_trade_pairs.insert(pair.clone()) {
+                continue;
+            }
+            let output_a = trade_output_by_faction.get(a).cloned().unwrap_or_default();
+            let output_b = trade_output_by_faction.get(b).cloned().unwrap_or_default();
+            let score_a: f32 = output_a.values().copied().sum();
+            let score_b: f32 = output_b.values().copied().sum();
+            let total_score = (score_a + score_b).max(0.0001);
+            let base_value =
+                ((total_score * 28.0) as i64).clamp(Self::TRADE_PACT_MIN_PAYOUT_ANNUAL, Self::TRADE_PACT_MAX_PAYOUT_ANNUAL);
+            let payout_a = ((base_value as f32)
+                * (score_a / total_score)
+                * self.faction_trade_efficiency(a))
+            .round() as i64;
+            let payout_b = ((base_value as f32)
+                * (score_b / total_score)
+                * self.faction_trade_efficiency(b))
+            .round() as i64;
+            *trade_income_annual_by_faction.entry(a.clone()).or_insert(0) += payout_a;
+            *trade_income_annual_by_faction.entry(b.clone()).or_insert(0) += payout_b;
+        }
+        for (faction_id, income_annual) in &trade_income_annual_by_faction {
+            let delta = ((*income_annual as f64) * delta_years as f64).round() as i64;
+            if let Some(faction) = self.factions.get_mut(faction_id) {
+                faction.treasury = faction.treasury.saturating_add(delta);
+            }
+        }
+        for faction in self.factions.values_mut() {
+            faction.trade.annual_production = trade_output_by_faction
+                .get(&faction.id)
+                .cloned()
+                .unwrap_or_default();
+            faction.trade.annual_trade_income = trade_income_annual_by_faction
+                .get(&faction.id)
+                .copied()
+                .unwrap_or(0);
+        }
+
+        let max_colonies = colony_counts_by_faction.values().copied().max().unwrap_or(1) as f32;
+        let max_army = self
+            .factions
+            .values()
+            .map(|f| f.military.standing_army_units)
+            .max()
+            .unwrap_or(1) as f32;
+        let mut influence_totals = HashMap::<String, f32>::new();
+        for sim in self.system_sim.values() {
+            for (fid, influence) in &sim.influence_by_faction {
+                *influence_totals.entry(fid.clone()).or_insert(0.0) += *influence;
+            }
+        }
+        let max_influence = influence_totals.values().copied().fold(0.0, f32::max).max(0.0001);
+        let max_treasury = self
+            .factions
+            .values()
+            .map(|f| f.treasury.max(0))
+            .max()
+            .unwrap_or(1) as f32;
+        for faction in self.factions.values_mut() {
+            let colony_score = *colony_counts_by_faction.get(&faction.id).unwrap_or(&0) as f32 / max_colonies;
+            let army_score = faction.military.standing_army_units as f32 / max_army;
+            let influence_score = influence_totals.get(&faction.id).copied().unwrap_or(0.0) / max_influence;
+            let treasury_score = faction.treasury.max(0) as f32 / max_treasury;
+            faction.dominance_score =
+                (colony_score * 0.35 + army_score * 0.30 + influence_score * 0.20 + treasury_score * 0.15)
+                    .clamp(0.0, 1.5);
+        }
+        let top_dominance = self
+            .factions
+            .values()
+            .map(|f| f.dominance_score)
+            .fold(0.0, f32::max);
+        for faction in self.factions.values_mut() {
+            let gap = (top_dominance - faction.dominance_score).max(0.0);
+            let debt_pressure = if faction.treasury < 0 { 0.18 } else { 0.0 };
+            faction.threatenedness_score = (gap * 0.85 + debt_pressure).clamp(0.0, 1.0);
         }
 
         let mut colony_metric_input = self.colonies.values().collect::<Vec<_>>();
@@ -3774,10 +5206,16 @@ impl GameState {
                     },
                 );
         let current_year = self.current_year;
+        let diplomacy_last_action_by_faction: HashMap<String, f32> = self
+            .factions
+            .iter()
+            .map(|(id, faction)| (id.clone(), faction.last_diplomacy_action_year))
+            .collect();
         const MAX_RELATION_EVENTS_PER_TICK: usize = 8;
-        const MAX_DIPLOMACY_EVENTS_PER_TICK: usize = 5;
+        const MAX_DIPLOMACY_EVENTS_PER_TICK: usize = 8;
         let mut emitted_relation_pairs: HashSet<(String, String)> = HashSet::new();
         let mut pending_diplomacy_events: Vec<GameEvent> = Vec::new();
+        let mut treaty_events_by_faction: HashMap<String, usize> = HashMap::new();
         let mut system_metric_entries: Vec<_> = metrics_by_system.drain().collect();
         system_metric_entries.sort_by_key(|(system_id, _)| *system_id);
         for (system_id, (influence_raw, stress, trade, unrest)) in system_metric_entries {
@@ -3789,14 +5227,69 @@ impl GameState {
                 let blended = current * 0.75 + target * 0.25;
                 sim.influence_by_faction.insert(faction_id, blended);
             }
-            sim.econ_pressure = (sim.econ_pressure * 0.78 + stress * 0.22).clamp(0.0, 1.2);
+            let pressure_baseline = Self::PRESSURE_BASELINE_FLOOR + unrest * 0.03;
+            let scarcity_baseline = Self::SCARCITY_BASELINE_FLOOR + unrest * 0.02;
+            sim.econ_pressure =
+                (sim.econ_pressure * 0.84 + stress * 0.20 + pressure_baseline * 0.06).clamp(0.0, 1.2);
             sim.trade_flow = (sim.trade_flow * 0.80 + trade * 0.20).clamp(0.0, 2.0);
             sim.scarcity =
-                (sim.scarcity * 0.75 + (stress - trade * 0.08).max(0.0) * 0.25).clamp(0.0, 1.0);
+                (sim.scarcity * 0.82
+                    + (stress - trade * 0.06).max(0.0) * 0.16
+                    + scarcity_baseline * 0.08)
+                    .clamp(0.0, 1.0);
+            if owner_weights_by_system.contains_key(&system_id) {
+                sim.econ_pressure = sim.econ_pressure.max(Self::PRESSURE_BASELINE_FLOOR);
+                sim.scarcity = sim.scarcity.max(Self::SCARCITY_BASELINE_FLOOR);
+            }
             sim.stability =
                 (sim.stability + (0.05 - unrest * 0.06 + trade * 0.01) * delta_years).clamp(0.05, 1.0);
             sim.security = (sim.security + (sim.stability - sim.scarcity - 0.4) * 0.16 * delta_years)
                 .clamp(0.05, 1.0);
+
+            if let Some(owner_weights) = owner_weights_by_system.get(&system_id) {
+                let mut participants: Vec<(String, f32)> = sim
+                    .influence_by_faction
+                    .iter()
+                    .filter_map(|(fid, influence)| {
+                        if existing_factions.contains(fid) && *influence > 0.0001 {
+                            Some((fid.clone(), *influence))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                participants.sort_by(|a, b| a.0.cmp(&b.0));
+                let influence_sum = participants.iter().map(|(_, v)| *v).sum::<f32>();
+                if influence_sum > 0.0001 {
+                    let total_system_income_annual =
+                        system_net_income_annual.get(&system_id).copied().unwrap_or(0);
+                    if total_system_income_annual > 0 {
+                        let mut owner_weight_pairs: Vec<(&String, &f32)> = owner_weights.iter().collect();
+                        owner_weight_pairs.sort_by(|a, b| a.0.cmp(b.0));
+                        let total_owner_weight =
+                            owner_weight_pairs.iter().map(|(_, w)| **w).sum::<f32>().max(0.001);
+                        let mut owner_floor_paid = 0_i64;
+                        let owner_floor_total = ((total_system_income_annual as f32)
+                            * Self::POWERPLAY_OWNER_INCOME_FLOOR)
+                            .round() as i64;
+                        for (owner_id, owner_weight) in owner_weight_pairs {
+                            let payout = ((owner_floor_total as f32) * (*owner_weight / total_owner_weight))
+                                .round() as i64;
+                            *powerplay_income_annual_by_faction.entry(owner_id.clone()).or_insert(0) += payout;
+                            owner_floor_paid = owner_floor_paid.saturating_add(payout);
+                        }
+                        let residual = total_system_income_annual.saturating_sub(owner_floor_paid);
+                        if residual > 0 {
+                            for (fid, influence) in &participants {
+                                let normalized = *influence / influence_sum;
+                                let payout = ((residual as f32) * normalized).round() as i64;
+                                *powerplay_income_annual_by_faction.entry(fid.clone()).or_insert(0) += payout;
+                            }
+                        }
+                        owner_floor_active_systems = owner_floor_active_systems.saturating_add(1);
+                    }
+                }
+            }
 
             sim.conflict = if sim.scarcity > 0.75 {
                 ConflictState::Embargo
@@ -3823,6 +5316,7 @@ impl GameState {
             }
             if let (Some(top_a), Some(top_b)) = (top_a, top_b) {
                 let conflict_pressure = sim.econ_pressure + sim.scarcity + (1.0 - sim.security);
+                let trade_flow_snapshot = sim.trade_flow;
                 let top_a_id = top_a.0.clone();
                 let top_b_id = top_b.0.clone();
                 let top_a_influence = top_a.1;
@@ -3832,15 +5326,25 @@ impl GameState {
                     && conflict_pressure > 1.25
                     && emitted_relation_pairs.len() < MAX_RELATION_EVENTS_PER_TICK
                 {
-                    let pair = Self::relation_key(top_a.0, top_b.0);
-                    if emitted_relation_pairs.insert(pair) {
-                        generated_events.push(GameEvent::FactionRelationChanged {
-                            at_year: current_year,
-                            from_faction: top_a_id.clone(),
-                            to_faction: top_b_id.clone(),
-                            delta: -1,
-                            reason: "Influence contest".to_owned(),
-                        });
+                    let a_cooldown_ready = diplomacy_last_action_by_faction
+                        .get(&top_a_id)
+                        .map(|last_year| current_year - *last_year >= Self::DIPLOMACY_ACTION_COOLDOWN_YEARS)
+                        .unwrap_or(true);
+                    let b_cooldown_ready = diplomacy_last_action_by_faction
+                        .get(&top_b_id)
+                        .map(|last_year| current_year - *last_year >= Self::DIPLOMACY_ACTION_COOLDOWN_YEARS)
+                        .unwrap_or(true);
+                    if a_cooldown_ready && b_cooldown_ready {
+                        let pair = Self::relation_key(top_a.0, top_b.0);
+                        if emitted_relation_pairs.insert(pair) {
+                            generated_events.push(GameEvent::FactionRelationChanged {
+                                at_year: current_year,
+                                from_faction: top_a_id.clone(),
+                                to_faction: top_b_id.clone(),
+                                delta: -1,
+                                reason: "Influence contest".to_owned(),
+                            });
+                        }
                     }
                 }
                 let _ = sim;
@@ -3850,30 +5354,93 @@ impl GameState {
                     let treaty = self.treaty_between(&top_a_id, &top_b_id).cloned();
                     let sanction_active = self.has_sanction(&top_a_id, &top_b_id)
                         || self.has_sanction(&top_b_id, &top_a_id);
+                    let alignment = self.diplomatic_alignment_score(&top_a_id, &top_b_id);
+                    let a_threat = self.faction_threatenedness_score(&top_a_id);
+                    let b_threat = self.faction_threatenedness_score(&top_b_id);
+                    let shared_threat = a_threat.min(b_threat);
+                    let a_dominance = self.faction_dominance_score(&top_a_id);
+                    let b_dominance = self.faction_dominance_score(&top_b_id);
+                    let dominant_pair = a_dominance.max(b_dominance) > 0.78;
+                    let a_treaty_emitted = *treaty_events_by_faction.get(&top_a_id).unwrap_or(&0);
+                    let b_treaty_emitted = *treaty_events_by_faction.get(&top_b_id).unwrap_or(&0);
+                    let can_emit_treaty = a_treaty_emitted < 3 && b_treaty_emitted < 3;
+                    let diplomacy_cooldown_ready = diplomacy_last_action_by_faction
+                        .get(&top_a_id)
+                        .map(|last_year| current_year - *last_year >= Self::DIPLOMACY_ACTION_COOLDOWN_YEARS)
+                        .unwrap_or(true)
+                        && diplomacy_last_action_by_faction
+                            .get(&top_b_id)
+                            .map(|last_year| current_year - *last_year >= Self::DIPLOMACY_ACTION_COOLDOWN_YEARS)
+                            .unwrap_or(true);
+                    let diplomacy_mod = ((self.faction_diplomacy_modifier(&top_a_id)
+                        + self.faction_diplomacy_modifier(&top_b_id))
+                        * 0.5)
+                        .round() as i16;
+                    let alliance_threshold = (44 - (shared_threat * 18.0) as i16 - diplomacy_mod)
+                        .clamp(-20, 90);
+                    let trade_threshold = (30 - (shared_threat * 14.0) as i16 - diplomacy_mod)
+                        .clamp(-20, 90);
+                    let nap_threshold = (20 - (shared_threat * 10.0) as i16 - diplomacy_mod)
+                        .clamp(-20, 90);
 
-                    if relation >= 48
+                    if can_emit_treaty
+                        && diplomacy_cooldown_ready
+                        && relation >= alliance_threshold
                         && conflict_pressure < 1.15
                         && treaty.is_none()
                         && top_a_influence > 0.18
                         && top_b_influence > 0.18
+                        && alignment > 0.08
+                        && !dominant_pair
                     {
                         pending_diplomacy_events.push(GameEvent::TreatyEstablished {
                             at_year: current_year,
                             faction_a: top_a_id.clone(),
                             faction_b: top_b_id.clone(),
                             treaty: DiplomaticTreatyKind::Alliance,
-                            expires_year: current_year + 2.8,
-                            reason: "Shared regional interests".to_owned(),
+                            expires_year: current_year + 6.0,
+                            reason: "Shared regional threat pressure".to_owned(),
                         });
-                    } else if relation >= 25 && relation < 48 && treaty.is_none() && !sanction_active {
+                        *treaty_events_by_faction.entry(top_a_id.clone()).or_insert(0) += 1;
+                        *treaty_events_by_faction.entry(top_b_id.clone()).or_insert(0) += 1;
+                    } else if can_emit_treaty
+                        && diplomacy_cooldown_ready
+                        && relation >= trade_threshold
+                        && treaty.is_none()
+                        && !sanction_active
+                        && conflict_pressure < 1.30
+                        && trade_flow_snapshot > 0.25
+                        && alignment > 0.03
+                        && !dominant_pair
+                    {
+                        pending_diplomacy_events.push(GameEvent::TreatyEstablished {
+                            at_year: current_year,
+                            faction_a: top_a_id.clone(),
+                            faction_b: top_b_id.clone(),
+                            treaty: DiplomaticTreatyKind::TradePact,
+                            expires_year: current_year + 5.0,
+                            reason: "Mutual resilience trade".to_owned(),
+                        });
+                        *treaty_events_by_faction.entry(top_a_id.clone()).or_insert(0) += 1;
+                        *treaty_events_by_faction.entry(top_b_id.clone()).or_insert(0) += 1;
+                    } else if can_emit_treaty
+                        && diplomacy_cooldown_ready
+                        && relation >= nap_threshold
+                        && relation < alliance_threshold
+                        && treaty.is_none()
+                        && !sanction_active
+                        && !dominant_pair
+                    {
                         pending_diplomacy_events.push(GameEvent::TreatyEstablished {
                             at_year: current_year,
                             faction_a: top_a_id.clone(),
                             faction_b: top_b_id.clone(),
                             treaty: DiplomaticTreatyKind::NonAggressionPact,
-                            expires_year: current_year + 1.8,
-                            reason: "Temporary frontier detente".to_owned(),
+                            expires_year: current_year + 4.0,
+                            reason: "Defensive frontier detente".to_owned(),
                         });
+                        *treaty_events_by_faction.entry(top_a_id.clone()).or_insert(0) += 1;
+                        *treaty_events_by_faction.entry(top_b_id.clone()).or_insert(0) += 1;
                     } else if relation <= -45
                         && conflict_pressure > 1.20
                         && !sanction_active
@@ -3896,6 +5463,19 @@ impl GameState {
                 }
             }
         }
+        for (faction_id, income_annual) in &powerplay_income_annual_by_faction {
+            let delta = ((*income_annual as f64) * delta_years as f64).round() as i64;
+            if let Some(faction) = self.factions.get_mut(faction_id) {
+                faction.treasury = faction.treasury.saturating_add(delta);
+            }
+        }
+        for faction in self.factions.values_mut() {
+            faction.trade.annual_powerplay_income = powerplay_income_annual_by_faction
+                .get(&faction.id)
+                .copied()
+                .unwrap_or(0);
+        }
+        self.powerplay_owner_floor_active_systems = owner_floor_active_systems;
         generated_events.extend(pending_diplomacy_events);
 
         let expired_treaties: Vec<_> = self
@@ -4060,6 +5640,279 @@ impl GameState {
             }
         }
 
+        // Standing army upkeep and insolvency guardrails.
+        let faction_ids: Vec<String> = self.factions.keys().cloned().collect();
+        for faction_id in faction_ids {
+            let (units, treasury_cost, pop_attrition) = if let Some(faction) = self.factions.get(&faction_id)
+            {
+                let units = faction.military.standing_army_units;
+                if units == 0 {
+                    continue;
+                }
+                let treasury_cost = ((units as f32)
+                    * Self::MILITARY_UPKEEP_TREASURY_COST_PER_UNIT as f32
+                    * delta_years)
+                    .round() as i64;
+                let pop_attrition = units as f64
+                    * Self::MILITARY_UPKEEP_POPULATION_ATTRITION_PER_UNIT
+                    * delta_years as f64;
+                (units, treasury_cost.max(0), pop_attrition.max(0.0))
+            } else {
+                continue;
+            };
+            if let Some(faction) = self.factions.get_mut(&faction_id) {
+                faction.military.annual_upkeep_treasury =
+                    ((units as f32) * Self::MILITARY_UPKEEP_TREASURY_COST_PER_UNIT as f32).round()
+                        as i64;
+                faction.military.annual_population_attrition =
+                    units as f64 * Self::MILITARY_UPKEEP_POPULATION_ATTRITION_PER_UNIT;
+            }
+            generated_events.push(GameEvent::ArmyUpkeepApplied {
+                at_year: self.current_year,
+                faction_id,
+                unit_count: units,
+                treasury_cost,
+                population_attrition: pop_attrition,
+            });
+        }
+
+        // Entity-based army movement and campaign resolution.
+        let lane_graph = self.lane_graph_for_colonized_systems();
+        let mut campaign_ids: Vec<u64> = self.military_campaigns.keys().copied().collect();
+        campaign_ids.sort_unstable();
+        for campaign_id in campaign_ids {
+            let Some(campaign) = self.military_campaigns.get(&campaign_id).cloned() else {
+                continue;
+            };
+            let Some(target_colony) = self.colonies.get(&campaign.target_colony_id) else {
+                generated_events.push(GameEvent::MilitaryCampaignAborted {
+                    at_year: self.current_year,
+                    campaign_id,
+                    attacker_faction: campaign.attacker_faction,
+                    defender_faction: campaign.defender_faction,
+                    target_colony_id: campaign.target_colony_id,
+                    reason: "Target colony no longer exists".to_owned(),
+                });
+                continue;
+            };
+            if target_colony.owner_faction != campaign.defender_faction {
+                generated_events.push(GameEvent::MilitaryCampaignAborted {
+                    at_year: self.current_year,
+                    campaign_id,
+                    attacker_faction: campaign.attacker_faction,
+                    defender_faction: campaign.defender_faction,
+                    target_colony_id: campaign.target_colony_id,
+                    reason: "Target owner changed".to_owned(),
+                });
+                continue;
+            }
+
+            let mut army_id = campaign.army_id;
+            if army_id == 0 {
+                let source_colony = self
+                    .colonies
+                    .values()
+                    .filter(|c| c.owner_faction == campaign.attacker_faction)
+                    .min_by(|a, b| {
+                        Self::system_distance_sq(a.system_pos, target_colony.system_pos)
+                            .total_cmp(&Self::system_distance_sq(b.system_pos, target_colony.system_pos))
+                    });
+                let Some(source) = source_colony else {
+                    generated_events.push(GameEvent::MilitaryCampaignAborted {
+                        at_year: self.current_year,
+                        campaign_id,
+                        attacker_faction: campaign.attacker_faction,
+                        defender_faction: campaign.defender_faction,
+                        target_colony_id: campaign.target_colony_id,
+                        reason: "No staging colony".to_owned(),
+                    });
+                    continue;
+                };
+                let dispatched_units = self
+                    .factions
+                    .get(&campaign.attacker_faction)
+                    .map(|f| (f.military.standing_army_units / 3).max(80))
+                    .unwrap_or(80);
+                army_id = self.next_army_id;
+                self.next_army_id = self.next_army_id.saturating_add(1);
+                generated_events.push(GameEvent::ArmyDispatched {
+                    at_year: self.current_year,
+                    army_id,
+                    faction_id: campaign.attacker_faction.clone(),
+                    units: dispatched_units,
+                    from_system: source.system,
+                    target_system: campaign.target_system,
+                    campaign_id: Some(campaign_id),
+                });
+                generated_events.push(GameEvent::MilitaryCampaignProgressed {
+                    at_year: self.current_year,
+                    campaign_id,
+                    progress: 0.12,
+                    attacker_strength: dispatched_units as f32,
+                    defender_strength: target_colony.defense_balance.max(0.0) * 1000.0,
+                    phase: MilitaryCampaignPhase::Mobilizing,
+                });
+                continue;
+            }
+
+            let Some(army) = self.active_armies.get(&army_id).cloned() else {
+                generated_events.push(GameEvent::MilitaryCampaignAborted {
+                    at_year: self.current_year,
+                    campaign_id,
+                    attacker_faction: campaign.attacker_faction,
+                    defender_faction: campaign.defender_faction,
+                    target_colony_id: campaign.target_colony_id,
+                    reason: "Army missing".to_owned(),
+                });
+                continue;
+            };
+            if army.units == 0 {
+                generated_events.push(GameEvent::ArmyDisbanded {
+                    at_year: self.current_year,
+                    army_id,
+                    faction_id: army.owner_faction.clone(),
+                    system: army.current_system,
+                    reason: "Depleted".to_owned(),
+                });
+                generated_events.push(GameEvent::MilitaryCampaignAborted {
+                    at_year: self.current_year,
+                    campaign_id,
+                    attacker_faction: campaign.attacker_faction,
+                    defender_faction: campaign.defender_faction,
+                    target_colony_id: campaign.target_colony_id,
+                    reason: "Attacker army collapsed".to_owned(),
+                });
+                continue;
+            }
+
+            if army.current_system != campaign.target_system {
+                let Some(next_hop) =
+                    self.next_hop_toward(&lane_graph, army.current_system, campaign.target_system)
+                else {
+                    generated_events.push(GameEvent::MilitaryCampaignAborted {
+                        at_year: self.current_year,
+                        campaign_id,
+                        attacker_faction: campaign.attacker_faction,
+                        defender_faction: campaign.defender_faction,
+                        target_colony_id: campaign.target_colony_id,
+                        reason: "No path to target".to_owned(),
+                    });
+                    continue;
+                };
+                generated_events.push(GameEvent::ArmyAdvanced {
+                    at_year: self.current_year,
+                    army_id,
+                    faction_id: army.owner_faction.clone(),
+                    from_system: army.current_system,
+                    to_system: next_hop,
+                    progress: 1.0,
+                });
+                generated_events.push(GameEvent::MilitaryCampaignProgressed {
+                    at_year: self.current_year,
+                    campaign_id,
+                    progress: (campaign.progress + 0.22).clamp(0.18, 0.90),
+                    attacker_strength: army.units as f32,
+                    defender_strength: target_colony.defense_balance.max(0.0) * 1000.0,
+                    phase: MilitaryCampaignPhase::Mobilizing,
+                });
+                continue;
+            }
+
+            generated_events.push(GameEvent::MilitaryCampaignProgressed {
+                at_year: self.current_year,
+                campaign_id,
+                progress: campaign.progress.max(0.86),
+                attacker_strength: army.units as f32,
+                defender_strength: target_colony.defense_balance.max(0.0) * 1000.0,
+                phase: MilitaryCampaignPhase::Assault,
+            });
+
+            let defender_army = self
+                .active_armies
+                .values()
+                .filter(|a| {
+                    a.owner_faction == campaign.defender_faction && a.current_system == campaign.target_system
+                })
+                .min_by_key(|a| a.id)
+                .cloned();
+            if let Some(def_army) = defender_army {
+                let (atk_roll, def_roll, atk_loss, def_loss, attacker_wins) =
+                    self.resolve_army_battle(&army, &def_army, campaign.target_system);
+                generated_events.push(GameEvent::ArmiesIntercepted {
+                    at_year: self.current_year,
+                    attacker_army_id: army.id,
+                    defender_army_id: def_army.id,
+                    system: campaign.target_system,
+                });
+                generated_events.push(GameEvent::ArmyBattleResolved {
+                    at_year: self.current_year,
+                    attacker_army_id: army.id,
+                    defender_army_id: def_army.id,
+                    system: campaign.target_system,
+                    attacker_roll: atk_roll,
+                    defender_roll: def_roll,
+                    attacker_loss: atk_loss,
+                    defender_loss: def_loss,
+                    winner_faction: if attacker_wins {
+                        campaign.attacker_faction.clone()
+                    } else {
+                        campaign.defender_faction.clone()
+                    },
+                });
+                if !attacker_wins {
+                    generated_events.push(GameEvent::MilitaryCampaignAborted {
+                        at_year: self.current_year,
+                        campaign_id,
+                        attacker_faction: campaign.attacker_faction,
+                        defender_faction: campaign.defender_faction,
+                        target_colony_id: campaign.target_colony_id,
+                        reason: "Army intercepted and repelled".to_owned(),
+                    });
+                    continue;
+                }
+            }
+
+            if campaign.outcome == MilitaryCampaignOutcome::Sack {
+                let defender_treasury = self
+                    .factions
+                    .get(&campaign.defender_faction)
+                    .map(|f| f.treasury.max(0))
+                    .unwrap_or(0);
+                let treasury_stolen =
+                    ((defender_treasury as f32) * Self::SACK_TREASURY_EXTRACT_PCT).round() as i64;
+                let population_lost = target_colony.population * Self::SACK_POPULATION_EXTRACT_PCT;
+                generated_events.push(GameEvent::ColonySackedByForce {
+                    at_year: self.current_year,
+                    campaign_id,
+                    attacker_faction: campaign.attacker_faction,
+                    defender_faction: campaign.defender_faction,
+                    colony_id: campaign.target_colony_id,
+                    system: campaign.target_system,
+                    treasury_stolen,
+                    population_lost,
+                    stability_hit: 0.52,
+                });
+            } else {
+                generated_events.push(GameEvent::ColonyCapturedByForce {
+                    at_year: self.current_year,
+                    campaign_id,
+                    attacker_faction: campaign.attacker_faction,
+                    defender_faction: campaign.defender_faction,
+                    colony_id: campaign.target_colony_id,
+                    system: campaign.target_system,
+                    stability_hit: 0.38,
+                });
+            }
+            generated_events.push(GameEvent::MilitaryCampaignProgressed {
+                at_year: self.current_year,
+                campaign_id,
+                progress: 1.0,
+                attacker_strength: army.units as f32,
+                defender_strength: 0.0,
+                phase: MilitaryCampaignPhase::Occupation,
+            });
+        }
+
         self.regenerate_missions();
 
         generated_events
@@ -4080,7 +5933,48 @@ impl GameState {
         let mission = self.missions.remove(index);
         if let Some(faction) = self.factions.get_mut(&mission.issuer_faction) {
             faction.treasury = faction.treasury.saturating_add(mission.reward_credits);
-            faction.colonization_tech_progress += mission.reward_tech;
+            match mission.kind {
+                MissionKind::SupplyRelief => {
+                    Self::advance_domain_progress(
+                        &mut faction.econ_tech_progress,
+                        &mut faction.econ_tech_level,
+                        mission.reward_tech,
+                    );
+                }
+                MissionKind::ReconSweep => {
+                    Self::advance_domain_progress(
+                        &mut faction.colonization_tech_progress,
+                        &mut faction.colonization_tech_level,
+                        mission.reward_tech,
+                    );
+                }
+                MissionKind::InfluenceOp => {
+                    Self::advance_domain_progress(
+                        &mut faction.military_tech_progress,
+                        &mut faction.military_tech_level,
+                        mission.reward_tech,
+                    );
+                }
+                MissionKind::AllianceSupport => {
+                    Self::advance_domain_progress(
+                        &mut faction.diplomacy_tech_progress,
+                        &mut faction.diplomacy_tech_level,
+                        mission.reward_tech,
+                    );
+                }
+                MissionKind::SanctionRunning => {
+                    Self::advance_domain_progress(
+                        &mut faction.diplomacy_tech_progress,
+                        &mut faction.diplomacy_tech_level,
+                        mission.reward_tech * 0.7,
+                    );
+                    Self::advance_domain_progress(
+                        &mut faction.military_tech_progress,
+                        &mut faction.military_tech_level,
+                        mission.reward_tech * 0.3,
+                    );
+                }
+            }
         }
         let rep = self
             .player_reputation
@@ -4090,20 +5984,20 @@ impl GameState {
         if let Some(sim) = self.system_sim.get_mut(&mission.target_system) {
             match mission.kind {
                 MissionKind::SanctionRunning => {
-                    sim.econ_pressure = (sim.econ_pressure - 0.18).max(0.0);
-                    sim.scarcity = (sim.scarcity - 0.22).max(0.0);
+                    sim.econ_pressure = (sim.econ_pressure - 0.10).max(0.0);
+                    sim.scarcity = (sim.scarcity - 0.12).max(0.0);
                     sim.trade_flow = (sim.trade_flow + 0.10).clamp(0.0, 2.0);
                     sim.stability = (sim.stability + 0.04).clamp(0.0, 1.0);
                 }
                 MissionKind::AllianceSupport => {
-                    sim.econ_pressure = (sim.econ_pressure - 0.12).max(0.0);
-                    sim.scarcity = (sim.scarcity - 0.12).max(0.0);
+                    sim.econ_pressure = (sim.econ_pressure - 0.07).max(0.0);
+                    sim.scarcity = (sim.scarcity - 0.08).max(0.0);
                     sim.trade_flow = (sim.trade_flow + 0.14).clamp(0.0, 2.0);
                     sim.stability = (sim.stability + 0.06).clamp(0.0, 1.0);
                 }
                 _ => {
-                    sim.econ_pressure = (sim.econ_pressure - 0.15).max(0.0);
-                    sim.scarcity = (sim.scarcity - 0.18).max(0.0);
+                    sim.econ_pressure = (sim.econ_pressure - 0.09).max(0.0);
+                    sim.scarcity = (sim.scarcity - 0.10).max(0.0);
                     sim.stability = (sim.stability + 0.05).clamp(0.0, 1.0);
                 }
             }
@@ -4222,7 +6116,7 @@ mod tests {
 
         assert!(updated.last_upkeep_cost_annual > 0);
         // No discount: upkeep should match the full calculated upkeep (plus building upkeep).
-        assert!(updated.last_upkeep_cost_annual >= GameState::colony_upkeep_cost_annual(updated));
+        assert!(updated.last_upkeep_cost_annual >= GameState::colony_upkeep_cost_annual(updated, 1.0));
     }
 
     #[test]
@@ -4292,7 +6186,20 @@ mod tests {
             | GameEvent::TreatyDissolved { at_year, .. }
             | GameEvent::SanctionImposed { at_year, .. }
             | GameEvent::SanctionLifted { at_year, .. }
-            | GameEvent::PowerplayOperationResolved { at_year, .. } => *at_year,
+            | GameEvent::PowerplayOperationResolved { at_year, .. }
+            | GameEvent::ArmyRecruited { at_year, .. }
+            | GameEvent::ArmyUpkeepApplied { at_year, .. }
+            | GameEvent::MilitaryCampaignStarted { at_year, .. }
+            | GameEvent::MilitaryCampaignProgressed { at_year, .. }
+            | GameEvent::MilitaryCampaignAborted { at_year, .. }
+            | GameEvent::ArmyDispatched { at_year, .. }
+            | GameEvent::ArmyAdvanced { at_year, .. }
+            | GameEvent::ArmiesIntercepted { at_year, .. }
+            | GameEvent::ArmyBattleResolved { at_year, .. }
+            | GameEvent::ArmyRetreated { at_year, .. }
+            | GameEvent::ArmyDisbanded { at_year, .. }
+            | GameEvent::ColonyCapturedByForce { at_year, .. }
+            | GameEvent::ColonySackedByForce { at_year, .. } => *at_year,
         };
         let year1 = match &events[1] {
             GameEvent::DiscoveredSystem { at_year, .. }
@@ -4306,7 +6213,20 @@ mod tests {
             | GameEvent::TreatyDissolved { at_year, .. }
             | GameEvent::SanctionImposed { at_year, .. }
             | GameEvent::SanctionLifted { at_year, .. }
-            | GameEvent::PowerplayOperationResolved { at_year, .. } => *at_year,
+            | GameEvent::PowerplayOperationResolved { at_year, .. }
+            | GameEvent::ArmyRecruited { at_year, .. }
+            | GameEvent::ArmyUpkeepApplied { at_year, .. }
+            | GameEvent::MilitaryCampaignStarted { at_year, .. }
+            | GameEvent::MilitaryCampaignProgressed { at_year, .. }
+            | GameEvent::MilitaryCampaignAborted { at_year, .. }
+            | GameEvent::ArmyDispatched { at_year, .. }
+            | GameEvent::ArmyAdvanced { at_year, .. }
+            | GameEvent::ArmiesIntercepted { at_year, .. }
+            | GameEvent::ArmyBattleResolved { at_year, .. }
+            | GameEvent::ArmyRetreated { at_year, .. }
+            | GameEvent::ArmyDisbanded { at_year, .. }
+            | GameEvent::ColonyCapturedByForce { at_year, .. }
+            | GameEvent::ColonySackedByForce { at_year, .. } => *at_year,
         };
         assert!(year0 <= year1, "events were not ordered: {year0} then {year1}");
     }
@@ -5020,8 +6940,8 @@ mod tests {
         colony_high.id = 91;
         colony_high.population = 16_000_000.0;
 
-        let mid_revenue = GameState::colony_tax_revenue_annual(&colony_mid);
-        let high_revenue = GameState::colony_tax_revenue_annual(&colony_high);
+        let mid_revenue = GameState::colony_tax_revenue_annual(&colony_mid, 1.0);
+        let high_revenue = GameState::colony_tax_revenue_annual(&colony_high, 1.0);
 
         assert!(high_revenue > mid_revenue);
         assert!(
@@ -5050,5 +6970,466 @@ mod tests {
             after < before,
             "expected over-cap population to contract, before={before}, after={after}"
         );
+    }
+
+    #[test]
+    fn military_recruitment_deducts_treasury_and_population() {
+        let mut state = GameState::default();
+        let faction_id = "brewer-corporation".to_owned();
+        state.colonies.insert(77, test_colony(77, 1_200_000.0));
+        if let Some(colony) = state.colonies.get_mut(&77) {
+            colony.owner_faction = faction_id.clone();
+        }
+        let treasury_before = state.factions.get(&faction_id).unwrap().treasury;
+        let pop_before = state.faction_total_population(&faction_id);
+        let event = state.try_recruit_army_batch(&faction_id).expect("recruit event");
+        state.apply_event(&event);
+        let faction = state.factions.get(&faction_id).unwrap();
+        assert!(faction.treasury < treasury_before);
+        assert!(faction.military.standing_army_units > 0);
+        assert!(state.faction_total_population(&faction_id) < pop_before);
+    }
+
+    #[test]
+    fn military_capture_transfers_colony_and_hits_stability() {
+        let mut state = GameState::default();
+        let attacker = "brewer-corporation".to_owned();
+        let defender = "drifters".to_owned();
+        let colony_id = 91;
+        state.colonies.insert(colony_id, test_colony(colony_id, 900_000.0));
+        if let Some(colony) = state.colonies.get_mut(&colony_id) {
+            colony.owner_faction = defender.clone();
+            colony.system = test_system(901);
+            colony.stability = 0.85;
+        }
+        let event = GameEvent::ColonyCapturedByForce {
+            at_year: state.current_year,
+            campaign_id: 1,
+            attacker_faction: attacker.clone(),
+            defender_faction: defender,
+            colony_id,
+            system: test_system(901),
+            stability_hit: 0.35,
+        };
+        state.apply_event(&event);
+        let colony = state.colonies.get(&colony_id).unwrap();
+        assert_eq!(colony.owner_faction, attacker);
+        assert!(colony.stability < 0.85);
+    }
+
+    #[test]
+    fn military_sack_extracts_and_keeps_owner() {
+        let mut state = GameState::default();
+        let attacker = "new-providence".to_owned();
+        let defender = "drifters".to_owned();
+        let colony_id = 123;
+        state.colonies.insert(colony_id, test_colony(colony_id, 1_000_000.0));
+        if let Some(colony) = state.colonies.get_mut(&colony_id) {
+            colony.owner_faction = defender.clone();
+            colony.system = test_system(1234);
+            colony.stability = 0.80;
+        }
+        let defender_before = state.factions.get(&defender).unwrap().treasury;
+        let attacker_before = state.factions.get(&attacker).unwrap().treasury;
+        let event = GameEvent::ColonySackedByForce {
+            at_year: state.current_year,
+            campaign_id: 7,
+            attacker_faction: attacker.clone(),
+            defender_faction: defender.clone(),
+            colony_id,
+            system: test_system(1234),
+            treasury_stolen: 42_000,
+            population_lost: 70_000.0,
+            stability_hit: 0.48,
+        };
+        state.apply_event(&event);
+        let colony = state.colonies.get(&colony_id).unwrap();
+        assert_eq!(colony.owner_faction, defender);
+        assert!(colony.population < 1_000_000.0);
+        assert!(state.factions.get(&attacker).unwrap().treasury > attacker_before);
+        assert!(state.factions.get(&defender).unwrap().treasury < defender_before);
+    }
+
+    #[test]
+    fn campaign_start_stores_outcome_kind() {
+        let mut state = GameState::default();
+        let attacker = "battle-pilgrims";
+        let defender = "drifters";
+        let colony_id = 333;
+        state.colonies.insert(colony_id, test_colony(colony_id, 700_000.0));
+        if let Some(colony) = state.colonies.get_mut(&colony_id) {
+            colony.owner_faction = defender.to_owned();
+            colony.system = test_system(3333);
+        }
+        let event = state
+            .try_start_military_campaign(attacker, defender, colony_id, MilitaryCampaignOutcome::Sack)
+            .expect("campaign should start");
+        state.apply_event(&event);
+        let campaign = state
+            .military_campaigns
+            .values()
+            .find(|c| c.target_colony_id == colony_id)
+            .expect("campaign present");
+        assert_eq!(campaign.outcome, MilitaryCampaignOutcome::Sack);
+    }
+
+    #[test]
+    fn trade_pact_applies_income_to_both_factions() {
+        let mut state = GameState::default();
+        let faction_a = "brewer-corporation".to_owned();
+        let faction_b = "hypercapitalist-foundation".to_owned();
+        let mut colony_a = test_colony(700, 1_400_000.0);
+        colony_a.owner_faction = faction_a.clone();
+        colony_a.buildings.push(ColonyBuildingState {
+            kind: ColonyBuildingKind::OrePurifierComplex,
+            site: ColonyBuildingSite::Planet(0),
+            level: 2,
+        });
+        let mut colony_b = test_colony(701, 1_100_000.0);
+        colony_b.owner_faction = faction_b.clone();
+        colony_b.buildings.push(ColonyBuildingState {
+            kind: ColonyBuildingKind::StellarIsotopeCondenser,
+            site: ColonyBuildingSite::Star(0),
+            level: 1,
+        });
+        state.colonies.insert(colony_a.id, colony_a);
+        state.colonies.insert(colony_b.id, colony_b);
+        state.diplomacy_treaties.insert(
+            ("brewer-corporation".to_owned(), "hypercapitalist-foundation".to_owned()),
+            DiplomacyTreatyState {
+                kind: DiplomaticTreatyKind::TradePact,
+                started_year: state.current_year,
+                expires_year: state.current_year + 3.0,
+                cohesion: 0.4,
+                strain: 0.0,
+            },
+        );
+
+        state.advance_strategic_tick(1.0);
+        let trade_a = state.factions.get(&faction_a).unwrap().trade.annual_trade_income;
+        let trade_b = state.factions.get(&faction_b).unwrap().trade.annual_trade_income;
+        assert!(trade_a > 0);
+        assert!(trade_b > 0);
+    }
+
+    #[test]
+    fn trade_pact_income_ratio_tracks_production() {
+        let mut state = GameState::default();
+        let faction_a = "brewer-corporation".to_owned();
+        let faction_b = "hypercapitalist-foundation".to_owned();
+        let mut colony_a = test_colony(710, 1_500_000.0);
+        colony_a.owner_faction = faction_a.clone();
+        colony_a.buildings.push(ColonyBuildingState {
+            kind: ColonyBuildingKind::OrePurifierComplex,
+            site: ColonyBuildingSite::Planet(0),
+            level: 3,
+        });
+        let mut colony_b = test_colony(711, 900_000.0);
+        colony_b.owner_faction = faction_b.clone();
+        colony_b.buildings.push(ColonyBuildingState {
+            kind: ColonyBuildingKind::OrePurifierComplex,
+            site: ColonyBuildingSite::Planet(0),
+            level: 1,
+        });
+        state.colonies.insert(colony_a.id, colony_a);
+        state.colonies.insert(colony_b.id, colony_b);
+        state.diplomacy_treaties.insert(
+            ("brewer-corporation".to_owned(), "hypercapitalist-foundation".to_owned()),
+            DiplomacyTreatyState {
+                kind: DiplomaticTreatyKind::TradePact,
+                started_year: state.current_year,
+                expires_year: state.current_year + 2.5,
+                cohesion: 0.45,
+                strain: 0.0,
+            },
+        );
+
+        state.advance_strategic_tick(1.0);
+        let trade_a = state.factions.get(&faction_a).unwrap().trade.annual_trade_income;
+        let trade_b = state.factions.get(&faction_b).unwrap().trade.annual_trade_income;
+        assert!(trade_a > trade_b);
+    }
+
+    #[test]
+    fn dominance_and_threat_scores_reflect_runaway_gap() {
+        let mut state = GameState::default();
+        let mut leader_colony = test_colony(900, 3_000_000.0);
+        leader_colony.owner_faction = "battle-pilgrims".to_owned();
+        leader_colony.defense_balance = 0.35;
+        let mut laggard_colony = test_colony(901, 350_000.0);
+        laggard_colony.owner_faction = "drifters".to_owned();
+        state.colonies.insert(leader_colony.id, leader_colony);
+        state.colonies.insert(laggard_colony.id, laggard_colony);
+        if let Some(leader) = state.factions.get_mut("battle-pilgrims") {
+            leader.military.standing_army_units = 1_200;
+        }
+        if let Some(laggard) = state.factions.get_mut("drifters") {
+            laggard.military.standing_army_units = 120;
+        }
+        state.advance_strategic_tick(0.25);
+        let leader_dom = state.faction_dominance_score("battle-pilgrims");
+        let laggard_dom = state.faction_dominance_score("drifters");
+        let laggard_threat = state.faction_threatenedness_score("drifters");
+        assert!(leader_dom > laggard_dom);
+        assert!(laggard_threat > 0.2);
+    }
+
+    #[test]
+    fn powerplay_operation_ignored_for_non_colonized_system() {
+        let mut state = GameState::default();
+        let actor = "brewer-corporation".to_owned();
+        let target = "drifters".to_owned();
+        let system = test_system(4444);
+        let event = GameEvent::PowerplayOperationResolved {
+            at_year: state.current_year,
+            actor_faction: actor,
+            target_faction: target,
+            system,
+            operation: PowerplayOperationKind::UndermineInfluence,
+            success: true,
+            strength: 0.08,
+            internal_operation: false,
+            treasury_cost: GameState::POWERPLAY_FOREIGN_OP_COST,
+            reason: "test".to_owned(),
+        };
+        state.apply_event(&event);
+        assert!(
+            !state.system_sim.contains_key(&system),
+            "non-colonized system should not receive powerplay simulation updates"
+        );
+    }
+
+    #[test]
+    fn owner_floor_and_foreign_cost_are_applied() {
+        let mut state = GameState::default();
+        let owner = "drifters".to_owned();
+        let actor = "brewer-corporation".to_owned();
+        let system = test_system(5555);
+        let mut owner_colony = test_colony(555, 1_100_000.0);
+        owner_colony.system = system;
+        owner_colony.owner_faction = owner.clone();
+        owner_colony.last_net_revenue_annual = 120_000;
+        state.colonies.insert(owner_colony.id, owner_colony);
+        state.system_sim.insert(
+            system,
+            SystemSimState {
+                system,
+                influence_by_faction: [(owner.clone(), 0.55), (actor.clone(), 0.45)]
+                    .into_iter()
+                    .collect(),
+                security: 0.55,
+                stability: 0.62,
+                econ_pressure: 0.25,
+                trade_flow: 0.7,
+                scarcity: 0.1,
+                conflict: ConflictState::Calm,
+            },
+        );
+        let actor_before = state.factions.get(&actor).unwrap().treasury;
+        let op_event = GameEvent::PowerplayOperationResolved {
+            at_year: state.current_year,
+            actor_faction: actor.clone(),
+            target_faction: owner.clone(),
+            system,
+            operation: PowerplayOperationKind::EconomicPressure,
+            success: true,
+            strength: 0.05,
+            internal_operation: false,
+            treasury_cost: GameState::POWERPLAY_FOREIGN_OP_COST,
+            reason: "test foreign".to_owned(),
+        };
+        state.apply_event(&op_event);
+        let actor_after_cost = state.factions.get(&actor).unwrap().treasury;
+        assert!(actor_after_cost < actor_before);
+
+        state.advance_strategic_tick(1.0);
+        let owner_income = state
+            .factions
+            .get(&owner)
+            .unwrap()
+            .trade
+            .annual_powerplay_income;
+        let actor_income = state
+            .factions
+            .get(&actor)
+            .unwrap()
+            .trade
+            .annual_powerplay_income;
+        assert!(owner_income > 0);
+        assert!(actor_income > 0);
+        assert!(owner_income > actor_income);
+        assert!(state.powerplay_owner_floor_active_systems >= 1);
+    }
+
+    #[test]
+    fn diplomacy_treaty_generation_is_deterministic_and_bounded() {
+        let mut state_a = GameState::default();
+        let mut state_b = GameState::default();
+        for state in [&mut state_a, &mut state_b] {
+            state.set_relation("hypercapitalist-foundation", "greater-armenia", 52);
+            state.system_sim.insert(
+                test_system(777),
+                SystemSimState {
+                    system: test_system(777),
+                    influence_by_faction: [
+                        ("hypercapitalist-foundation".to_owned(), 0.38),
+                        ("greater-armenia".to_owned(), 0.35),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    security: 0.55,
+                    stability: 0.64,
+                    econ_pressure: 0.28,
+                    trade_flow: 0.9,
+                    scarcity: 0.12,
+                    conflict: ConflictState::Calm,
+                },
+            );
+        }
+        let events_a = state_a.advance_strategic_tick(0.6);
+        let events_b = state_b.advance_strategic_tick(0.6);
+        let treaties_a: Vec<_> = events_a
+            .iter()
+            .filter(|e| matches!(e, GameEvent::TreatyEstablished { .. }))
+            .collect();
+        let treaties_b: Vec<_> = events_b
+            .iter()
+            .filter(|e| matches!(e, GameEvent::TreatyEstablished { .. }))
+            .collect();
+        assert_eq!(treaties_a.len(), treaties_b.len());
+        assert!(treaties_a.len() <= 5);
+    }
+
+    #[test]
+    fn campaign_dispatches_army_entity_event() {
+        let mut state = GameState::default();
+        let attacker = "brewer-corporation".to_owned();
+        let defender = "drifters".to_owned();
+        let mut atk_colony = test_colony(8001, 900_000.0);
+        atk_colony.owner_faction = attacker.clone();
+        atk_colony.system = test_system(8100);
+        let mut def_colony = test_colony(8002, 700_000.0);
+        def_colony.owner_faction = defender.clone();
+        def_colony.system = test_system(8101);
+        state.colonies.insert(atk_colony.id, atk_colony);
+        state.colonies.insert(def_colony.id, def_colony.clone());
+
+        let start = state
+            .try_start_military_campaign(
+                &attacker,
+                &defender,
+                def_colony.id,
+                MilitaryCampaignOutcome::Takeover,
+            )
+            .expect("campaign start");
+        state.apply_event(&start);
+        let events = state.advance_strategic_tick(0.5);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GameEvent::ArmyDispatched { .. }
+        )));
+    }
+
+    #[test]
+    fn army_battle_rolls_are_deterministic() {
+        let state = GameState::default();
+        let attacker = ArmyEntityState {
+            id: 1,
+            owner_faction: "brewer-corporation".to_owned(),
+            units: 160,
+            origin_system: test_system(9001),
+            current_system: test_system(9002),
+            target_system: test_system(9003),
+            route_progress: 0.0,
+            readiness: 0.6,
+            mission: ArmyMissionIntent::CampaignTakeover,
+            campaign_id: Some(4),
+        };
+        let defender = ArmyEntityState {
+            id: 2,
+            owner_faction: "drifters".to_owned(),
+            units: 140,
+            origin_system: test_system(9004),
+            current_system: test_system(9002),
+            target_system: test_system(9002),
+            route_progress: 0.0,
+            readiness: 0.55,
+            mission: ArmyMissionIntent::Intercept,
+            campaign_id: None,
+        };
+        let a = state.resolve_army_battle(&attacker, &defender, test_system(9002));
+        let b = state.resolve_army_battle(&attacker, &defender, test_system(9002));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn domain_progress_rollover_increases_levels() {
+        let mut progress = 0.85_f32;
+        let mut level = 2_u32;
+        GameState::advance_domain_progress(&mut progress, &mut level, 0.40);
+        assert_eq!(level, 3);
+        assert!(progress < 1.0);
+    }
+
+    #[test]
+    fn domain_modifiers_are_bounded() {
+        let mut state = GameState::default();
+        let fid = "brewer-corporation".to_owned();
+        if let Some(faction) = state.factions.get_mut(&fid) {
+            faction.econ_tech_level = 200;
+            faction.military_tech_level = 200;
+            faction.diplomacy_tech_level = 200;
+            faction.colonization_tech_level = 200;
+        }
+        assert!(state.faction_econ_efficiency(&fid) <= 1.36);
+        assert!(state.faction_upkeep_efficiency(&fid) >= 0.72);
+        assert!(state.faction_military_effectiveness(&fid) <= 1.32);
+        assert!(state.faction_trade_efficiency(&fid) <= 1.28);
+        assert!(state.faction_survey_speed_modifier(&fid) >= 0.62);
+    }
+
+    #[test]
+    fn colonized_systems_keep_pressure_and_scarcity_floor() {
+        let mut state = GameState::default();
+        let mut colony = test_colony(880, 800_000.0);
+        colony.owner_faction = "brewer-corporation".to_owned();
+        colony.system = test_system(8800);
+        colony.food_balance = 0.08;
+        colony.industry_balance = 0.07;
+        colony.energy_balance = 0.06;
+        state.colonies.insert(colony.id, colony);
+        state.advance_strategic_tick(1.0);
+        let sim = state
+            .system_sim
+            .get(&test_system(8800))
+            .expect("sim state should exist");
+        assert!(sim.econ_pressure >= GameState::PRESSURE_BASELINE_FLOOR);
+        assert!(sim.scarcity >= GameState::SCARCITY_BASELINE_FLOOR);
+    }
+
+    #[test]
+    fn forced_fallback_reason_updates_activity_trackers() {
+        let mut state = GameState::default();
+        let system = test_system(7777);
+        let event = GameEvent::PowerplayOperationResolved {
+            at_year: state.current_year + 0.4,
+            actor_faction: "brewer-corporation".to_owned(),
+            target_faction: "brewer-corporation".to_owned(),
+            system,
+            operation: PowerplayOperationKind::SupportAlly,
+            success: true,
+            strength: 0.07,
+            internal_operation: true,
+            treasury_cost: 0,
+            reason: "Forced fallback powerplay window".to_owned(),
+        };
+        let mut colony = test_colony(881, 600_000.0);
+        colony.owner_faction = "brewer-corporation".to_owned();
+        colony.system = system;
+        state.colonies.insert(colony.id, colony);
+        state.apply_event(&event);
+        let faction = state.factions.get("brewer-corporation").unwrap();
+        assert!(faction.powerplay_actions_recent > 0);
+        assert!(faction.forced_fallback_actions_recent > 0);
     }
 }

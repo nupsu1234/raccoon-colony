@@ -3,9 +3,11 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use serde::Deserialize;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::f32::consts::PI;
 use std::fs;
+use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -48,6 +50,7 @@ const GAME_SAVE_PATH: &str = "galaxy_game_state.json";
 const DELTA_SAVE_PATH: &str = "galaxy_deltas.json";
 const TYPE_DESCRIPTIONS_PATH: &str = "assets/type_descriptions.json";
 const MAX_SAVED_GAME_EVENTS: usize = 10_000;
+const MAX_ACTIVE_EVENT_VISUALS: usize = 320;
 const SIM_SNAPSHOT_MIN_INTERVAL_MS: u64 = 120;
 const MAX_PENDING_SIM_TICKS: u32 = 240;
 const AI_CLUSTER_RADIUS_MIN: f32 = 1_200.0;
@@ -259,6 +262,58 @@ struct CameraFocusTween {
     target_zoom: f32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventVisualKind {
+    Exploration,
+    Colonization,
+    Military,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventVisualDurationPreset {
+    Short,
+    Medium,
+    Long,
+}
+
+impl EventVisualDurationPreset {
+    fn label(self) -> &'static str {
+        match self {
+            EventVisualDurationPreset::Short => "Short",
+            EventVisualDurationPreset::Medium => "Medium",
+            EventVisualDurationPreset::Long => "Long",
+        }
+    }
+
+    fn all() -> [Self; 3] {
+        [
+            EventVisualDurationPreset::Short,
+            EventVisualDurationPreset::Medium,
+            EventVisualDurationPreset::Long,
+        ]
+    }
+
+    fn ttl_scale(self) -> f32 {
+        match self {
+            EventVisualDurationPreset::Short => 1.0,
+            EventVisualDurationPreset::Medium => 2.0,
+            EventVisualDurationPreset::Long => 3.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EventVisual {
+    kind: EventVisualKind,
+    world_pos: [f32; 3],
+    source_world_pos: Option<[f32; 3]>,
+    target_world_pos: Option<[f32; 3]>,
+    color: egui::Color32,
+    created_at_ms: f64,
+    ttl_seconds: f32,
+    emphasis: f32,
+}
+
 #[derive(Clone, Debug)]
 struct SystemSearchResult {
     id: SystemId,
@@ -451,12 +506,42 @@ struct LodProfile {
     system_view_max_missing_sectors: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct ResourcesSnapshot {
-    faction_summaries: Vec<(String, String, i64, u32, f32, usize, f32, f32, f32, f32)>,
+    faction_summaries: Vec<(
+        String,
+        String,
+        i64,
+        u32,
+        f32,
+        u32,
+        f32,
+        u32,
+        f32,
+        u32,
+        f32,
+        usize,
+        f32,
+        f32,
+        f32,
+        f32,
+        f32,
+        f32,
+        f32,
+        f32,
+        u32,
+        i64,
+        usize,
+        i64,
+        f32,
+        i64,
+        i64,
+    )>,
+    trade_resource_totals: Vec<(crate::game_state::TradeResourceKind, f32)>,
     total_element_amounts: Vec<f32>,
     total_atmosphere_amounts: Vec<f32>,
     pending_building_count: usize,
+    powerplay_owner_floor_active_systems: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -606,6 +691,15 @@ pub struct GalaxyApp {
     adaptive_rebuild_interval_ms: f64,
     last_sent_sim_thread_budget: usize,
     sim_spike_cooldown_commands: u32,
+    event_visuals: Vec<EventVisual>,
+    event_visual_last_seen_len: usize,
+    event_visual_last_tail_signature: Option<u64>,
+    game_event_total_seen: u64,
+    event_visuals_enabled: bool,
+    event_visuals_show_exploration: bool,
+    event_visuals_show_colonization: bool,
+    event_visuals_show_military: bool,
+    event_visual_duration_preset: EventVisualDurationPreset,
 }
 
 impl Default for GalaxyApp {
@@ -683,6 +777,10 @@ impl Default for GalaxyApp {
             ai_home_spawn_config,
             max_sim_threads,
         );
+        let event_visual_last_seen_len = game_events.len();
+        let game_event_total_seen = game_events.len() as u64;
+        let event_visual_last_tail_signature =
+            game_events.back().map(Self::game_event_signature);
         Self {
             phase: AppPhase::MainMenu,
             menu_seed_input: String::new(),
@@ -810,6 +908,15 @@ impl Default for GalaxyApp {
             adaptive_rebuild_interval_ms: MIN_REBUILD_INTERVAL_MS,
             last_sent_sim_thread_budget: max_sim_threads,
             sim_spike_cooldown_commands: 0,
+            event_visuals: Vec::new(),
+            event_visual_last_seen_len,
+            event_visual_last_tail_signature,
+            game_event_total_seen,
+            event_visuals_enabled: true,
+            event_visuals_show_exploration: true,
+            event_visuals_show_colonization: true,
+            event_visuals_show_military: true,
+            event_visual_duration_preset: EventVisualDurationPreset::Short,
         }
     }
 }
@@ -1437,41 +1544,86 @@ impl GalaxyApp {
                     .max_height(180.0)
                     .show(ui, |ui| {
                         egui::Grid::new("faction_overview_grid")
-                            .num_columns(8)
+                            .num_columns(19)
                             .spacing([10.0, 4.0])
                             .striped(true)
                             .show(ui, |ui| {
                                 ui.label(egui::RichText::new("Faction").underline());
                                 ui.label(egui::RichText::new("Treasury").underline());
-                                ui.label(egui::RichText::new("Tech").underline());
+                                ui.label(egui::RichText::new("Colonize").underline());
+                                ui.label(egui::RichText::new("Econ").underline());
+                                ui.label(egui::RichText::new("Military").underline());
+                                ui.label(egui::RichText::new("Diplomacy").underline());
                                 ui.label(egui::RichText::new("Colonies").underline());
+                                ui.label(egui::RichText::new("Econ eff").underline());
+                                ui.label(egui::RichText::new("Upkeep eff").underline());
+                                ui.label(egui::RichText::new("Mil eff").underline());
+                                ui.label(egui::RichText::new("Survey speed").underline());
                                 ui.label(egui::RichText::new("Food").underline());
                                 ui.label(egui::RichText::new("Industry").underline());
                                 ui.label(egui::RichText::new("Energy").underline());
                                 ui.label(egui::RichText::new("Capacity").underline());
+                                ui.label(egui::RichText::new("Army").underline());
+                                ui.label(egui::RichText::new("Army upkeep").underline());
+                                ui.label(egui::RichText::new("Campaigns").underline());
+                                ui.label(egui::RichText::new("Trade income").underline());
+                                ui.label(egui::RichText::new("Trade output").underline());
+                                ui.label(egui::RichText::new("Powerplay income").underline());
+                                ui.label(egui::RichText::new("Powerplay spend").underline());
                                 ui.end_row();
 
                                 for (
                                     _fid,
                                     display_name,
                                     treasury,
-                                    tech_level,
-                                    _tech_progress,
+                                    colonize_level,
+                                    _colonize_progress,
+                                    econ_level,
+                                    _econ_progress,
+                                    military_level,
+                                    _military_progress,
+                                    diplomacy_level,
+                                    _diplomacy_progress,
                                     colony_count,
+                                    econ_eff,
+                                    upkeep_eff,
+                                    military_eff,
+                                    survey_speed,
                                     food_stock,
                                     industry_stock,
                                     energy_stock,
                                     stockpile_cap,
+                                    army_units,
+                                    army_upkeep,
+                                    active_campaigns,
+                                    trade_income,
+                                    trade_output,
+                                    powerplay_income,
+                                    powerplay_spend,
                                 ) in &resources.faction_summaries
                                 {
                                     ui.label(display_name.as_str());
                                     ui.label(format!("{}", treasury));
-                                    ui.label(format!("L{}", tech_level));
+                                    ui.label(format!("L{}", colonize_level));
+                                    ui.label(format!("L{}", econ_level));
+                                    ui.label(format!("L{}", military_level));
+                                    ui.label(format!("L{}", diplomacy_level));
                                     ui.label(format!("{}", colony_count));
+                                    ui.label(format!("{:.2}x", econ_eff));
+                                    ui.label(format!("{:.2}x", upkeep_eff));
+                                    ui.label(format!("{:.2}x", military_eff));
+                                    ui.label(format!("{:.2}x", survey_speed));
                                     ui.label(format!("{:.1}", food_stock));
                                     ui.label(format!("{:.1}", industry_stock));
                                     ui.label(format!("{:.1}", energy_stock));
                                     ui.label(format!("{:.1}", stockpile_cap));
+                                    ui.label(format!("{}", army_units));
+                                    ui.label(format!("{}", army_upkeep));
+                                    ui.label(format!("{}", active_campaigns));
+                                    ui.label(format!("{}", trade_income));
+                                    ui.label(format!("{:.1}", trade_output));
+                                    ui.label(format!("{}", powerplay_income));
+                                    ui.label(format!("{}", powerplay_spend));
                                     ui.end_row();
                                 }
                             });
@@ -1485,6 +1637,17 @@ impl GalaxyApp {
                 ui.small(
                     "Element and atmosphere amounts below are summed across ALL faction colony stockpiles.",
                 );
+                let trade_summary = resources
+                    .trade_resource_totals
+                    .iter()
+                    .map(|(kind, amount)| format!("{} {:.1}", kind.label(), amount))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                ui.small(format!("Trade resources (annual): {}", trade_summary));
+                ui.small(format!(
+                    "Powerplay owner-floor active systems: {}",
+                    resources.powerplay_owner_floor_active_systems
+                ));
 
                 ui.columns(2, |columns| {
                     columns[0].push_id("resource_elements_column", |ui| {
@@ -1579,6 +1742,104 @@ impl GalaxyApp {
                     }
                 });
                 ui.separator();
+                let campaigns = self.game_state.active_military_campaigns();
+                let in_transit_armies = self
+                    .game_state
+                    .active_armies
+                    .values()
+                    .filter(|army| army.current_system != army.target_system)
+                    .count();
+                let stationed_armies = self.game_state.active_armies.len().saturating_sub(in_transit_armies);
+                let battles_recent = self
+                    .game_events
+                    .iter()
+                    .rev()
+                    .filter(|event| matches!(event, GameEvent::ArmyBattleResolved { .. }))
+                    .take(10)
+                    .count();
+                ui.label(format!(
+                    "Army entities: active {} | in transit {} | stationed {} | recent battles {}",
+                    self.game_state.active_armies.len(),
+                    in_transit_armies,
+                    stationed_armies,
+                    battles_recent
+                ));
+                if let Some(player_faction) = self.game_state.factions.get(&self.game_state.player.faction_id) {
+                    ui.small(format!(
+                        "Player faction tech: Colonize L{} | Econ L{} | Military L{} | Diplomacy L{}",
+                        player_faction.colonization_tech_level,
+                        player_faction.econ_tech_level,
+                        player_faction.military_tech_level,
+                        player_faction.diplomacy_tech_level
+                    ));
+                }
+                if !campaigns.is_empty() {
+                    ui.label(egui::RichText::new("Active Military Campaigns").strong());
+                    for campaign in campaigns.iter().take(6) {
+                        ui.label(format!(
+                            "#{} {} -> {} | colony {} | {:?} | progress {:.0}% ({:?})",
+                            campaign.id,
+                            campaign.attacker_faction,
+                            campaign.defender_faction,
+                            campaign.target_colony_id,
+                            campaign.outcome,
+                            campaign.progress * 100.0,
+                            campaign.phase
+                        ));
+                    }
+                    ui.separator();
+                }
+                let recent_force_events: Vec<&GameEvent> = self
+                    .game_events
+                    .iter()
+                    .rev()
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            GameEvent::ColonyCapturedByForce { .. } | GameEvent::ColonySackedByForce { .. }
+                        )
+                    })
+                    .take(4)
+                    .collect();
+                if !recent_force_events.is_empty() {
+                    ui.label(egui::RichText::new("Recent Force Outcomes").strong());
+                    for event in recent_force_events {
+                        if let GameEvent::ColonyCapturedByForce {
+                            attacker_faction,
+                            defender_faction,
+                            colony_id,
+                            stability_hit,
+                            ..
+                        } = event
+                        {
+                            ui.label(format!(
+                                "{} captured colony {} from {} (stability hit {:.0}%)",
+                                attacker_faction,
+                                colony_id,
+                                defender_faction,
+                                stability_hit * 100.0
+                            ));
+                        } else if let GameEvent::ColonySackedByForce {
+                            attacker_faction,
+                            defender_faction,
+                            colony_id,
+                            treasury_stolen,
+                            population_lost,
+                            ..
+                        } = event
+                        {
+                            ui.label(format!(
+                                "{} sacked colony {} of {} ({} treasury, {:.0} population extracted)",
+                                attacker_faction,
+                                colony_id,
+                                defender_faction,
+                                treasury_stolen,
+                                population_lost
+                            ));
+                        }
+                    }
+                    ui.separator();
+                }
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     egui::Grid::new("galactic_hotspots_grid")
                         .num_columns(8)
@@ -1833,11 +2094,286 @@ impl GalaxyApp {
             }
             if let Some(events) = snapshot.events {
                 self.game_events = events;
+                self.enqueue_event_visuals_from_new_events();
             }
             if snapshot.emitted_full_snapshot {
                 self.ai_home_positions = snapshot.ai_home_positions;
             }
         }
+    }
+
+    fn event_visual_kind_for_event(event: &GameEvent) -> Option<EventVisualKind> {
+        match event {
+            GameEvent::DiscoveredSystem { .. } | GameEvent::SurveyedSystem { .. } => {
+                Some(EventVisualKind::Exploration)
+            }
+            GameEvent::FoundedColony { .. } => Some(EventVisualKind::Colonization),
+            GameEvent::MilitaryCampaignStarted { .. }
+            | GameEvent::MilitaryCampaignProgressed { .. }
+            | GameEvent::MilitaryCampaignAborted { .. }
+            | GameEvent::ArmyDispatched { .. }
+            | GameEvent::ArmyAdvanced { .. }
+            | GameEvent::ArmiesIntercepted { .. }
+            | GameEvent::ArmyBattleResolved { .. }
+            | GameEvent::ArmyRetreated { .. }
+            | GameEvent::ArmyDisbanded { .. }
+            | GameEvent::ColonyCapturedByForce { .. }
+            | GameEvent::ColonySackedByForce { .. } => Some(EventVisualKind::Military),
+            _ => None,
+        }
+    }
+
+    fn event_visual_enabled_for_kind(&self, kind: EventVisualKind) -> bool {
+        match kind {
+            EventVisualKind::Exploration => self.event_visuals_show_exploration,
+            EventVisualKind::Colonization => self.event_visuals_show_colonization,
+            EventVisualKind::Military => self.event_visuals_show_military,
+        }
+    }
+
+    fn event_visual_ttl_seconds(&self, kind: EventVisualKind) -> f32 {
+        let base = match kind {
+            EventVisualKind::Exploration => 7.0,
+            EventVisualKind::Colonization => 8.0,
+            EventVisualKind::Military => 9.0,
+        };
+        base * self.event_visual_duration_preset.ttl_scale()
+    }
+
+    fn resolve_system_position(&mut self, id: SystemId) -> Option<[f32; 3]> {
+        if id == Self::sagittarius_a_system_id() {
+            return Some(galaxy_center());
+        }
+        if let Some(summary) = self.procedural_generator.find_system_summary(id) {
+            return Some(summary.pos);
+        }
+        if !self.sector_cache.contains(id.sector) {
+            let systems = self.procedural_generator.generate_sector(id.sector);
+            self.sector_cache.insert(id.sector, systems);
+        }
+        self.sector_cache.get(id.sector).and_then(|systems| {
+            systems
+                .iter()
+                .find(|summary| summary.id.local_index == id.local_index)
+                .map(|summary| summary.pos)
+        })
+    }
+
+    fn push_event_visual(&mut self, visual: EventVisual) {
+        if self.event_visuals.len() >= MAX_ACTIVE_EVENT_VISUALS {
+            let overflow = self
+                .event_visuals
+                .len()
+                .saturating_sub(MAX_ACTIVE_EVENT_VISUALS)
+                .saturating_add(1);
+            self.event_visuals.drain(0..overflow);
+        }
+        self.event_visuals.push(visual);
+    }
+
+    fn build_event_visual(&mut self, event: &GameEvent, now_ms: f64) -> Option<EventVisual> {
+        let kind = Self::event_visual_kind_for_event(event)?;
+        let ttl_seconds = self.event_visual_ttl_seconds(kind);
+        let mut source_world_pos = None;
+        let mut target_world_pos = None;
+        let mut emphasis = 1.0;
+        let (world_pos, color) = match event {
+            GameEvent::DiscoveredSystem {
+                system,
+                by_faction,
+                ..
+            }
+            | GameEvent::SurveyedSystem {
+                system,
+                by_faction,
+                ..
+            } => (
+                self.resolve_system_position(*system)?,
+                Self::faction_marker_color(by_faction),
+            ),
+            GameEvent::FoundedColony {
+                founder_faction,
+                system_pos,
+                source_colony_id,
+                ..
+            } => {
+                source_world_pos = source_colony_id
+                    .and_then(|id| self.game_state.colonies.get(&id))
+                    .map(|colony| colony.system_pos);
+                (*system_pos, Self::faction_marker_color(founder_faction))
+            }
+            GameEvent::MilitaryCampaignStarted {
+                attacker_faction,
+                target_system,
+                ..
+            } => {
+                target_world_pos = self.resolve_system_position(*target_system);
+                emphasis = 1.25;
+                (target_world_pos?, Self::faction_marker_color(attacker_faction))
+            }
+            GameEvent::MilitaryCampaignProgressed { campaign_id, .. } => {
+                let (target_system, attacker_faction) = {
+                    let campaign = self.game_state.military_campaigns.get(campaign_id)?;
+                    (
+                        campaign.target_system,
+                        campaign.attacker_faction.clone(),
+                    )
+                };
+                let pos = self.resolve_system_position(target_system)?;
+                target_world_pos = Some(pos);
+                emphasis = 1.12;
+                (pos, Self::faction_marker_color(&attacker_faction))
+            }
+            GameEvent::MilitaryCampaignAborted {
+                attacker_faction,
+                target_colony_id,
+                ..
+            } => {
+                let pos = self
+                    .game_state
+                    .colonies
+                    .get(target_colony_id)
+                    .map(|colony| colony.system_pos)?;
+                emphasis = 0.85;
+                (pos, Self::faction_marker_color(attacker_faction))
+            }
+            GameEvent::ArmyDispatched {
+                faction_id,
+                from_system,
+                target_system,
+                ..
+            } => {
+                source_world_pos = self.resolve_system_position(*from_system);
+                target_world_pos = self.resolve_system_position(*target_system);
+                emphasis = 1.05;
+                (source_world_pos.unwrap_or(target_world_pos?), Self::faction_marker_color(faction_id))
+            }
+            GameEvent::ArmyAdvanced {
+                faction_id,
+                from_system,
+                to_system,
+                ..
+            } => {
+                source_world_pos = self.resolve_system_position(*from_system);
+                target_world_pos = self.resolve_system_position(*to_system);
+                emphasis = 0.95;
+                (target_world_pos?, Self::faction_marker_color(faction_id))
+            }
+            GameEvent::ArmiesIntercepted { system, .. } => {
+                emphasis = 1.15;
+                (self.resolve_system_position(*system)?, egui::Color32::from_rgb(255, 120, 120))
+            }
+            GameEvent::ArmyBattleResolved {
+                winner_faction,
+                system,
+                ..
+            } => {
+                emphasis = 1.30;
+                (
+                    self.resolve_system_position(*system)?,
+                    Self::faction_marker_color(winner_faction).gamma_multiply(1.1),
+                )
+            }
+            GameEvent::ArmyRetreated {
+                faction_id,
+                from_system,
+                to_system,
+                ..
+            } => {
+                source_world_pos = self.resolve_system_position(*from_system);
+                target_world_pos = self.resolve_system_position(*to_system);
+                emphasis = 0.80;
+                (target_world_pos?, Self::faction_marker_color(faction_id))
+            }
+            GameEvent::ArmyDisbanded {
+                faction_id,
+                system,
+                ..
+            } => {
+                emphasis = 0.75;
+                (self.resolve_system_position(*system)?, Self::faction_marker_color(faction_id))
+            }
+            GameEvent::ColonyCapturedByForce {
+                attacker_faction,
+                system,
+                ..
+            } => {
+                emphasis = 1.45;
+                (
+                    self.resolve_system_position(*system)?,
+                    Self::faction_marker_color(attacker_faction).gamma_multiply(1.05),
+                )
+            }
+            GameEvent::ColonySackedByForce {
+                attacker_faction,
+                system,
+                ..
+            } => {
+                emphasis = 1.35;
+                (
+                    self.resolve_system_position(*system)?,
+                    Self::faction_marker_color(attacker_faction),
+                )
+            }
+            _ => return None,
+        };
+        Some(EventVisual {
+            kind,
+            world_pos,
+            source_world_pos,
+            target_world_pos,
+            color,
+            created_at_ms: now_ms,
+            ttl_seconds,
+            emphasis,
+        })
+    }
+
+    fn enqueue_event_visuals_from_new_events(&mut self) {
+        let len = self.game_events.len();
+        if len == 0 {
+            self.event_visual_last_seen_len = 0;
+            self.event_visual_last_tail_signature = None;
+            return;
+        }
+        let start = if len > self.event_visual_last_seen_len {
+            self.event_visual_last_seen_len.min(len)
+        } else if len < self.event_visual_last_seen_len {
+            0
+        } else if let Some(prev_sig) = self.event_visual_last_tail_signature {
+            let prev_idx = self
+                .game_events
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(idx, event)| {
+                    (Self::game_event_signature(event) == prev_sig).then_some(idx)
+                });
+            prev_idx.map(|idx| idx.saturating_add(1)).unwrap_or(len.saturating_sub(64))
+        } else {
+            len.saturating_sub(64)
+        };
+        let now_ms = Self::wall_time_ms();
+        let new_events: Vec<GameEvent> = self.game_events.iter().skip(start).cloned().collect();
+        self.game_event_total_seen = self
+            .game_event_total_seen
+            .saturating_add(new_events.len() as u64);
+        for event in &new_events {
+            if let Some(visual) = self.build_event_visual(event, now_ms) {
+                self.push_event_visual(visual);
+            }
+        }
+        self.event_visual_last_seen_len = len;
+        self.event_visual_last_tail_signature = self
+            .game_events
+            .back()
+            .map(Self::game_event_signature);
+    }
+
+    fn game_event_signature(event: &GameEvent) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        hasher.write(format!("{event:?}").as_bytes());
+        hasher.finish()
     }
 
     fn restart_sim_worker(&mut self) {
@@ -1871,6 +2407,8 @@ impl GalaxyApp {
             .collect();
 
         let mut by_faction_accum: HashMap<String, (usize, f32, f32, f32, f32)> = HashMap::new();
+        let mut trade_resource_totals: HashMap<crate::game_state::TradeResourceKind, f32> =
+            HashMap::new();
         let mut total_element_amounts = vec![0.0f32; element_catalog.len()];
         let mut total_atmosphere_amounts = vec![0.0f32; atmosphere_catalog.len()];
         let mut colony_rows = Vec::with_capacity(self.game_state.colonies.len());
@@ -1921,17 +2459,48 @@ impl GalaxyApp {
             if let Some(faction) = self.game_state.factions.get(&fid) {
                 let (colony_count, food_stock, industry_stock, energy_stock, stockpile_cap) =
                     by_faction_accum.get(&fid).copied().unwrap_or((0, 0.0, 0.0, 0.0, 0.0));
+                let army_units = faction.military.standing_army_units;
+                let army_upkeep = faction.military.annual_upkeep_treasury;
+                let active_campaigns = self.game_state.active_campaign_count_for_faction(&fid);
+                let trade_income = faction.trade.annual_trade_income;
+                let trade_output: f32 = faction.trade.annual_production.values().copied().sum();
+                let powerplay_income = faction.trade.annual_powerplay_income;
+                let powerplay_spend = faction.trade.annual_powerplay_spend;
+                let econ_eff = self.game_state.faction_econ_efficiency(&fid);
+                let upkeep_eff = self.game_state.faction_upkeep_efficiency(&fid);
+                let military_eff = self.game_state.faction_military_effectiveness(&fid);
+                let survey_speed = self.game_state.faction_survey_speed_modifier(&fid);
+                for (kind, amount) in &faction.trade.annual_production {
+                    *trade_resource_totals.entry(*kind).or_insert(0.0) += *amount;
+                }
                 faction_summaries.push((
                     fid.clone(),
                     faction.display_name.clone(),
                     faction.treasury,
                     faction.colonization_tech_level,
                     faction.colonization_tech_progress,
+                    faction.econ_tech_level,
+                    faction.econ_tech_progress,
+                    faction.military_tech_level,
+                    faction.military_tech_progress,
+                    faction.diplomacy_tech_level,
+                    faction.diplomacy_tech_progress,
                     colony_count,
+                    econ_eff,
+                    upkeep_eff,
+                    military_eff,
+                    survey_speed,
                     food_stock,
                     industry_stock,
                     energy_stock,
                     stockpile_cap,
+                    army_units,
+                    army_upkeep,
+                    active_campaigns,
+                    trade_income,
+                    trade_output,
+                    powerplay_income,
+                    powerplay_spend,
                 ));
             }
         }
@@ -1944,9 +2513,14 @@ impl GalaxyApp {
             .collect::<Vec<_>>();
         self.cached_resources = Some(ResourcesSnapshot {
             faction_summaries,
+            trade_resource_totals: crate::game_state::TradeResourceKind::ALL
+                .iter()
+                .map(|kind| (*kind, trade_resource_totals.get(kind).copied().unwrap_or(0.0)))
+                .collect(),
             total_element_amounts,
             total_atmosphere_amounts,
             pending_building_count: self.game_state.pending_colony_buildings.len(),
+            powerplay_owner_floor_active_systems: self.game_state.powerplay_owner_floor_active_systems,
         });
         self.cached_colonies = Some(colony_rows);
         self.cached_hotspots = Some(hotspots);
@@ -1958,6 +2532,10 @@ impl GalaxyApp {
         self.delta_store = DeltaStore::default();
         self.game_state = GameState::default();
         self.game_events.clear();
+        self.event_visuals.clear();
+        self.event_visual_last_seen_len = 0;
+        self.event_visual_last_tail_signature = None;
+        self.game_event_total_seen = 0;
         self.game_paused = true;
         self.pending_sim_ticks = 0;
         self.game_autosave_accum_years = 0.0;
@@ -2006,6 +2584,106 @@ impl GalaxyApp {
                 "Some save files could not be removed: {}",
                 remove_errors.join(" | ")
             ));
+        }
+    }
+
+    fn project_world_to_screen(
+        &self,
+        world_pos: [f32; 3],
+        center2d: egui::Pos2,
+        center3d: [f32; 3],
+    ) -> egui::Pos2 {
+        let rotated = rotate_point(world_pos, self.yaw, self.pitch, center3d);
+        center2d
+            + egui::Vec2::new(
+                (rotated[0] - center3d[0] + self.pan.x) * self.zoom,
+                (rotated[1] - center3d[1] + self.pan.y) * self.zoom,
+            )
+    }
+
+    fn draw_event_visuals(
+        &mut self,
+        painter: &egui::Painter,
+        map_rect: egui::Rect,
+        center2d: egui::Pos2,
+        center3d: [f32; 3],
+        now_ms: f64,
+    ) {
+        self.event_visuals.retain(|visual| {
+            let age_ms = (now_ms - visual.created_at_ms).max(0.0);
+            age_ms <= visual.ttl_seconds as f64 * 1000.0
+        });
+        if !self.event_visuals_enabled || self.event_visuals.is_empty() {
+            return;
+        }
+
+        let draw_rect = map_rect.expand(48.0);
+        for visual in &self.event_visuals {
+            if !self.event_visual_enabled_for_kind(visual.kind) {
+                continue;
+            }
+            let age = ((now_ms - visual.created_at_ms) as f32 / (visual.ttl_seconds * 1000.0))
+                .clamp(0.0, 1.0);
+            let fade = (1.0 - age).powf(1.45);
+            if fade <= 0.01 {
+                continue;
+            }
+
+            let pos = self.project_world_to_screen(visual.world_pos, center2d, center3d);
+            if !draw_rect.contains(pos) {
+                continue;
+            }
+            let alpha = (190.0 * fade * visual.emphasis).clamp(18.0, 255.0) as u8;
+            let color = egui::Color32::from_rgba_unmultiplied(
+                visual.color.r(),
+                visual.color.g(),
+                visual.color.b(),
+                alpha,
+            );
+
+            match visual.kind {
+                EventVisualKind::Exploration => {
+                    let radius = 4.0 + age * 34.0;
+                    painter.circle_stroke(pos, radius, egui::Stroke::new(1.5, color));
+                }
+                EventVisualKind::Colonization => {
+                    let radius_outer = 6.0 + age * 28.0;
+                    let radius_inner = 3.0 + age * 18.0;
+                    painter.circle_stroke(pos, radius_outer, egui::Stroke::new(2.0, color));
+                    painter.circle_stroke(
+                        pos,
+                        radius_inner,
+                        egui::Stroke::new(1.2, color.gamma_multiply(0.8)),
+                    );
+                    painter.circle_filled(pos, 1.8 + fade * 1.4, color.gamma_multiply(0.8));
+                }
+                EventVisualKind::Military => {
+                    let radius = 8.0 + age * 26.0;
+                    painter.circle_stroke(pos, radius, egui::Stroke::new(2.4, color));
+                    if let Some(target) = visual.target_world_pos {
+                        let target_screen = self.project_world_to_screen(target, center2d, center3d);
+                        if draw_rect.contains(target_screen) {
+                            painter.circle_stroke(
+                                target_screen,
+                                3.2 + age * 8.0,
+                                egui::Stroke::new(1.3, color.gamma_multiply(0.9)),
+                            );
+                        }
+                    }
+                    if let (Some(source), Some(target)) =
+                        (visual.source_world_pos, visual.target_world_pos)
+                    {
+                        let source_screen = self.project_world_to_screen(source, center2d, center3d);
+                        let target_screen = self.project_world_to_screen(target, center2d, center3d);
+                        if draw_rect.contains(source_screen) || draw_rect.contains(target_screen) {
+                            painter.line_segment(
+                                [source_screen, target_screen],
+                                egui::Stroke::new(1.2, color.gamma_multiply(0.75)),
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2216,7 +2894,7 @@ impl GalaxyApp {
                                     ui.label(egui::RichText::new("Name").underline());
                                     ui.label(egui::RichText::new("Stars").underline());
                                     ui.label(egui::RichText::new("Planets").underline());
-                                    ui.label(egui::RichText::new("Habitable").underline());
+                                    ui.label(egui::RichText::new("Terraformable").underline());
                                     ui.label(egui::RichText::new("Focus").underline());
                                     ui.label(egui::RichText::new("Select").underline());
                                     ui.end_row();
@@ -2860,7 +3538,7 @@ impl GalaxyApp {
                                     if planet.kind == PlanetKind::EarthLikeWorld {
                                         " | ELW"
                                     } else if planet.habitable {
-                                        " | Habitable"
+                                        " | Terraformable"
                                     } else {
                                         ""
                                     },
@@ -3467,7 +4145,7 @@ impl GalaxyApp {
                             if planet.habitable {
                                 "Potentially life-supporting"
                             } else {
-                                "Non-habitable"
+                                "Non-terraformable"
                             }
                         ));
                         ui.separator();
@@ -5109,17 +5787,38 @@ impl GalaxyApp {
                     }
                 });
             });
+            ui.horizontal_wrapped(|ui| {
+                ui.separator();
+                ui.checkbox(&mut self.event_visuals_enabled, "Show event visuals");
+                ui.add_enabled_ui(self.event_visuals_enabled, |ui| {
+                    ui.checkbox(&mut self.event_visuals_show_exploration, "Exploration");
+                    ui.checkbox(&mut self.event_visuals_show_colonization, "Colonization");
+                    ui.checkbox(&mut self.event_visuals_show_military, "Military");
+                    egui::ComboBox::from_id_source("event_visual_duration_preset")
+                        .selected_text(self.event_visual_duration_preset.label())
+                        .show_ui(ui, |ui| {
+                            for preset in EventVisualDurationPreset::all() {
+                                ui.selectable_value(
+                                    &mut self.event_visual_duration_preset,
+                                    preset,
+                                    preset.label(),
+                                );
+                            }
+                        });
+                });
+            });
             if filter_changed {
                 self.last_required_ready_hash = u64::MAX;
                 self.visible_build_inflight = false;
             }
             ui.label(format!(
-                "Year: {:.2} | Known systems: {} | Fully assessed: {} | Colonies: {} | Factions: {} | Game events: {}",
+                "Year: {:.2} | Known systems: {} | Fully assessed: {} | Colonies: {} | Factions: {} | Game events: {} (stored {})",
                 self.game_state.current_year,
                 self.game_state.explored_systems.len(),
                 self.game_state.fully_surveyed_system_count(),
                 self.game_state.colonies.len(),
                 self.game_state.factions.len(),
+                self.game_event_total_seen,
                 self.game_events.len(),
             ));
             if let Some(status) = &self.system_search_status {
@@ -5289,20 +5988,140 @@ impl GalaxyApp {
                         blocked_by_deferred_treasury,
                         avg_break_even_years,
                     ));
-                    let (alliance_count, pact_count, sanction_count) =
+                    let (alliance_count, pact_count, trade_pact_count, sanction_count) =
                         self.game_state.diplomacy_summary_counts();
+                    let (forced_active_factions, diplomacy_actions_recent, powerplay_actions_recent) =
+                        self.game_state.forced_activity_summary();
+                    let sim_count = self.game_state.system_sim.len().max(1) as f32;
+                    let avg_pressure = self
+                        .game_state
+                        .system_sim
+                        .values()
+                        .map(|sim| sim.econ_pressure)
+                        .sum::<f32>()
+                        / sim_count;
+                    let avg_scarcity = self
+                        .game_state
+                        .system_sim
+                        .values()
+                        .map(|sim| sim.scarcity)
+                        .sum::<f32>()
+                        / sim_count;
                     let active_ops_recent = self
                         .game_state
                         .recent_powerplay_ops
                         .iter()
                         .filter(|op| self.game_state.current_year - op.at_year <= 1.0)
                         .count();
+                    let ops_support_recent = self
+                        .game_state
+                        .recent_powerplay_ops
+                        .iter()
+                        .filter(|op| {
+                            self.game_state.current_year - op.at_year <= 1.0
+                                && matches!(op.operation, crate::game_state::PowerplayOperationKind::SupportAlly)
+                        })
+                        .count();
+                    let ops_undermine_recent = self
+                        .game_state
+                        .recent_powerplay_ops
+                        .iter()
+                        .filter(|op| {
+                            self.game_state.current_year - op.at_year <= 1.0
+                                && matches!(
+                                    op.operation,
+                                    crate::game_state::PowerplayOperationKind::UndermineInfluence
+                                )
+                        })
+                        .count();
+                    let ops_pressure_recent = self
+                        .game_state
+                        .recent_powerplay_ops
+                        .iter()
+                        .filter(|op| {
+                            self.game_state.current_year - op.at_year <= 1.0
+                                && matches!(
+                                    op.operation,
+                                    crate::game_state::PowerplayOperationKind::EconomicPressure
+                                )
+                        })
+                        .count();
+                    let takeovers_recent = self
+                        .game_events
+                        .iter()
+                        .filter(|event| match event {
+                            GameEvent::ColonyCapturedByForce { at_year, .. } => {
+                                self.game_state.current_year - *at_year <= 1.0
+                            }
+                            _ => false,
+                        })
+                        .count();
+                    let sacks_recent = self
+                        .game_events
+                        .iter()
+                        .filter(|event| match event {
+                            GameEvent::ColonySackedByForce { at_year, .. } => {
+                                self.game_state.current_year - *at_year <= 1.0
+                            }
+                            _ => false,
+                        })
+                        .count();
+                    let internal_ops_recent = self
+                        .game_state
+                        .recent_powerplay_ops
+                        .iter()
+                        .filter(|op| {
+                            self.game_state.current_year - op.at_year <= 1.0 && op.internal_operation
+                        })
+                        .count();
+                    let foreign_ops_recent = active_ops_recent.saturating_sub(internal_ops_recent);
+                    let threatened_count = self
+                        .game_state
+                        .factions
+                        .values()
+                        .filter(|f| f.threatenedness_score >= 0.45)
+                        .count();
+                    let top_dominance = self
+                        .game_state
+                        .factions
+                        .values()
+                        .map(|f| f.dominance_score)
+                        .fold(0.0_f32, f32::max);
+                    let treaty_events_recent = self
+                        .game_events
+                        .iter()
+                        .filter(|event| match event {
+                            GameEvent::TreatyEstablished { at_year, .. } => {
+                                self.game_state.current_year - *at_year <= 1.0
+                            }
+                            _ => false,
+                        })
+                        .count();
                     ui.label(format!(
-                        "Diplomacy telemetry: alliances {} | pacts {} | sanctions {} | powerplay ops (last 1y) {}",
+                        "Diplomacy telemetry: alliances {} | pacts {} | trade pacts {} | sanctions {} | powerplay ops (last 1y) {} [support {} / undermine {} / pressure {} | internal {} / foreign {}] | military outcomes (last 1y) takeover {} / sack {} | threatened factions {} | top dominance {:.2} | treaties formed (last 1y) {}",
                         alliance_count,
                         pact_count,
+                        trade_pact_count,
                         sanction_count,
                         active_ops_recent,
+                        ops_support_recent,
+                        ops_undermine_recent,
+                        ops_pressure_recent,
+                        internal_ops_recent,
+                        foreign_ops_recent,
+                        takeovers_recent,
+                        sacks_recent,
+                        threatened_count,
+                        top_dominance,
+                        treaty_events_recent,
+                    ));
+                    ui.label(format!(
+                        "Powerplay pressure telemetry: avg pressure {:.2} | avg scarcity {:.2} | diplomacy actions recent {} | powerplay actions recent {} | forced fallback factions {}",
+                        avg_pressure,
+                        avg_scarcity,
+                        diplomacy_actions_recent,
+                        powerplay_actions_recent,
+                        forced_active_factions
                     ));
                     ui.label(format!(
                         "AI build intents: recovery {} | extraction {} | throughput {} | growth {} | avg reserve depth {:.2}",
@@ -5703,6 +6522,7 @@ impl GalaxyApp {
                     egui::Stroke::new(1.0, marker_color),
                 );
             }
+            self.draw_event_visuals(&painter, response.rect, center2d, center3d, Self::wall_time_ms());
             if self.debug_show_ai_home_positions {
                 for (faction_id, home_pos) in &self.ai_home_positions {
                     let rotated = rotate_point(*home_pos, self.yaw, self.pitch, center3d);
@@ -5816,7 +6636,7 @@ impl GalaxyApp {
                                     );
                                     ui.end_row();
 
-                                    ui.label("Habitable worlds:");
+                                    ui.label("Terraformable worlds:");
                                     ui.label(
                                         survey_record
                                             .as_ref()
@@ -5885,7 +6705,7 @@ impl GalaxyApp {
                                     ui.label(egui::RichText::new("Around").underline());
                                     ui.label(egui::RichText::new("Orbit (AU)").underline());
                                     ui.label(egui::RichText::new("Temp (K)").underline());
-                                    ui.label(egui::RichText::new("Habitable").underline());
+                                    ui.label(egui::RichText::new("Terraformable").underline());
                                     ui.label(egui::RichText::new("Info").underline());
                                     ui.end_row();
                                     for planet in &detail.planets {
@@ -6060,7 +6880,8 @@ impl GalaxyApp {
         let needs_frequent_repaint = !self.game_paused
             || self.visible_build_inflight
             || self.camera_focus_tween.is_some()
-            || self.pan_velocity.length_sq() > 0.01;
+            || self.pan_velocity.length_sq() > 0.01
+            || !self.event_visuals.is_empty();
         if needs_frequent_repaint {
             ctx.request_repaint_after(Duration::from_millis(16));
         } else {
@@ -6147,6 +6968,62 @@ mod tests {
             catalog.planets.get("rocky"),
             defaults.planets.get("rocky"),
             "missing planet key should keep default text"
+        );
+    }
+
+    #[test]
+    fn event_visual_mapping_includes_requested_categories() {
+        let exploration = GameEvent::DiscoveredSystem {
+            at_year: 3300.0,
+            system: SystemId {
+                sector: SectorCoord { x: 1, y: 2 },
+                local_index: 4,
+            },
+            by_faction: "flood-of-raccoons".to_owned(),
+        };
+        let colonization = GameEvent::FoundedColony {
+            at_year: 3300.0,
+            colony_id: 1,
+            colony_name: "Test".to_owned(),
+            founder_faction: "flood-of-raccoons".to_owned(),
+            system: SystemId {
+                sector: SectorCoord { x: 1, y: 2 },
+                local_index: 4,
+            },
+            body_index: 0,
+            habitable_site: false,
+            earth_like_world: false,
+            system_pos: [10.0, 20.0, 30.0],
+            element_resource_profile: HashMap::new(),
+            atmosphere_resource_profile: HashMap::new(),
+            atmosphere_pressure_atm: 0.0,
+            colonists_sent: 0,
+            source_colony_id: None,
+        };
+        let military = GameEvent::ColonyCapturedByForce {
+            at_year: 3300.0,
+            campaign_id: 7,
+            attacker_faction: "flood-of-raccoons".to_owned(),
+            defender_faction: "drifters".to_owned(),
+            colony_id: 42,
+            system: SystemId {
+                sector: SectorCoord { x: 1, y: 2 },
+                local_index: 4,
+            },
+            stability_hit: 0.35,
+        };
+
+        assert_eq!(
+            GalaxyApp::event_visual_kind_for_event(&exploration),
+            Some(EventVisualKind::Exploration)
+        );
+        assert_eq!(
+            GalaxyApp::event_visual_kind_for_event(&colonization),
+            Some(EventVisualKind::Colonization)
+        );
+        assert_eq!(
+            GalaxyApp::event_visual_kind_for_event(&military),
+            Some(EventVisualKind::Military)
         );
     }
 }
